@@ -679,7 +679,7 @@ def _curve_front_bangs_tex(png_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
-def _straight_png_to_premul(img_path: Path, target_size: tuple[int, int] | None = None, feather_shoulder_tabs: bool = False) -> bytes:
+def _straight_png_to_premul(img_path: Path, target_size: tuple[int, int] | None = None) -> bytes:
     """Convert any user-drawn or inpainted straight-alpha PNG into clean Inochi2D premultiplied RGBA."""
     im = Image.open(img_path).convert("RGBA")
     if target_size is not None and im.size != target_size:
@@ -687,41 +687,138 @@ def _straight_png_to_premul(img_path: Path, target_size: tuple[int, int] | None 
     arr = np.array(im, dtype=np.float32)
     rgb = arr[..., :3].copy()
     a = arr[..., 3] / 255.0
-
-    # Pure soft alpha gradient dissolve on the left/right vertical shoulder-socket skin tabs
-    # so the two peach tones blend smoothly with zero straight vertical Barbie-doll seam!
-    if feather_shoulder_tabs:
-        h, w = a.shape
-        y0, y1 = int(h * 0.140), int(h * 0.365)
-        for y in range(y0, min(h, y1 + 12)):
-            xs = np.where(a[y] > 0.15)[0]
-            if len(xs) < 40:
-                continue
-            xl, xr = int(xs[0]), int(xs[-1])
-            ty = min(1.0, (y - y0) / max(1.0, h * 0.015)) * min(1.0, max(0.0, (y1 + 10 - y) / max(1.0, h * 0.025)))
-            if ty <= 0.0:
-                continue
-            for side, x_edge, step in (("L", xl, 1), ("R", xr, -1)):
-                xi = x_edge + step * 28
-                if not (0 <= xi < w):
-                    continue
-                pr, pg, pb = rgb[y, xi]
-                if not (pr > 180.0 and pr > pb + 18.0):
-                    continue
-                for d in range(28):
-                    x = x_edge + step * d
-                    if not (0 <= x < w):
-                        break
-                    t = d / 27.0
-                    fade = t * t * (3.0 - 2.0 * t)
-                    a[y, x] *= (1.0 - ty) + ty * fade
-
     premul = np.zeros_like(arr, dtype=np.uint8)
     premul[..., :3] = np.clip(np.rint(rgb * a[..., None]), 0, 255).astype(np.uint8)
     premul[..., 3] = np.clip(np.rint(a * 255.0), 0, 255).astype(np.uint8)
     premul[premul[..., 3] == 0] = 0
     buf = io.BytesIO()
     Image.fromarray(premul).save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
+_ARM_SKIN_REF: list[np.ndarray] = []
+
+
+def _arm_skin_reference() -> np.ndarray | None:
+    """Median skin tone of the resting arm's shoulder area (what shows through a feathered topwear tab)."""
+    if _ARM_SKIN_REF:
+        return _ARM_SKIN_REF[0]
+    if not HD_ARM_RIGHT.exists():
+        return None
+    arr = np.array(Image.open(HD_ARM_RIGHT).convert("RGBA"), dtype=np.float32)
+    h = arr.shape[0]
+    top = arr[int(0.03 * h): int(0.20 * h)]
+    inner = cv2.distanceTransform((top[..., 3] > 200).astype(np.uint8), cv2.DIST_L2, 5) > 10
+    if not np.any(inner):
+        return None
+    _ARM_SKIN_REF.append(np.median(top[inner][:, :3], axis=0))
+    return _ARM_SKIN_REF[0]
+
+
+# Topwear UV rows of the vertical shoulder-socket skin tabs (~0.140..0.375, plus the narrow skin tip that runs down
+# to the armpit point). The resting arm only lies underneath from ~0.15 down, so the dissolve eases in over
+# 0.140-0.185 (never revealing background above the arm) and out over 0.360-0.405.
+_TAB_Y0, _TAB_IN, _TAB_OUT, _TAB_Y1 = 0.140, 0.185, 0.360, 0.405
+_TAB_DISSOLVE_PX = 40.0     # cubic alpha dissolve from the cut inward (arm skin covers >= 49 px past the cut)
+_TAB_DEFRINGE_PX = 5        # outer px of the cut whose dark / light outline is replaced with skin
+
+
+def _feather_topwear_shoulder_tabs_premul(premul_png: bytes) -> bytes:
+    """Melt the left / right vertical shoulder-socket skin tabs of ANY topwear texture (original, hikari-stripe,
+    refined-vrm) into the resting arm underneath: works on un-premultiplied RGB + alpha, then re-premultiplies.
+    Per row (only where the pixels next to the cut are skin, so halter fabric / cyan piping are never touched):
+      1. defringe the outer 5 px of outline along the cut with the row's own interior skin colour;
+      2. pull the fading skin toward the arm's tone so there is no colour step;
+      3. cubic (smoothstep) alpha dissolve over 40 px from the cut inward, shortened where the skin run is short."""
+    im = Image.open(io.BytesIO(premul_png)).convert("RGBA")
+    arr = np.array(im, dtype=np.float32)
+    h, w = arr.shape[:2]
+    a = arr[..., 3] / 255.0
+    rgb = np.zeros((h, w, 3), dtype=np.float32)
+    m = a > 0.004
+    rgb[m] = np.clip(arr[m, :3] / a[m, None], 0.0, 255.0)
+    arm_ref = _arm_skin_reference()
+    sx = w / 740.0                                   # tuned on the 740 px wide topwear UV layout
+    dis_px = _TAB_DISSOLVE_PX * sx
+    fringe = max(2, int(round(_TAB_DEFRINGE_PX * sx)))
+
+    def is_skin(px: np.ndarray) -> np.ndarray:
+        """Warm peach skin incl. its shaded creases; white piping, grey/black fabric and cyan stripes all fail."""
+        r, g, b = px[..., 0], px[..., 1], px[..., 2]
+        return (r > 140.0) & (r > b + 16.0) & (r > g + 14.0) & ((0.30 * r + 0.59 * g + 0.11 * b) > 110.0)
+
+    y_lo, y_hi = int(_TAB_Y0 * h), min(h, int(np.ceil(_TAB_Y1 * h)) + 1)
+    rows = np.arange(y_lo, y_hi)
+    fy = (rows + 0.5) / h
+    env = np.clip((fy - _TAB_Y0) / (_TAB_IN - _TAB_Y0), 0.0, 1.0) * np.clip((_TAB_Y1 - fy) / (_TAB_Y1 - _TAB_OUT), 0.0, 1.0)
+    env = env * env * (3.0 - 2.0 * env)
+
+    def erode_blur(v: np.ndarray, erode: int, sigma: float) -> np.ndarray:
+        """Running minimum (so the effect has already tapered off before a row that can't take it) + Gaussian."""
+        if erode > 0:
+            pad = np.pad(v, erode, mode="edge")
+            v = np.min(np.stack([pad[k:k + len(v)] for k in range(2 * erode + 1)]), axis=0)
+        return cv2.GaussianBlur(v.reshape(-1, 1).astype(np.float32), (1, 0), sigma).ravel()
+
+    for flip in (False, True):                       # left tab, then the mirrored right tab (views, edited in place)
+        A = a[:, ::-1] if flip else a
+        C = rgb[:, ::-1] if flip else rgb
+        # Pass 1: measure every row (cut position, skin run, interior skin colour).
+        n_rows = len(rows)
+        xe_r = np.zeros(n_rows, dtype=np.int64)
+        ok_r = np.zeros(n_rows, dtype=np.float32)
+        d_r = np.zeros(n_rows, dtype=np.float32)
+        skin_r = np.zeros((n_rows, 3), dtype=np.float32)
+        for k, y in enumerate(rows):
+            xs = np.nonzero(A[y] > 0.04)[0]
+            if len(xs) < 40:
+                continue
+            xe = int(xs[0])
+            probe = C[y, xe + fringe: min(w, xe + fringe + int(130 * sx))]
+            skin = is_skin(probe)
+            if len(skin) < 8 or int(skin[:8].sum()) < 6:
+                continue                             # fabric right at the edge: not a skin-tab row
+            # Skin run = up to the first spot where non-skin persists for 3 px (ignores 1-2 px crease lines).
+            gone = ~skin
+            persist = gone[:-2] & gone[1:-1] & gone[2:]
+            run = (int(np.argmax(persist)) if persist.any() else len(skin)) + fringe
+            ref_lo = xe + fringe + int(3 * sx)
+            ref_hi = max(ref_lo + 1, xe + int(min(run, fringe + 18 * sx)))
+            xe_r[k], ok_r[k] = xe, 1.0
+            d_r[k] = float(np.clip(run - 5.0 * sx, 0.0, dis_px))
+            skin_r[k] = np.median(C[y, ref_lo:ref_hi], axis=0)
+        # Smooth across rows: no row-to-row on/off steps, and the fade narrows gradually where fabric closes in.
+        strength = erode_blur(ok_r * env, int(round(5 * sx)), 2.5 * sx) * ok_r
+        d_s = np.maximum(erode_blur(d_r, int(round(2 * sx)), 2.0 * sx), 3.0 * sx)
+        # Pass 2: apply.
+        for k, y in enumerate(rows):
+            st = float(strength[k])
+            if st < 0.01:
+                continue
+            xe, d_len, row_skin = int(xe_r[k]), float(d_s[k]), skin_r[k]
+            target = row_skin if arm_ref is None else 0.45 * row_skin + 0.55 * arm_ref
+            n = int(np.ceil(d_len)) + 1
+            xx = np.arange(xe, min(w, xe + n))
+            d = (xx - xe).astype(np.float32)
+            t = np.clip(d / d_len, 0.0, 1.0)
+            fade = t * t * (3.0 - 2.0 * t)
+            seg = C[y, xe:xe + len(xx)].copy()
+            # 1. defringe: the outer px take the row's interior skin colour
+            k_def = (np.clip(1.0 - (d - fringe + 1.0) / 2.0, 0.0, 1.0) * st)[:, None]
+            seg = seg * (1.0 - k_def) + row_skin[None, :] * k_def
+            # 2. tone match toward the arm where the tab is mostly transparent
+            k_tone = (0.6 * (1.0 - fade) * st)[:, None]
+            seg = seg * (1.0 - k_tone) + target[None, :] * k_tone
+            C[y, xe:xe + len(xx)] = seg
+            # 3. cubic alpha dissolve
+            A[y, xe:xe + len(xx)] *= (1.0 - st) + st * fade
+
+    out = np.zeros((h, w, 4), dtype=np.uint8)
+    out[..., :3] = np.clip(np.rint(rgb * a[..., None]), 0, 255).astype(np.uint8)
+    out[..., 3] = np.clip(np.rint(a * 255.0), 0, 255).astype(np.uint8)
+    out[out[..., 3] == 0] = 0
+    buf = io.BytesIO()
+    Image.fromarray(out).save(buf, format="PNG", compress_level=6)
     return buf.getvalue()
 
 
@@ -1333,15 +1430,38 @@ class CharacterCustomizer:
         self.vrm_eyes: dict[str, Path] = {}
         self._ensure_default_vrm_eyes()
 
-    def _load_premul_cached(self, img_path: Path, feather_shoulder_tabs: bool = False) -> bytes:
+    def _load_premul_cached(self, img_path: Path) -> bytes:
         mtime = img_path.stat().st_mtime
-        key = img_path.with_name(f"{img_path.name}__seam") if feather_shoulder_tabs else img_path
-        cached = self._premul_cache.get(key)
+        cached = self._premul_cache.get(img_path)
         if cached is not None and cached[0] == mtime:
             return cached[1]
-        data = _straight_png_to_premul(img_path, feather_shoulder_tabs=feather_shoulder_tabs)
-        self._premul_cache[key] = (mtime, data)
+        data = _straight_png_to_premul(img_path)
+        self._premul_cache[img_path] = (mtime, data)
         return data
+
+    def _cached_header(self, tag: tuple[Any, ...], header: bytes, build: Any) -> bytes:
+        """Header post-passes (collar / emissive) re-parse the whole rig JSON (~0.18 s each). Their result only
+        depends on the input header + tag, so reuse it; returning the same bytes object keeps hashing cheap."""
+        cache: dict[tuple[Any, ...], bytes] = self.__dict__.setdefault("_header_cache", {})
+        key = tag + (len(header), hash(header))
+        out = cache.get(key)
+        if out is None:
+            if len(cache) > 12:
+                cache.clear()
+            out = cache[key] = build(header)
+        return out
+
+    def _feathered_top(self, premul_png: bytes) -> bytes:
+        """Cached shoulder-tab feather for whichever topwear texture is active."""
+        cache: dict[tuple[Any, ...], bytes] = self.__dict__.setdefault("_tab_cache", {})
+        key = ("tabs", len(premul_png), hash(premul_png))
+        out = cache.get(key)
+        if out is None:
+            if len(cache) > 8:
+                cache.clear()
+            out = _feather_topwear_shoulder_tabs_premul(premul_png)
+            cache[key] = out
+        return out
 
     def _ensure_default_vrm_eyes(self) -> None:
         ir = self.vrm_assets_dir / "vrm_iris_r.png"
@@ -1521,7 +1641,7 @@ class CharacterCustomizer:
             out_texs[TOP_TEXTURE] = (0, self.wardrobe.stripe_top)
         elif top_style == "refined-vrm":
             if HD_TOPWEAR_REFINED.exists():
-                out_texs[TOP_TEXTURE] = (0, self._load_premul_cached(HD_TOPWEAR_REFINED, feather_shoulder_tabs=True))
+                out_texs[TOP_TEXTURE] = (0, self._load_premul_cached(HD_TOPWEAR_REFINED))
             else:
                 out_texs[TOP_TEXTURE] = (0, self.wardrobe.refined_top)
             if self._wraparound_collar is None and out_texs[3][0] == 0:
@@ -1550,6 +1670,9 @@ class CharacterCustomizer:
                     if ckey not in self._smooth_wardrobe_cache:
                         self._smooth_wardrobe_cache[ckey] = _smooth_raised_upper_arm_cap(out_texs[tid_w][1], is_left=is_l)
                     out_texs[tid_w] = (0, self._smooth_wardrobe_cache[ckey])
+        # Seamless shoulders on every outfit: melt the vertical shoulder-socket skin tabs into the arm (pre-tint).
+        if out_texs[TOP_TEXTURE][0] == 0:
+            out_texs[TOP_TEXTURE] = (0, self._feathered_top(out_texs[TOP_TEXTURE][1]))
         if is_high_top:
             for texture_index, paint in zip(SHOE_TEXTURES, self.wardrobe.high_tops, strict=True):
                 out_texs[texture_index] = (0, paint)
@@ -1579,7 +1702,8 @@ class CharacterCustomizer:
                 collar_tex = _recolor_outfit_skin_safe_png(collar_tex, o_tint, o_str, o_val, preserve_print=False)
             collar_tid = len(out_texs)
             out_texs.append((0, collar_tex))
-            header = _attach_wraparound_collar(header, collar_node, collar_binds, collar_tid)
+            header = self._cached_header(("collar", collar_tid), header,
+                                         lambda h: _attach_wraparound_collar(h, collar_node, collar_binds, collar_tid))
 
         # Attach real GPU Emissive Glow maps (Galaxy / Solid-Pupil Eyes + Cyber Halter Top LEDs!)
         emissive_map: dict[int, int] = {}
@@ -1590,10 +1714,18 @@ class CharacterCustomizer:
         emissive_map[1024] = len(out_texs)
         out_texs.append((0, em_l))
         if top_style == "refined-vrm":
-            em_top = _build_topwear_cyber_emissive_png(out_texs[TOP_TEXTURE][1])
+            top_png = out_texs[TOP_TEXTURE][1]
+            em_cache: dict[tuple[Any, ...], bytes] = self.__dict__.setdefault("_em_top_cache", {})
+            em_key = (len(top_png), hash(top_png))
+            em_top = em_cache.get(em_key)
+            if em_top is None:
+                if len(em_cache) > 6:
+                    em_cache.clear()
+                em_top = em_cache[em_key] = _build_topwear_cyber_emissive_png(top_png)
             emissive_map[1005] = len(out_texs)
             out_texs.append((0, em_top))
-        header = _attach_emissive_maps(header, emissive_map)
+        header = self._cached_header(("emissive", tuple(sorted(emissive_map.items()))), header,
+                                     lambda h: _attach_emissive_maps(h, emissive_map))
 
         tmp = out_inp.with_suffix(".tmp")
         tmp.write_bytes(_pack_inp(header, out_texs, self._trailing))
