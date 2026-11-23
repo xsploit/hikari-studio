@@ -1350,9 +1350,9 @@ def _new_param_1d(name: str, uid: int) -> dict[str, Any]:
 
 
 def _tune_arm_and_mouth_rig(header: bytes) -> bytes:
-    """- Raised wave arms: Arm R/L Lift -45..+35 deg, Arm R/L Gesture elbow +-28 / wrist +-22 deg, plus separate
-      Arm R/L Elbow (-35..+30 deg) / Arm R/L Wrist (+-30 deg) on the existing pivots (capped where the wave art's
-      joint overlap stays closed).
+    """- Raised wave arms: lock Arm R/L Lift tightly to -5.5..+6.5 deg so shoulders NEVER separate or notch on
+      any emote/slider, while Arm R/L Gesture (elbow +-24 / wrist +-22 deg) and separate Arm R/L Elbow/Wrist
+      carry the lively motion cleanly inside the wave art's closed joint overlap.
     - Mouth Spring physics anchor follows the live VB Mouth / Jaw Open (the legacy 'Mouth' param is never driven)."""
     puppet = json.loads(header[12:])
     nodes: set[int] = set()
@@ -1370,10 +1370,10 @@ def _tune_arm_and_mouth_rig(header: bytes) -> bytes:
         sg = 1.0 if side == "R" else -1.0
         lift = by_name.get(f"Arm {side} Lift")
         if lift is not None:
-            _bind_1d(lift, sh, "transform.r.z", sg * _deg(-45.0), 0.0, sg * _deg(35.0))
+            _bind_1d(lift, sh, "transform.r.z", sg * _deg(-5.5), 0.0, sg * _deg(6.5))
         gest = by_name.get(f"Arm {side} Gesture")
         if gest is not None:
-            _bind_1d(gest, el, "transform.r.z", sg * _deg(28.0), 0.0, sg * _deg(-28.0))
+            _bind_1d(gest, el, "transform.r.z", sg * _deg(24.0), 0.0, sg * _deg(-24.0))
             _bind_1d(gest, wr, "transform.r.z", sg * _deg(22.0), 0.0, sg * _deg(-22.0))
         # Beyond about -35 / +30 deg the wave art's elbow overlap opens up, so the extra range stops there.
         for pname, nid, v_neg, v_pos in ((f"Arm {side} Elbow", el, sg * _deg(-35.0), sg * _deg(30.0)),   # + = fold
