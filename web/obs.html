@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Hikari Studio · OBS Transparent Browser Source</title>
+  <style>
+    html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
+    canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  </style>
+</head>
+<body>
+  <canvas id="avatar-canvas"></canvas>
+  <script type="module">
+    import { AvatarGLRenderer } from '/static/js/stage.js';
+    const canvas = document.getElementById('avatar-canvas');
+    const glr = new AvatarGLRenderer(canvas);
+    const params = new URLSearchParams(location.search);
+    let stageCfg = { avatarX: 0.5, avatarY: 0.0, avatarScale: 1.0, room: 'transparent' };
+    let ws = null;
+    let reconnectTimer = null;
+    let sawConfigSync = false;   // once the server broadcasts config_sync, the fallback resync stops for good
+    let resyncTimer = null;
+
+    // Framing (avatarX / avatarY / avatarScale) is read on every frame from stageCfg; room drives the chroma backdrop.
+    function applyStage(stage) {
+      if (!stage || typeof stage !== 'object') return;
+      stageCfg = { ...stageCfg, ...stage };
+      const chroma = params.get('chroma') === '1' || stageCfg.room === 'chroma_green';
+      document.body.style.background = chroma ? '#00b140' : 'transparent';
+    }
+
+    async function syncState() {
+      try {
+        const st = await (await fetch('/api/state', { cache: 'no-store' })).json();
+        applyStage(st?.config?.stage);
+      } catch { /* server restarting — the socket reconnect will retry */ }
+    }
+
+    // Fallback for servers that don't broadcast config_sync after live edits: light resync until one arrives.
+    function scheduleResync() {
+      clearTimeout(resyncTimer);
+      if (sawConfigSync) return;
+      resyncTimer = setTimeout(async () => { await syncState(); scheduleResync(); }, 5000);
+    }
+
+    function scheduleReconnect() {
+      if (reconnectTimer) return;
+      reconnectTimer = setTimeout(() => { reconnectTimer = null; connectWs(); }, 1000);
+    }
+
+    function connectWs() {
+      try { ws?.close(); } catch {}
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const sock = new WebSocket(`${proto}//${location.host}/ws`);
+      ws = sock;
+      sock.binaryType = 'arraybuffer';
+      sock.onopen = () => { syncState(); }; // resync framing after every (re)connect
+      sock.onmessage = async (ev) => {
+        if (typeof ev.data === 'string') {
+          let msg;
+          try { msg = JSON.parse(ev.data); } catch { return; }
+          if (msg.type === 'config_sync') {
+            sawConfigSync = true;
+            clearTimeout(resyncTimer);
+            applyStage(msg.config?.stage);
+          }
+          return;
+        }
+        await glr.drawPacket(ev.data, stageCfg, 0, 0);
+      };
+      sock.onerror = () => { try { sock.close(); } catch {} };
+      sock.onclose = () => { if (ws === sock) scheduleReconnect(); };
+    }
+
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) syncState(); });
+    await syncState();
+    connectWs();
+    scheduleResync();
+  </script>
+</body>
+</html>

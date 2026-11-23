@@ -1,0 +1,15 @@
+{
+  "name": "hikari-live-engine",
+  "targetType": "executable",
+  "dependencies": {
+    "inochi2d": {
+      "path": "D:/Hikari-Rig-Tools/Inochi-SDK-087/inochi2d-0.8.7"
+    }
+  },
+  "subConfigurations": {
+    "inochi2d": "full"
+  },
+  "versions": [
+    "GL_32"
+  ]
+}

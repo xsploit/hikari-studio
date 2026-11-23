@@ -1,0 +1,372 @@
+"""Central Studio Configuration, Shader Presets, Expression Presets & Persistence.
+Zero borrowed external assets: all default stage scenes are 100% original procedural
+architectural/anime studio environments + custom user room uploads.
+"""
+from __future__ import annotations
+
+import asyncio
+import copy
+import json
+import threading
+from pathlib import Path
+from typing import Any
+
+from core.customizer import DEFAULT_CUSTOMIZER_CFG, EYE_STYLE_PRESETS
+from modules.ai_companion import BRAIN_MODES, DEFAULT_AI_CFG, upgrade_persona
+from modules.fish_tts_stream import FISH_TRANSPORTS
+from modules.sleep_memory import COLAB_BASE_MODELS, DEFAULT_MEMORY_CFG
+from modules.lipsync import DEFAULT_LIPSYNC_CFG, DEFAULT_PARAM_MAP, DEFAULT_VISEMES, LIPSYNC_ENGINES, MFCC_SCORING
+
+PARAM_MAP_FIELDS = ("inMin", "inMax", "outMin", "outMax", "smooth", "curve")
+SECRET_MASK = "********"
+# Every saved credential override. Masked in EVERY browser payload; never echoed raw.
+SECRET_AI_FIELDS = ("apiKey", "fishApiKey", "vercelApiKey", "cloudflareAccountId", "cloudflareApiToken", "perplexityApiKey")
+# Internal test / proxy hooks: never settable from a client patch.
+INTERNAL_AI_FIELDS = ("jevEndpoint", "clefEndpoint", "pplxEndpoint", "lunaEndpoint")
+
+
+def _id_list(value: Any, limit: int = 12) -> list[str]:
+    import re
+    if isinstance(value, str):
+        value = [v for v in re.split(r"[,\s]+", value) if v]
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: list[str] = []
+    for v in value:
+        t = str(v).strip()
+        if t and len(t) <= 96 and t not in out:
+            out.append(t)
+    return out[:limit]
+
+
+def sanitize_ai_brain_patch(values: dict[str, Any]) -> dict[str, Any]:
+    """Validate brain / voice / gateway fields of an `ai` patch; the masked secret is ignored."""
+    out = dict(values)
+    if "brainMode" in out:
+        m = str(out["brainMode"] or "").lower()
+        out["brainMode"] = m if m in BRAIN_MODES else "fish_duplex"
+    if "fishTtsTransport" in out:
+        t = str(out["fishTtsTransport"] or "").lower()
+        out["fishTtsTransport"] = t if t in FISH_TRANSPORTS else "sse"
+    if "fishLatency" in out and out["fishLatency"] not in ("normal", "balanced", "low"):
+        out["fishLatency"] = "balanced"
+    if "localBackend" in out and out["localBackend"] not in ("ollama", "llama-server"):
+        out["localBackend"] = "ollama"
+    for k in ("vercelProviderOrder", "vercelFallbackModels"):
+        if k in out:
+            out[k] = _id_list(out[k], 6 if k == "vercelFallbackModels" else 12)
+    if "vercelProviderOnly" in out:
+        # True = restrict strictly to vercelProviderOrder (UI checkbox); a list/string = explicit providers
+        only = out["vercelProviderOnly"]
+        out["vercelProviderOnly"] = True if only is True else ([] if only in (False, None) else _id_list(only, 12))
+    if "vercelHeaders" in out and not isinstance(out["vercelHeaders"], dict):
+        out["vercelHeaders"] = {}
+    for k in ("vercelModel", "vercelEmbeddingModel", "localModel", "localBaseUrl", "localLoraPath",
+              "clefModel", "pplxModel", "jevModel", "lunaModel", "decisionModel"):
+        if k in out:
+            out[k] = str(out[k] or "").strip()[:300]
+    clear = out.pop("clearKeys", None)
+    clear = {k for k in clear if k in SECRET_AI_FIELDS} if isinstance(clear, (list, tuple)) else set()
+    for k in SECRET_AI_FIELDS:
+        if k in clear:
+            out[k] = ""                   # explicit clear
+        elif k in out:
+            v = out[k]
+            if v is None:
+                out[k] = ""               # explicit clear (JSON null)
+            elif not isinstance(v, str) or v.strip() in ("", SECRET_MASK):
+                out.pop(k)                # empty / echoed mask: keep the stored key
+            else:
+                out[k] = v.strip()
+    for k in INTERNAL_AI_FIELDS:
+        out.pop(k, None)
+    return out
+
+
+def sanitize_memory_patch(values: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if "enabled" in values:
+        out["enabled"] = bool(values["enabled"])
+    if "embeddingProvider" in values:
+        out["embeddingProvider"] = values["embeddingProvider"] if values["embeddingProvider"] in ("vercel", "local_hash") else "vercel"
+    if "autoSleepIdleMin" in values:
+        try:
+            out["autoSleepIdleMin"] = max(0.0, min(24 * 60.0, float(values["autoSleepIdleMin"])))
+        except (TypeError, ValueError):
+            out["autoSleepIdleMin"] = 30
+    if "colabBaseModel" in values:
+        m = str(values["colabBaseModel"] or "").strip()
+        out["colabBaseModel"] = m if m in COLAB_BASE_MODELS or (m.startswith("unsloth/") and len(m) < 120) else COLAB_BASE_MODELS[0]
+    if "triage" in values:
+        t = str(values["triage"] or "").lower()
+        out["triage"] = t if t in ("auto", "off", "jev", "clef", "pplx", "luna") else "auto"
+    if "triageModel" in values:
+        out["triageModel"] = str(values["triageModel"] or "").strip()[:200]
+    if "recallTopK" in values:
+        try:
+            out["recallTopK"] = max(1, min(12, int(values["recallTopK"])))
+        except (TypeError, ValueError):
+            out["recallTopK"] = 5
+    return out
+
+
+def mask_secrets(section: dict[str, Any]) -> dict[str, Any]:
+    """Copy of an `ai`-like dict with every saved credential override masked (set -> mask, unset -> "")."""
+    out = {k: v for k, v in section.items() if k not in INTERNAL_AI_FIELDS}
+    for k in SECRET_AI_FIELDS:
+        if k in out:
+            out[k] = SECRET_MASK if out.get(k) else ""
+    return out
+
+
+def secrets_set(section: dict[str, Any]) -> dict[str, bool]:
+    return {k: bool(section.get(k)) for k in SECRET_AI_FIELDS}
+
+
+def public_config(data: dict[str, Any]) -> dict[str, Any]:
+    """Config for the browser: every saved key override masked (server env keys are never in config)."""
+    out = dict(data)
+    out["ai"] = mask_secrets(data.get("ai") or {})
+    return out
+
+
+def sanitize_lipsync_patch(values: dict[str, Any]) -> dict[str, Any]:
+    """Validate the multi-engine lip-sync fields of a `lipsync` config patch (others pass through)."""
+    out = dict(values)
+    if "engine" in out:
+        e = str(out["engine"] or "").lower()
+        out["engine"] = e if e in LIPSYNC_ENGINES else "hybrid"
+    if "mfccScoring" in out:
+        s = str(out["mfccScoring"] or "").lower()
+        out["mfccScoring"] = s if s in MFCC_SCORING else "cosine"
+    if "coarticulation" in out:
+        try:
+            out["coarticulation"] = max(0.08, min(0.60, float(out["coarticulation"])))
+        except (TypeError, ValueError):
+            out["coarticulation"] = 0.22
+    if "paramMap" in out:
+        pm_in = out["paramMap"] if isinstance(out["paramMap"], dict) else {}
+        pm: dict[str, dict[str, Any]] = {}
+        for ch, vals in pm_in.items():
+            if (ch not in DEFAULT_PARAM_MAP and ch != "mouthSpring") or not isinstance(vals, dict):
+                continue
+            clean: dict[str, Any] = {}
+            if "enabled" in vals:
+                clean["enabled"] = bool(vals["enabled"])
+            for f in PARAM_MAP_FIELDS:
+                if f in vals:
+                    try:
+                        v = float(vals[f])
+                    except (TypeError, ValueError):
+                        continue
+                    if f == "smooth":
+                        v = max(0.0, min(0.98, v))
+                    elif f == "curve":
+                        v = max(0.2, min(5.0, v))
+                    else:
+                        v = max(-2.0, min(2.0, v))
+                    clean[f] = v
+            pm[ch] = clean
+        out["paramMap"] = pm
+    out.pop("mfccCalibration", None)     # only changed through /api/lipsync/calibrate
+    return out
+
+
+SHADER_PRESETS: dict[str, dict[str, Any]] = {
+    "hikari_live_hd_v2": {
+        "label": "Hikari Live HD v2 (Flagship)",
+        "enabled": True, "sharpness": 0.35, "rimStrength": 0.72, "rimWidth": 1.00,
+        "keyColor": "#ffb8e0", "fillColor": "#8ce0ff", "keyAngle": 138.0,
+        "bloomStrength": 0.20, "bloomThresh": 0.94, "vibrance": 1.08,
+        "contrast": 1.04, "brightness": 1.01, "warmth": 0.08, "tint": "#fffbfc",
+        "ambientColor": "#f4b8da", "ambientWrap": 0.24, "chromaAb": 0.0,
+    },
+    "studio_pop": {
+        "label": "Studio Broadcast Pop",
+        "enabled": True, "sharpness": 0.75, "rimStrength": 0.95, "rimWidth": 1.0,
+        "keyColor": "#ffb8e0", "fillColor": "#8ce0ff", "keyAngle": 135.0,
+        "bloomStrength": 0.65, "bloomThresh": 0.90, "vibrance": 1.06,
+        "contrast": 1.04, "brightness": 1.01, "warmth": 0.04, "tint": "#ffffff",
+        "ambientColor": "#f4b8da", "ambientWrap": 0.22, "chromaAb": 0.0,
+    },
+    "twilight_atelier": {
+        "label": "Twilight Atelier Warm",
+        "enabled": True, "sharpness": 0.95, "rimStrength": 1.00, "rimWidth": 1.00,
+        "keyColor": "#ffbe7a", "fillColor": "#a892ff", "keyAngle": 148.0,
+        "bloomStrength": 0.24, "bloomThresh": 0.94, "vibrance": 1.06,
+        "contrast": 1.05, "brightness": 1.01, "warmth": 0.14, "tint": "#fffaf6",
+        "ambientColor": "#ffb470", "ambientWrap": 0.30, "chromaAb": 0.0,
+    },
+    "midnight_neon": {
+        "label": "Cyber Neon Balcony",
+        "enabled": True, "sharpness": 0.85, "rimStrength": 1.35, "rimWidth": 1.25,
+        "keyColor": "#ff5cc8", "fillColor": "#3ae8ff", "keyAngle": 122.0,
+        "bloomStrength": 0.95, "bloomThresh": 0.84, "vibrance": 1.14,
+        "contrast": 1.10, "brightness": 0.98, "warmth": -0.14, "tint": "#f5f4ff",
+        "ambientColor": "#8258ff", "ambientWrap": 0.48, "chromaAb": 0.22,
+    },
+    "sakura_dawn": {
+        "label": "Sakura Pastel Dream",
+        "enabled": True, "sharpness": 0.60, "rimStrength": 0.88, "rimWidth": 1.05,
+        "keyColor": "#ffd1e6", "fillColor": "#fff0d6", "keyAngle": 115.0,
+        "bloomStrength": 0.85, "bloomThresh": 0.87, "vibrance": 1.05,
+        "contrast": 1.00, "brightness": 1.04, "warmth": 0.14, "tint": "#fff8fb",
+        "ambientColor": "#ffc2dc", "ambientWrap": 0.34, "chromaAb": 0.05,
+    },
+    "crisp_cel": {
+        "label": "Ultra-Sharp Anime Cel",
+        "enabled": True, "sharpness": 1.18, "rimStrength": 0.60, "rimWidth": 0.80,
+        "keyColor": "#ffffff", "fillColor": "#c4e4ff", "keyAngle": 135.0,
+        "bloomStrength": 0.28, "bloomThresh": 0.93, "vibrance": 1.10,
+        "contrast": 1.08, "brightness": 1.02, "warmth": 0.0, "tint": "#ffffff",
+        "ambientColor": "#ffffff", "ambientWrap": 0.08, "chromaAb": 0.0,
+    },
+    "raw_unshaded": {
+        "label": "Raw Unshaded Rig",
+        "enabled": False, "sharpness": 0.0, "rimStrength": 0.0, "rimWidth": 1.0,
+        "keyColor": "#ffffff", "fillColor": "#ffffff", "keyAngle": 135.0,
+        "bloomStrength": 0.0, "bloomThresh": 0.95, "vibrance": 1.0,
+        "contrast": 1.0, "brightness": 1.0, "warmth": 0.0, "tint": "#ffffff",
+        "ambientColor": "#ffffff", "ambientWrap": 0.0, "chromaAb": 0.0,
+    },
+}
+
+ROOM_AMBIENT_MAP: dict[str, dict[str, Any]] = {
+    "twilight_atelier": {"ambientColor": "#ffb470", "keyColor": "#ffbe7a", "fillColor": "#9d8cff"},
+    "midnight_loft":    {"ambientColor": "#7f5cff", "keyColor": "#ff5cc8", "fillColor": "#3ae8ff"},
+    "sakura_pavilion":  {"ambientColor": "#ffb8d8", "keyColor": "#ffd1e6", "fillColor": "#b8d6ff"},
+    "obsidian_studio":  {"ambientColor": "#f4b8da", "keyColor": "#ffb8e0", "fillColor": "#8ce0ff"},
+    "chroma_green":     {"ambientColor": "#ffffff", "keyColor": "#ffffff", "fillColor": "#d6ecff"},
+    "transparent":      {"ambientColor": "#ffffff", "keyColor": "#ffb8e0", "fillColor": "#8ce0ff"},
+}
+
+EXPRESSION_PRESETS: dict[str, dict[str, float]] = {
+    "neutral":   {"eyeSmile": 0.0, "squint": 0.0, "browY": 0.0,  "browForm":  0.0,  "mouthForm":  0.08, "cheekPuff": 0.0, "sparkle": 0.0,  "blush": 0.0},
+    "happy":     {"eyeSmile": 0.40,"squint": 0.20,"browY": 0.25, "browForm":  0.40, "mouthForm":  0.60, "cheekPuff": 0.0, "sparkle": 0.00, "blush": 0.20},
+    "excited":   {"eyeSmile": 0.85,"squint": 0.50,"browY": 0.55, "browForm":  0.65, "mouthForm":  0.80, "cheekPuff": 0.0, "sparkle": 0.95, "blush": 0.55},
+    "shy":       {"eyeSmile": 0.25,"squint": 0.20,"browY": -0.15,"browForm": -0.35, "mouthForm":  0.20, "cheekPuff": 0.15,"sparkle": 0.10, "blush": 0.92},
+    "smug":      {"eyeSmile": 0.20,"squint": 0.55,"browY": 0.15, "browForm":  0.20, "mouthForm":  0.55, "cheekPuff": 0.0, "sparkle": 0.15, "blush": 0.10},
+    "pout":      {"eyeSmile": 0.0, "squint": 0.25,"browY": -0.45,"browForm": -0.75, "mouthForm": -0.55, "cheekPuff": 0.92,"sparkle": 0.0,  "blush": 0.45},
+    "surprised": {"eyeSmile": 0.0, "squint": 0.0, "browY": 0.85, "browForm":  0.30, "mouthForm": -0.35, "cheekPuff": 0.0, "sparkle": 0.60, "blush": 0.15},
+    "sleepy":    {"eyeSmile": 0.15,"squint": 0.82,"browY": -0.30,"browForm": -0.25, "mouthForm": -0.10, "cheekPuff": 0.0, "sparkle": 0.0,  "blush": 0.15},
+    "curious":   {"eyeSmile": 0.10,"squint": 0.05,"browY": 0.50, "browForm":  0.15, "mouthForm":  0.25, "cheekPuff": 0.0, "sparkle": 0.30, "blush": 0.10},
+    "flustered": {"eyeSmile": 0.35,"squint": 0.45,"browY": 0.20, "browForm": -0.45, "mouthForm":  0.10, "cheekPuff": 0.30,"sparkle": 0.05, "blush": 1.00},
+    "sad":       {"eyeSmile": 0.0, "squint": 0.30,"browY": -0.20,"browForm": -0.80, "mouthForm": -0.45, "cheekPuff": 0.0, "sparkle": 0.0,  "blush": 0.05},
+}
+
+
+def default_config() -> dict[str, Any]:
+    return {
+        "stage": {
+            "room": "twilight_atelier",   # procedural original rooms: twilight_atelier | midnight_loft | sakura_pavilion | obsidian_studio | chroma_green | transparent | custom
+            "customRoomUrl": "",
+            "roomBlur": 1.5,
+            "roomDim": 0.14,
+            "parallax": 0.55,
+            "particles": "auto",          # auto | embers | rain | sakura | dust | none
+            "autoMatchLighting": True,
+            "avatarX": 0.50,
+            "avatarY": 0.00,
+            "avatarScale": 1.00,
+        },
+        "camera": {
+            "scale": 1.82,
+            "x": 0.0,
+            "y": 355.0,
+        },
+        "shader": copy.deepcopy(SHADER_PRESETS["hikari_live_hd_v2"]),
+        "rig": {
+            "physicsEnabled": True,
+            "jiggleScale": 1.25,
+            "emissiveGlow": 1.0,
+            "headPatEnabled": True,
+            "chibiMode": 0.0,
+            "gloom": 0.0,
+            "autoBlink": True,
+            "blinkRate": 1.0,
+            "autoBreath": True,
+            "breathAmp": 1.0,
+            "idleSway": 1.0,
+            "autoGaze": True,
+            "autoGazeLiveliness": 1.0,
+            "mouseLookAt": True,
+            "mouseLookStrength": 0.72,
+            "expression": "happy",
+            "armRPose": 0.0,
+            "armLPose": 0.0,
+            "armRGesture": 0.0,
+            "armLGesture": 0.0,
+            "armRLift": 0.0,
+            "armLLift": 0.0,
+            "autoGestureOnSpeech": True,
+            "sparkleEyes": 0.0,
+            "blushLines": 0.15,
+            "cheekPuff": 0.0,
+            "tongueOut": 0.0,
+            "eyeSquint": 0.0,
+            "overrides": {},
+        },
+        "lipsync": copy.deepcopy(DEFAULT_LIPSYNC_CFG),
+        "visemes": copy.deepcopy(DEFAULT_VISEMES),
+        "ai": copy.deepcopy(DEFAULT_AI_CFG),
+        "customizer": copy.deepcopy(DEFAULT_CUSTOMIZER_CFG),
+        "memory": copy.deepcopy(DEFAULT_MEMORY_CFG),
+        "plugins": {},
+        "userPresets": {},
+    }
+
+
+def _deep_merge(base: dict, patch: dict) -> dict:
+    for k, v in patch.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = copy.deepcopy(v)
+    return base
+
+
+class ConfigStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._save_lock = threading.Lock()
+        self.data: dict[str, Any] = default_config()
+        self.load()
+
+    def load(self) -> None:
+        if self.path.exists():
+            try:
+                saved = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(saved, dict):
+                    _deep_merge(self.data, saved)
+            except Exception:
+                pass
+        # Upgrade a saved legacy generic persona to Hikari-chan's verbatim personality
+        # (custom user personas are left untouched) and persist it once.
+        if isinstance(self.data.get("ai"), dict) and upgrade_persona(self.data["ai"]) and self.path.exists():
+            try:
+                self.save()
+            except Exception:
+                pass
+
+    def _write(self, text: str) -> None:
+        with self._save_lock:
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(text, encoding="utf-8")
+            tmp.replace(self.path)
+
+    def save(self) -> None:
+        self._write(json.dumps(self.data, indent=2))
+
+    async def save_async(self) -> None:
+        """Snapshot on the loop (consistent, ~1 ms), write on a worker thread (no disk I/O on the loop)."""
+        text = json.dumps(self.data, indent=2)
+        await asyncio.to_thread(self._write, text)
+
+    def patch(self, section: str, values: dict[str, Any]) -> dict[str, Any]:
+        if section not in self.data:
+            self.data[section] = {}
+        if isinstance(self.data[section], dict) and isinstance(values, dict):
+            _deep_merge(self.data[section], values)
+        else:
+            self.data[section] = copy.deepcopy(values)
+        return self.data[section]

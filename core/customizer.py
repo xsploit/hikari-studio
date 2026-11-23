@@ -1,0 +1,1502 @@
+"""Modular VRM Asset Extractor & Live Character Customizer for Hikari Studio.
+- Extracts real high-res EyeIris + EyeHighlight (and other face/hair textures) from any .vrm (GLB 2.0) file.
+- Maps the VRM irises + chromatic highlights symmetrically onto Hikari's Inochi2D iris UVs (zero lazy eye!).
+- Applies real-time HSV color/brightness/highlight customizations to Eyes, Hair, and Outfit
+  and rebuilds Hikari-v28-Custom.inp in <0.6s for hot-reloading into hikari-live-engine.exe!
+"""
+from __future__ import annotations
+
+import io
+import json
+from pathlib import Path
+import struct
+from typing import Any
+
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw
+
+from core.texture_upscaler import (
+    _pack_inp,
+    _unpack_inp,
+    _upscale_eyelash_or_sclera_hd,
+    _upscale_premul_png,
+    smooth_premul_silhouette_png,
+)
+
+from core.wardrobe import SHOE_TEXTURES, TOP_TEXTURE, Wardrobe
+
+DEFAULT_VRM_PATH = Path(r"D:\Waifu Studio\assets\characters\models\a4f45d37bdbb-hikari-refined.vrm")
+ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
+DEFAULT_FRONT_HAIR_HD = ASSETS_DIR / "front_hair_lighter_bangs.png"
+DEFAULT_BACK_HAIR_HD = ASSETS_DIR / "back_hair_matching.png"
+HD_PARTS_DIR = ASSETS_DIR / "hd_parts"
+HD_FACE = HD_PARTS_DIR / "face_hd.png"
+HD_NECK = HD_PARTS_DIR / "neck_hd.png"
+HD_TOPWEAR_REFINED = HD_PARTS_DIR / "topwear_refined_hd.png"
+HD_ARM_RIGHT = HD_PARTS_DIR / "arm_right_hd.png"
+HD_BOTTOMWEAR = HD_PARTS_DIR / "bottomwear_hd.png"
+HD_LEG_RIGHT = HD_PARTS_DIR / "leg_right_hd.png"
+HD_WAVE_DIR = HD_PARTS_DIR / "wave"
+COLLAR_PREVIEW_INP = ASSETS_DIR / "collar_preview" / "Hikari-v28-CollarPreview.inp"
+
+# Exact verified texture ID groups in Hikari-v28.inp:
+TEX_IRIS_R = 23
+TEX_IRIS_L = 24
+TEX_HI_R = 25
+TEX_HI_L = 26
+TEX_SCLERA = (14, 15)
+TEX_LASH_BROW = (16, 17, 19, 21, 27, 29, 31, 33)
+# ALL hair layers: BackHair+Twintails (8), FrontHair+Ahoge (35), FrontHair See-Through (36), Eyebrows (31,32,33,34)
+TEX_HAIR = (8, 35, 36, 31, 32, 33, 34)
+# Outfit layers (skin-safe masked so chest/belly/leg skin stays untouched!): Bottomwear (4), Topwear (5), Footwear (6,7)
+TEX_OUTFIT = (4, 5, 6, 7)
+
+DEFAULT_CUSTOMIZER_CFG: dict[str, Any] = {
+    "eyeStyle": "vrm_refined",   # vrm_refined | original_solid_pupil | original_hd | vrm_ruby | vrm_aqua | vrm_amber | vrm_emerald | custom
+    "eyeHue": 0.0,               # -180 .. +180 deg
+    "eyeSat": 1.05,              # 0.2 .. 1.8
+    "eyeVal": 1.08,              # 0.6 .. 1.5
+    "eyeHighlight": 1.00,        # 0.0 .. 1.5
+    "eyeScale": 1.04,            # 0.80 .. 1.25
+    "eyeOffsetX": 0.0,           # -0.15 .. +0.15 (symmetrical convergence)
+    "eyeOffsetY": 0.0,           # -0.15 .. +0.15
+    "hairColor": "#ff6a9e",      # Direct Hair Color Picker!
+    "hairColorStrength": 0.0,    # 0.0 = original Sakura Pink, >0 = direct picked hair color
+    "hairHue": 0.0,              # -180 .. +180 deg
+    "hairSat": 1.00,             # 0.0 .. 1.6
+    "hairVal": 1.00,             # 0.6 .. 1.35
+    "bangsMode": "solid",        # solid (full natural outline, zero fade/chop) | seethrough (50% fade over eye) | custom
+    "customFrontHairPath": "",
+    "outfitStyle": "original",
+    "shoeStyle": "original",
+    "outfitTint": "#d6284c",     # Recolors dark fabric cleanly while protecting peach skin!
+    "outfitTintStrength": 0.0,   # 0.0 .. 1.0 (auto-sets to 0.78 when picking a color in UI)
+    "outfitVal": 1.00,           # 0.6 .. 1.8
+    "customEyePath": "",
+}
+
+EYE_STYLE_PRESETS: dict[str, dict[str, Any]] = {
+    "vrm_refined":          {"label": "VRM Galaxy Violet (Refined)",      "eyeHue": 0.0,    "eyeSat": 1.05, "eyeVal": 1.08, "eyeHighlight": 1.0},
+    "original_solid_pupil": {"label": "Original 2D · Solid Black Pupils", "eyeHue": 0.0,    "eyeSat": 1.05, "eyeVal": 1.02, "eyeHighlight": 1.0},
+    "original_hd":          {"label": "Original 2D Art (Upscaled HD)",    "eyeHue": 0.0,    "eyeSat": 1.00, "eyeVal": 1.00, "eyeHighlight": 0.9},
+    "vrm_ruby":             {"label": "VRM Ruby Rose",                    "eyeHue": 28.0,   "eyeSat": 1.08, "eyeVal": 1.12, "eyeHighlight": 1.0},
+    "vrm_aqua":             {"label": "VRM Cyber Aqua",                   "eyeHue": -128.0, "eyeSat": 1.10, "eyeVal": 1.15, "eyeHighlight": 1.05},
+    "vrm_amber":            {"label": "VRM Sunset Gold",                  "eyeHue": 82.0,   "eyeSat": 1.12, "eyeVal": 1.18, "eyeHighlight": 1.0},
+    "vrm_emerald":          {"label": "VRM Emerald Mint",                 "eyeHue": -168.0, "eyeSat": 1.05, "eyeVal": 1.12, "eyeHighlight": 1.0},
+}
+
+
+def extract_vrm_eye_assets(vrm_path: Path, out_dir: Path) -> dict[str, Path]:
+    """Extract EyeIris and EyeHighlight PNGs from any VRM (GLB 2.0) file."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    data = vrm_path.read_bytes()
+    if data[:4] != b"glTF":
+        raise ValueError("Not a valid GLB/VRM binary file.")
+    jlen, _ = struct.unpack_from("<II", data, 12)
+    gltf = json.loads(data[20 : 20 + jlen].decode("utf-8"))
+    bin_off = 20 + jlen
+    blen, _ = struct.unpack_from("<II", data, bin_off)
+    bin_data = data[bin_off + 8 : bin_off + 8 + blen]
+
+    texs = gltf.get("textures", [])
+    imgs = gltf.get("images", [])
+    bvs = gltf.get("bufferViews", [])
+
+    def load_img_by_idx(img_idx: int) -> Image.Image:
+        bv = bvs[imgs[img_idx]["bufferView"]]
+        off = bv.get("byteOffset", 0)
+        return Image.open(io.BytesIO(bin_data[off : off + bv["byteLength"]])).convert("RGBA")
+
+    iris_im = None
+    hi_im = None
+    for mat in gltf.get("materials", []):
+        mname = str(mat.get("name") or "").lower()
+        bct = mat.get("pbrMetallicRoughness", {}).get("baseColorTexture", {}).get("index")
+        if bct is None:
+            continue
+        img_idx = texs[bct]["source"]
+        if "eyeiris" in mname or ("iris" in mname and iris_im is None):
+            iris_im = load_img_by_idx(img_idx)
+        elif "eyehighlight" in mname or ("highlight" in mname and "eye" in mname and hi_im is None):
+            hi_im = load_img_by_idx(img_idx)
+
+    if iris_im is None:
+        raise ValueError("Could not locate EyeIris material in this VRM file.")
+
+    saved: dict[str, Path] = {}
+    # Split 1024x512 side-by-side VRM iris texture into clean tight-cropped Left & Right irises
+    iw, ih = iris_im.size
+    if iw >= ih * 1.6:
+        half_r = iris_im.crop((0, 0, iw // 2, ih))
+        half_l = iris_im.crop((iw // 2, 0, iw, ih))
+    else:
+        half_r = iris_im
+        half_l = iris_im.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+
+    def crop_pair(iris_half: Image.Image, hi_half: Image.Image | None, tag: str) -> None:
+        arr = np.array(iris_half, dtype=np.uint8)
+        ys, xs = np.where(arr[..., 3] > 12)
+        if len(xs) == 0:
+            raise ValueError("Empty VRM iris alpha.")
+        # Square centered crop around iris bounding box so pupil is dead-center!
+        cx = 0.5 * (xs.min() + xs.max())
+        cy = 0.5 * (ys.min() + ys.max())
+        rad = max(xs.max() - xs.min(), ys.max() - ys.min()) * 0.52
+        x0, y0 = int(round(cx - rad)), int(round(cy - rad))
+        x1, y1 = int(round(cx + rad)), int(round(cy + rad))
+        pad_box = (max(0, x0), max(0, y0), min(iris_half.width, x1), min(iris_half.height, y1))
+        ic = iris_half.crop(pad_box).resize((256, 256), Image.Resampling.LANCZOS)
+        p_i = out_dir / f"vrm_iris_{tag}.png"
+        ic.save(p_i)
+        saved[f"iris_{tag}"] = p_i
+        if hi_half is not None:
+            hc = hi_half.crop(pad_box).resize((256, 256), Image.Resampling.LANCZOS)
+            p_h = out_dir / f"vrm_hi_{tag}.png"
+            hc.save(p_h)
+            saved[f"hi_{tag}"] = p_h
+
+    hi_r = hi_im.crop((0, 0, hi_im.width // 2, hi_im.height)) if (hi_im and hi_im.width >= hi_im.height * 1.6) else hi_im
+    hi_l = hi_im.crop((hi_im.width // 2, 0, hi_im.width, hi_im.height)) if (hi_im and hi_im.width >= hi_im.height * 1.6) else (hi_im.transpose(Image.Transpose.FLIP_LEFT_RIGHT) if hi_im else None)
+
+    crop_pair(half_r, hi_r, "r")
+    crop_pair(half_l, hi_l, "l")
+    return saved
+
+
+def _shift_hsv_rgb(rgb: np.ndarray, hue_deg: float, sat_mul: float, val_mul: float) -> np.ndarray:
+    if abs(hue_deg) < 0.5 and abs(sat_mul - 1.0) < 0.01 and abs(val_mul - 1.0) < 0.01:
+        return rgb
+    u8 = np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
+    hsv = cv2.cvtColor(u8, cv2.COLOR_RGB2HSV).astype(np.float32)
+    hsv[..., 0] = (hsv[..., 0] + hue_deg * 0.5) % 180.0
+    hsv[..., 1] = np.clip(hsv[..., 1] * sat_mul, 0.0, 255.0)
+    hsv[..., 2] = np.clip(hsv[..., 2] * val_mul, 0.0, 255.0)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
+
+
+def _recolor_hair_direct_png(png_bytes: bytes, target_hex: str, strength: float, sat_mul: float, val_mul: float) -> bytes:
+    """Recolor anime hair to ANY picked hex color while preserving glossy highlights, shading & dark hair ties!"""
+    hx = str(target_hex or "#ff6a9e").strip().lstrip("#")
+    if len(hx) != 6:
+        return png_bytes
+    tr, tg, tb = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
+    tgt_hsv = cv2.cvtColor(np.array([[[tr, tg, tb]]], dtype=np.uint8), cv2.COLOR_RGB2HSV)[0, 0].astype(np.float32)
+    tgt_h, tgt_s, tgt_v = float(tgt_hsv[0]), float(tgt_hsv[1]) / 255.0, float(tgt_hsv[2]) / 255.0
+
+    im = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+    arr = np.array(im, dtype=np.float32)
+    a = arr[..., 3] / 255.0
+    mask = a > 0.01
+    rgb = np.zeros_like(arr[..., :3])
+    if np.any(mask):
+        rgb[mask] = np.clip(arr[mask, :3] / np.maximum(a[mask, None], 0.01), 0.0, 255.0)
+        u8 = np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
+        hsv = cv2.cvtColor(u8, cv2.COLOR_RGB2HSV).astype(np.float32)
+        # Preserve glossy white speculars (low-sat bright pixels) & dark navy hair ties cleanly
+        orig_s = hsv[..., 1] / 255.0
+        orig_v = hsv[..., 2] / 255.0
+        # Target hue replaces pink hair hue, scaled smoothly by target saturation & value
+        new_hsv = hsv.copy()
+        new_hsv[..., 0] = tgt_h
+        # Keep highlights bright white-tinted and shadows rich
+        new_hsv[..., 1] = np.clip(orig_s * (0.15 + 1.15 * tgt_s) * sat_mul * 255.0, 0.0, 255.0)
+        v_gain = (0.48 + 0.65 * tgt_v) * val_mul
+        new_hsv[..., 2] = np.clip(orig_v * v_gain * 255.0, 0.0, 255.0)
+        recol = cv2.cvtColor(new_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
+        rgb = rgb * (1.0 - strength) + recol * strength
+
+    out = np.zeros_like(arr, dtype=np.uint8)
+    out[..., :3] = np.clip(np.rint(rgb * a[..., None]), 0, 255).astype(np.uint8)
+    out[..., 3] = arr[..., 3].astype(np.uint8)
+    out[out[..., 3] == 0] = 0
+    buf = io.BytesIO()
+    Image.fromarray(out).save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
+def _recolor_outfit_skin_safe_png(
+    png_bytes: bytes, tint_hex: str, strength: float, val_mul: float, *, preserve_print: bool = False
+) -> bytes:
+    """Recolor charcoal/black fabric on Topwear/Bottomwear/Footwear while keeping peach skin 100% untouched!"""
+    if strength < 0.01 and abs(val_mul - 1.0) < 0.01:
+        return png_bytes
+    hx = str(tint_hex or "#ffffff").strip().lstrip("#")
+    if len(hx) == 6:
+        tr, tg, tb = int(hx[0:2], 16) / 255.0, int(hx[2:4], 16) / 255.0, int(hx[4:6], 16) / 255.0
+    else:
+        tr, tg, tb = 1.0, 1.0, 1.0
+
+    im = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+    arr = np.array(im, dtype=np.float32)
+    a = arr[..., 3] / 255.0
+    mask = a > 0.02
+    rgb = np.zeros_like(arr[..., :3])
+    if np.any(mask):
+        rgb[mask] = np.clip(arr[mask, :3] / np.maximum(a[mask, None], 0.02), 0.0, 255.0)
+        # Detect warm peach skin pixels (high R, warm R > G > B, bright luma) and PROTECT them!
+        r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+        lum = 0.299 * r + 0.587 * g + 0.114 * b
+        is_skin = (r > 158.0) & (r > g + 10.0) & (g > b - 6.0) & (lum > 140.0)
+        protected = is_skin
+        if preserve_print:
+            # Keep the cyan piping, light screen print, and rubber soles legible.
+            accent = np.maximum(lum - 105.0, np.minimum(g, b) - r - 16.0)
+            protected = protected | (accent >= 37.0)
+        cloth_w = cv2.GaussianBlur((mask & ~protected).astype(np.float32), (0, 0), 1.5)
+        cloth_w[protected] = 0.0
+        cloth_w = cloth_w[..., None]
+
+        # Colorize dark fabric smoothly using luminance-preserving tint
+        luma_n = np.clip((lum / 255.0) * val_mul, 0.0, 1.0)[..., None]
+        # Lift charcoal floor slightly when tinting brightly so colored tops actually pop!
+        lifted = np.clip(luma_n * (1.0 + strength * 0.85) + strength * 0.08, 0.0, 1.0)
+        tinted = lifted * np.array([tr, tg, tb], dtype=np.float32)[None, None, :] * 255.0
+        scaled_orig = np.clip(rgb * val_mul, 0.0, 255.0)
+        recolored = scaled_orig * (1.0 - strength) + tinted * strength
+        rgb = np.clip(rgb * (1.0 - cloth_w) + recolored * cloth_w, 0.0, 255.0)
+
+    out = arr.astype(np.uint8)
+    out[mask, :3] = np.rint(rgb[mask] * a[mask, None]).astype(np.uint8)
+    buf = io.BytesIO()
+    Image.fromarray(out).save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
+def _tint_premul_png(png_bytes: bytes, hue_deg: float, sat_mul: float, val_mul: float) -> bytes:
+    if abs(hue_deg) < 0.5 and abs(sat_mul - 1.0) < 0.01 and abs(val_mul - 1.0) < 0.01:
+        return png_bytes
+    im = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+    arr = np.array(im, dtype=np.float32)
+    a = arr[..., 3] / 255.0
+    mask = a > 0.01
+    rgb = np.zeros_like(arr[..., :3])
+    if np.any(mask):
+        rgb[mask] = np.clip(arr[mask, :3] / np.maximum(a[mask, None], 0.01), 0.0, 255.0)
+        rgb = _shift_hsv_rgb(rgb, hue_deg, sat_mul, val_mul)
+    out = np.zeros_like(arr, dtype=np.uint8)
+    out[..., :3] = np.clip(np.rint(rgb * a[..., None]), 0, 255).astype(np.uint8)
+    out[..., 3] = arr[..., 3].astype(np.uint8)
+    out[out[..., 3] == 0] = 0
+    buf = io.BytesIO()
+    Image.fromarray(out).save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
+def _build_vrm_mapped_iris(
+    orig_iris_png: bytes,
+    vrm_iris_path: Path,
+    vrm_hi_path: Path | None,
+    is_left: bool,
+    cfg: dict[str, Any],
+) -> bytes:
+    """Map the real high-res VRM iris + chromatic highlights symmetrically into Hikari's exact UV box.
+    Uses the EXACT geometric center of the original iris alpha so BOTH eyes converge cleanly (zero lazy eye!)."""
+    orig = Image.open(io.BytesIO(orig_iris_png)).convert("RGBA")
+    ow, oh = orig.size
+    orig_a = np.array(orig, dtype=np.float32)[..., 3] / 255.0
+
+    # Target crisp 256px canvas preserving original UV aspect ratio
+    S = 256
+    nw, nh = S, int(round(S * oh / max(1, ow)))
+    a_up = cv2.resize(orig_a, (nw, nh), interpolation=cv2.INTER_CUBIC)
+
+    # Find exact center & size of original iris silhouette in UV space
+    ys, xs = np.where(a_up > 0.35)
+    cx = 0.5 * (xs.min() + xs.max()) if len(xs) else nw * 0.5
+    cy = 0.5 * (ys.min() + ys.max()) if len(ys) else nh * 0.5
+    # Slight symmetrical inward offset if user tweaks eyeOffsetX
+    sgn = -1.0 if is_left else 1.0
+    cx += float(cfg.get("eyeOffsetX", 0.0)) * nw * sgn
+    cy += float(cfg.get("eyeOffsetY", 0.0)) * nh
+    # Keep iris slightly taller anime oval (matches original 26x28 proportions cleanly!)
+    sc = float(cfg.get("eyeScale", 1.04))
+    w_box = max(20.0, (xs.max() - xs.min()) * sc) if len(xs) else nw * 0.9
+    h_box = max(20.0, (ys.max() - ys.min()) * sc) if len(ys) else nh * 0.9
+
+    # Load VRM iris & apply live HSV customization!
+    v_im = Image.open(vrm_iris_path).convert("RGBA")
+    v_arr = np.array(v_im, dtype=np.float32)
+    v_rgb = _shift_hsv_rgb(
+        v_arr[..., :3],
+        float(cfg.get("eyeHue", 0.0)),
+        float(cfg.get("eyeSat", 1.05)),
+        float(cfg.get("eyeVal", 1.08)),
+    )
+    v_a = v_arr[..., 3:4] / 255.0
+
+    # Composite the real VRM chromatic glossy highlights right on top!
+    hi_str = float(cfg.get("eyeHighlight", 1.0))
+    if vrm_hi_path and vrm_hi_path.exists() and hi_str > 0.01:
+        h_im = Image.open(vrm_hi_path).convert("RGBA").resize(v_im.size, Image.Resampling.LANCZOS)
+        h_arr = np.array(h_im, dtype=np.float32)
+        ha = np.clip((h_arr[..., 3:4] / 255.0) * hi_str, 0.0, 1.0)
+        # Screen/alpha blend highlights crisply over the iris
+        v_rgb = np.clip(v_rgb * (1.0 - ha * 0.85) + h_arr[..., :3] * ha * 1.15, 0.0, 255.0)
+
+    # Subtle top eyelid shadow so the VRM iris sits naturally under Hikari's 2D eyelashes
+    yy_v = np.linspace(0.0, 1.0, v_im.height, dtype=np.float32)[:, None, None]
+    lid = np.clip((0.26 - yy_v) / 0.26, 0.0, 1.0)
+    v_rgb *= (1.0 - 0.32 * lid)
+
+    # Crisp subtle unsharp pass on the 256px VRM iris
+    blur = cv2.GaussianBlur(v_rgb, (0, 0), 1.0)
+    v_rgb = np.clip(v_rgb + (v_rgb - blur) * 0.55, 0.0, 255.0)
+
+    # Place centered into the exact UV canvas
+    tw, th = max(8, int(round(w_box))), max(8, int(round(h_box)))
+    r_rgb = cv2.resize(v_rgb, (tw, th), interpolation=cv2.INTER_LANCZOS4)
+    r_a = np.clip(cv2.resize(v_a[..., 0], (tw, th), interpolation=cv2.INTER_LANCZOS4), 0.0, 1.0)
+
+    canvas_rgb = np.zeros((nh, nw, 3), dtype=np.float32)
+    canvas_a = np.zeros((nh, nw), dtype=np.float32)
+    x0 = int(round(cx - tw * 0.5))
+    y0 = int(round(cy - th * 0.5))
+    sx0, sy0 = max(0, -x0), max(0, -y0)
+    dx0, dy0 = max(0, x0), max(0, y0)
+    cw = min(tw - sx0, nw - dx0)
+    ch = min(th - sy0, nh - dy0)
+    if cw > 0 and ch > 0:
+        canvas_rgb[dy0 : dy0 + ch, dx0 : dx0 + cw] = r_rgb[sy0 : sy0 + ch, sx0 : sx0 + cw]
+        canvas_a[dy0 : dy0 + ch, dx0 : dx0 + cw] = r_a[sy0 : sy0 + ch, sx0 : sx0 + cw]
+
+    premul = np.zeros((nh, nw, 4), dtype=np.uint8)
+    premul[..., :3] = np.clip(np.rint(canvas_rgb * canvas_a[..., None]), 0, 255).astype(np.uint8)
+    premul[..., 3] = np.clip(np.rint(canvas_a * 255.0), 0, 255).astype(np.uint8)
+    premul[premul[..., 3] == 0] = 0
+    buf = io.BytesIO()
+    Image.fromarray(premul).save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
+def _build_original_solid_pupil_iris(orig_iris_png: bytes, is_left: bool, cfg: dict[str, Any]) -> bytes:
+    """Clean 8x upscaled original 2D ruby-pink iris with a completely filled-in round solid black pupil + crisp catchlight."""
+    im = Image.open(io.BytesIO(orig_iris_png)).convert("RGBA")
+    w, h = im.size
+    arr = np.array(im, dtype=np.float32)
+    alpha = arr[..., 3] / 255.0
+    straight = np.zeros((h, w, 3), dtype=np.float32)
+    m = alpha > 0.02
+    if np.any(m):
+        straight[m] = np.clip(arr[m, :3] / np.maximum(alpha[m, None], 0.02), 0.0, 255.0)
+
+    S = 256
+    nw, nh = S, int(round(S * h / max(1, w)))
+    up_rgb = cv2.resize(straight, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
+    up_a = np.clip((cv2.GaussianBlur(cv2.resize(alpha, (nw, nh), interpolation=cv2.INTER_CUBIC), (0, 0), 2.4) - 0.44) / 0.14, 0.0, 1.0)
+    up_rgb = _shift_hsv_rgb(up_rgb, float(cfg.get("eyeHue", 0.0)), float(cfg.get("eyeSat", 1.05)), float(cfg.get("eyeVal", 1.02)))
+
+    yy, xx = np.mgrid[0:nh, 0:nw].astype(np.float32)
+    ys, xs = np.where(up_a > 0.35)
+    cx = 0.5 * (xs.min() + xs.max()) if len(xs) else nw * 0.5
+    cy = 0.5 * (ys.min() + ys.max()) if len(ys) else nh * 0.5
+    sgn = -1.0 if is_left else 1.0
+    cx += float(cfg.get("eyeOffsetX", 0.0)) * nw * sgn
+    cy += float(cfg.get("eyeOffsetY", 0.0)) * nh
+    rx = max(20.0, (xs.max() - xs.min()) * 0.5) if len(xs) else nw * 0.45
+    ry = max(20.0, (ys.max() - ys.min()) * 0.5) if len(ys) else nh * 0.45
+
+    # Completely filled-in round glossy jet-black anime pupil (replaces hollow oval ring cleanly!)
+    d_pup = np.hypot((xx - cx) / (rx * 0.34), (yy - cy) / (ry * 0.36))
+    pup_mask = 1.0 - np.clip((d_pup - 0.86) / 0.18, 0.0, 1.0)
+    up_rgb = up_rgb * (1.0 - pup_mask[..., None]) + np.array([14.0, 6.0, 14.0]) * pup_mask[..., None]
+
+    # Crisp anime specular catchlight top-left of pupil
+    hi_str = float(cfg.get("eyeHighlight", 1.0))
+    if hi_str > 0.01:
+        for hx, hy, hr in [(-0.34, -0.32, 0.17), (0.34, 0.30, 0.08)]:
+            d_h = np.hypot((xx - (cx + hx * rx)) / (rx * hr), (yy - (cy + hy * ry)) / (ry * hr))
+            hw = np.clip((1.0 - np.clip((d_h - 0.65) / 0.35, 0.0, 1.0)) * hi_str, 0.0, 1.0)
+            up_rgb = up_rgb * (1.0 - hw[..., None] * 0.94) + np.array([255.0, 250.0, 254.0]) * (hw[..., None] * 0.94)
+
+    blur = cv2.GaussianBlur(up_rgb, (0, 0), 1.0)
+    up_rgb = np.clip(up_rgb + (up_rgb - blur) * 0.55, 0.0, 255.0)
+
+    premul = np.zeros((nh, nw, 4), dtype=np.uint8)
+    premul[..., :3] = np.clip(np.rint(up_rgb * up_a[..., None]), 0, 255).astype(np.uint8)
+    premul[..., 3] = np.clip(np.rint(up_a * 255.0), 0, 255).astype(np.uint8)
+    premul[premul[..., 3] == 0] = 0
+    buf = io.BytesIO()
+    Image.fromarray(premul).save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
+def _transparent_png(size: tuple[int, int] = (32, 32)) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGBA", size, (0, 0, 0, 0)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _mirror_premul_png_h(png_bytes: bytes, target_size: tuple[int, int] | None = None) -> bytes:
+    """Horizontally mirror a premultiplied RGBA PNG cleanly (un-premult -> flip/resize -> re-premult)
+    so Left Eye (L) matches Right Eye (R) with 100% mirror symmetry and zero edge halos."""
+    im = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+    arr = np.array(im, dtype=np.float32)
+    a = arr[..., 3] / 255.0
+    rgb = np.zeros_like(arr[..., :3])
+    m = a > 0.01
+    if np.any(m):
+        rgb[m] = np.clip(arr[m, :3] / np.maximum(a[m, None], 0.01), 0.0, 255.0)
+    rgb = rgb[:, ::-1, :]
+    a = a[:, ::-1]
+    if target_size is not None and (rgb.shape[1], rgb.shape[0]) != target_size:
+        tw, th = target_size
+        rgb = cv2.resize(rgb, (tw, th), interpolation=cv2.INTER_LANCZOS4)
+        a = np.clip(cv2.resize(a, (tw, th), interpolation=cv2.INTER_LANCZOS4), 0.0, 1.0)
+    premul = np.zeros((a.shape[0], a.shape[1], 4), dtype=np.uint8)
+    premul[..., :3] = np.clip(np.rint(rgb * a[..., None]), 0, 255).astype(np.uint8)
+    premul[..., 3] = np.clip(np.rint(a * 255.0), 0, 255).astype(np.uint8)
+    premul[premul[..., 3] == 0] = 0
+    buf = io.BytesIO()
+    Image.fromarray(premul).save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
+def _pad_mesh_node_to_alpha(node: dict[str, Any], a_arr: np.ndarray, min_steps: int = 2, max_steps: int = 28) -> None:
+    """Expand ONLY outer boundary vertices & UVs of an Inochi2D mesh by the exact rest-pose affine Jacobian
+    so zero pixels of the texture ever get hard-clipped by tight polygon boundaries.
+    Preserves vertex count and every deform/physics binding 100% intact with zero texture shift or folding."""
+    m = node.get("mesh")
+    if not m:
+        return
+    verts = np.array(m["verts"], dtype=np.float64).reshape(-1, 2)
+    uvs = np.array(m["uvs"], dtype=np.float64).reshape(-1, 2)
+    idx = np.array(m["indices"], dtype=np.int32).reshape(-1, 3)
+
+    sx = np.polyfit(uvs[:, 0], verts[:, 0], 1)
+    sy = np.polyfit(uvs[:, 1], verts[:, 1], 1)
+
+    def _areas(u_cur: np.ndarray) -> np.ndarray:
+        a, b, c = u_cur[idx[:, 0]], u_cur[idx[:, 1]], u_cur[idx[:, 2]]
+        return 0.5 * ((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+
+    areas0 = _areas(uvs)
+    sgn = 1.0 if float(np.median(areas0)) >= 0.0 else -1.0
+
+    edge_tris: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
+    for ti, tri in enumerate(idx):
+        for k in range(3):
+            u, v = int(tri[k]), int(tri[(k + 1) % 3])
+            edge_tris.setdefault((min(u, v), max(u, v)), []).append((ti, u, v))
+
+    b_normals: dict[int, np.ndarray] = {}
+    for lst in edge_tris.values():
+        if len(lst) == 1:
+            ti, u, v = lst[0]
+            w_idx = [int(x) for x in idx[ti] if int(x) != u and int(x) != v][0]
+            e = uvs[v] - uvs[u]
+            nrm = np.array([e[1], -e[0]], dtype=np.float64)
+            if float(np.dot(nrm, 0.5 * (uvs[u] + uvs[v]) - uvs[w_idx])) < 0.0:
+                nrm = -nrm
+            ln = float(np.linalg.norm(nrm))
+            if ln > 1e-12:
+                nrm /= ln
+                for vi in (u, v):
+                    b_normals[vi] = b_normals.get(vi, np.zeros(2, dtype=np.float64)) + nrm
+
+    inc: dict[int, list[int]] = {}
+    for ti, tri in enumerate(idx):
+        for vi in tri:
+            inc.setdefault(int(vi), []).append(ti)
+
+    h, w = a_arr.shape
+    uvs_new = uvs.copy()
+
+    for step in range(max_steps):
+        mask = Image.new("L", (w, h), 0)
+        draw = ImageDraw.Draw(mask)
+        for tri in idx:
+            draw.polygon([(float(uvs_new[i, 0] * w), float(uvs_new[i, 1] * h)) for i in tri], fill=255)
+        cl = a_arr & (np.array(mask) < 128)
+        if not cl.any() and step >= min_steps:
+            break
+        cy, cx = np.where(cl)
+        c_uv = np.stack([cx / float(w), cy / float(h)], axis=1) if len(cx) else np.zeros((0, 2))
+        for vi, nsum in b_normals.items():
+            ln = float(np.linalg.norm(nsum))
+            if ln < 1e-9:
+                continue
+            nrm = nsum / ln
+            if step >= min_steps:
+                if len(c_uv) == 0:
+                    continue
+                dists = np.hypot(c_uv[:, 0] - uvs_new[vi, 0], c_uv[:, 1] - uvs_new[vi, 1])
+                if float(dists.min()) > 0.08:
+                    continue
+                nearest = c_uv[int(np.argmin(dists))]
+                to_c = nearest - uvs_new[vi]
+                tln = float(np.linalg.norm(to_c))
+                if tln > 1e-9:
+                    to_c /= tln
+                    if float(np.dot(to_c, nrm)) > 0.15:
+                        nrm = 0.55 * nrm + 0.45 * to_c
+                        nrm /= float(np.linalg.norm(nrm))
+            cand = np.clip(uvs_new[vi] + nrm * 0.0028, 0.0, 1.0)
+            old = uvs_new[vi].copy()
+            uvs_new[vi] = cand
+            tis = np.array(inc[vi], dtype=np.int32)
+            if float((_areas(uvs_new)[tis] * sgn).min()) <= 1e-7:
+                uvs_new[vi] = old
+
+    duv = uvs_new - uvs
+    verts_new = verts.copy()
+    verts_new[:, 0] += duv[:, 0] * sx[0]
+    verts_new[:, 1] += duv[:, 1] * sy[0]
+    m["uvs"] = [round(float(x), 6) for x in uvs_new.reshape(-1)]
+    m["verts"] = [round(float(x), 4) for x in verts_new.reshape(-1)]
+
+
+def _pad_all_meshes(header: bytes, raw_textures: list[tuple[int, bytes]]) -> bytes:
+    """Pad outer mesh boundaries on hair, arms, torso/topwear, bottomwear, legs & symmetrical eyes
+    so zero anti-aliased edge pixels are ever sliced off by tight low-res polygon boundaries."""
+    puppet = json.loads(header[12:])
+    pending = [puppet["nodes"]]
+    nodes: dict[int, dict[str, Any]] = {}
+    while pending:
+        node = pending.pop()
+        nodes[node["uuid"]] = node
+        pending.extend(node.get("children", ()))
+
+    def _alpha_from_file(p: Path) -> np.ndarray:
+        return np.array(Image.open(p).convert("RGBA"))[..., 3] > 10
+
+    def _alpha_from_raw(tid: int, flip_h: bool = False) -> np.ndarray:
+        im = Image.open(io.BytesIO(raw_textures[tid][1])).convert("RGBA")
+        a = np.array(im)[..., 3] > 10
+        return a[:, ::-1] if flip_h else a
+
+    if 1008 in nodes and DEFAULT_BACK_HAIR_HD.exists():
+        _pad_mesh_node_to_alpha(nodes[1008], _alpha_from_file(DEFAULT_BACK_HAIR_HD))
+    if 1035 in nodes and DEFAULT_FRONT_HAIR_HD.exists():
+        _pad_mesh_node_to_alpha(nodes[1035], _alpha_from_file(DEFAULT_FRONT_HAIR_HD))
+    if 1036 in nodes and DEFAULT_FRONT_HAIR_HD.exists():
+        _pad_mesh_node_to_alpha(nodes[1036], _alpha_from_file(DEFAULT_FRONT_HAIR_HD))
+
+    # Pad arms, legs, bottomwear, topwear, face & neck against HD parts (or raw fallback) so zero pixels clip!
+    for uid, tid, hd_path, flip_h in (
+        (1000, 0, HD_ARM_RIGHT, True),
+        (1046, 46, HD_ARM_RIGHT, False),
+        (1001, 1, HD_LEG_RIGHT, False),
+        (1002, 2, HD_LEG_RIGHT, True),
+        (1003, 3, HD_NECK, False),
+        (1004, 4, HD_BOTTOMWEAR, False),
+        (1005, 5, HD_TOPWEAR_REFINED, False),
+        (1011, 11, HD_FACE, False),
+    ):
+        if uid in nodes and tid < len(raw_textures):
+            if hd_path.exists():
+                a = _alpha_from_file(hd_path)
+                if flip_h:
+                    a = a[:, ::-1]
+            else:
+                a = _alpha_from_raw(tid)
+            _pad_mesh_node_to_alpha(nodes[uid], a, min_steps=3, max_steps=18)
+
+    # Pad mirrored Left Eye nodes (1015 sclera, 1021 upper lash, 1029 closed eye) so mirrored R tips never clip!
+    for uid, tid_r, flip_h in ((1014, 14, False), (1015, 14, True), (1019, 19, False), (1021, 19, True), (1027, 27, False), (1029, 27, True)):
+        if uid in nodes and tid_r < len(raw_textures):
+            _pad_mesh_node_to_alpha(nodes[uid], _alpha_from_raw(tid_r, flip_h=flip_h), min_steps=2, max_steps=14)
+
+    # Seat ONLY the raised wave shoulder roots (50006, 50015) flush with the trapezius slope (resting arms untouched!)
+    for uid, dx, dy in ((50006, 1.8, -3.8), (50015, -1.8, -3.8)):
+        if uid in nodes:
+            tr = nodes[uid].setdefault("transform", {}).setdefault("trans", [0.0, 0.0, 0.0])
+            tr[0] = round(float(tr[0]) + dx, 4)
+            tr[1] = round(float(tr[1]) + dy, 4)
+
+    content = json.dumps(puppet, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return header[:8] + len(content).to_bytes(4, "big") + content
+
+
+def _sweep_front_bangs(header: bytes) -> bytes:
+    """Keep FrontHair mesh geometry 100% untouched (zero triangle folding or crooked hooks);
+    only remove the eye DodgeMask & semi-transparent ghost duplicate so both eyes stay crisp."""
+    puppet = json.loads(header[12:])
+    pending = [puppet["nodes"]]
+    nodes = {}
+    while pending:
+        node = pending.pop()
+        nodes[node["uuid"]] = node
+        pending.extend(node.get("children", ()))
+
+    front_hair = nodes[1035]
+    front_hair["masks"] = [
+        mask for mask in front_hair["masks"]
+        if not (mask["mode"] == "DodgeMask" and mask["source"] in (1014, 1015))
+    ]
+    nodes[1036]["enabled"] = False
+    content = json.dumps(puppet, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return header[:8] + len(content).to_bytes(4, "big") + content
+
+
+def _curve_front_bangs_tex(png_bytes: bytes) -> bytes:
+    """Smooth 4x pixel-space anime bang curve on ArtMeshFrontHair (tex[35]).
+    Gently lifts and curves ONLY the center-right bang lock away from the viewer-right eye
+    without chopping flat edges, folding mesh triangles, or touching the right temple lock."""
+    im = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+    arr = np.array(im, dtype=np.float32)
+    h, w = arr.shape[:2]
+    a = arr[..., 3] / 255.0
+    rgb = np.zeros((h, w, 3), dtype=np.float32)
+    m = a > 0.01
+    rgb[m] = np.clip(arr[m, :3] / np.maximum(a[m, None], 0.01), 0.0, 255.0)
+
+    def _ss(lo: float, hi: float, v: np.ndarray) -> np.ndarray:
+        t = np.clip((v - lo) / (hi - lo), 0.0, 1.0)
+        return t * t * (3.0 - 2.0 * t)
+
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    sx, sy = w / 928.0, h / 1196.0
+    nx, ny = xx / sx, yy / sy
+
+    # Softly remove ONLY the stray detached whisker tip strictly inside nx in [534..632] (never touches right temple lock!)
+    stray_tail = _ss(534.0, 562.0, nx) * (1.0 - _ss(612.0, 632.0, nx)) * _ss(690.0, 722.0, ny)
+    a = a * (1.0 - stray_tail)
+
+    # Follow the empty transparent V-gap between center bangs and right temple lock -> ZERO edge pinch!
+    x_gap = np.interp(ny, [420.0, 500.0, 560.0, 620.0, 680.0, 760.0], [568.0, 582.0, 610.0, 642.0, 682.0, 725.0])
+    in_x = _ss(295.0, 415.0, nx) * (1.0 - _ss(x_gap - 10.0, x_gap + 14.0, nx))
+    v_t = np.clip((ny - 380.0) / 360.0, 0.0, 1.0)
+    v_curve = v_t * v_t * (3.0 - 2.0 * v_t)
+    w_flow = in_x * v_curve
+
+    # Gentle, organic anime sweep: 28px left & 52px up — keeps full lush pointed bangs clear of both eyes!
+    dx = 28.0 * w_flow * sx
+    dy = 52.0 * w_flow * sy
+
+    rgb_out = cv2.remap(rgb, (xx + dx).astype(np.float32), (yy + dy).astype(np.float32),
+                        interpolation=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    a_out = np.clip(cv2.remap(a, (xx + dx).astype(np.float32), (yy + dy).astype(np.float32),
+                              interpolation=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0), 0.0, 1.0)
+    a_out = np.clip((a_out - 0.5) * 1.08 + 0.5, 0.0, 1.0)
+
+    premul = np.zeros((h, w, 4), dtype=np.uint8)
+    premul[..., :3] = np.clip(np.rint(rgb_out * a_out[..., None]), 0, 255).astype(np.uint8)
+    premul[..., 3] = np.clip(np.rint(a_out * 255.0), 0, 255).astype(np.uint8)
+    premul[premul[..., 3] == 0] = 0
+    buf = io.BytesIO()
+    Image.fromarray(premul).save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
+def _straight_png_to_premul(img_path: Path, target_size: tuple[int, int] | None = None, feather_shoulder_tabs: bool = False) -> bytes:
+    """Convert any user-drawn or inpainted straight-alpha PNG into clean Inochi2D premultiplied RGBA."""
+    im = Image.open(img_path).convert("RGBA")
+    if target_size is not None and im.size != target_size:
+        im = im.resize(target_size, Image.Resampling.LANCZOS)
+    arr = np.array(im, dtype=np.float32)
+    rgb = arr[..., :3].copy()
+    a = arr[..., 3] / 255.0
+
+    # Pure soft alpha gradient dissolve on the left/right vertical shoulder-socket skin tabs
+    # so the two peach tones blend smoothly with zero straight vertical Barbie-doll seam!
+    if feather_shoulder_tabs:
+        h, w = a.shape
+        y0, y1 = int(h * 0.140), int(h * 0.365)
+        for y in range(y0, min(h, y1 + 12)):
+            xs = np.where(a[y] > 0.15)[0]
+            if len(xs) < 40:
+                continue
+            xl, xr = int(xs[0]), int(xs[-1])
+            ty = min(1.0, (y - y0) / max(1.0, h * 0.015)) * min(1.0, max(0.0, (y1 + 10 - y) / max(1.0, h * 0.025)))
+            if ty <= 0.0:
+                continue
+            for side, x_edge, step in (("L", xl, 1), ("R", xr, -1)):
+                xi = x_edge + step * 28
+                if not (0 <= xi < w):
+                    continue
+                pr, pg, pb = rgb[y, xi]
+                if not (pr > 180.0 and pr > pb + 18.0):
+                    continue
+                for d in range(28):
+                    x = x_edge + step * d
+                    if not (0 <= x < w):
+                        break
+                    t = d / 27.0
+                    fade = t * t * (3.0 - 2.0 * t)
+                    a[y, x] *= (1.0 - ty) + ty * fade
+
+    premul = np.zeros_like(arr, dtype=np.uint8)
+    premul[..., :3] = np.clip(np.rint(rgb * a[..., None]), 0, 255).astype(np.uint8)
+    premul[..., 3] = np.clip(np.rint(a * 255.0), 0, 255).astype(np.uint8)
+    premul[premul[..., 3] == 0] = 0
+    buf = io.BytesIO()
+    Image.fromarray(premul).save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
+def _add_neck_back_collar_ring(neck_premul_bytes: bytes) -> bytes:
+    """Paint the dark 3D inner back-of-collar ring behind the neck on ArtMeshNeck (tex[3], z=-5.0)
+    so the refined-vrm turtleneck collar wraps cleanly around the back of Hikari's neck with zero pink-hair gaps."""
+    im = Image.open(io.BytesIO(neck_premul_bytes)).convert("RGBA")
+    arr = np.array(im, dtype=np.float32)
+    h, w = arr.shape[:2]
+    a = arr[..., 3] / 255.0
+    rgb = np.zeros((h, w, 3), dtype=np.float32)
+    m = a > 0.01
+    rgb[m] = np.clip(arr[m, :3] / np.maximum(a[m, None], 0.01), 0.0, 255.0)
+
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    u = xx / float(max(1, w - 1))
+    v = yy / float(max(1, h - 1))
+
+    # ArtMeshNeck world box: vx=[-28.9, 30.8], vy=[-418, -322].
+    # Refined collar top tips sit at world x=[-27.4, +27.7] (u=0.025..0.948), vy~-359 (v~0.615).
+    # Back collar arches gently UP behind the neck to v~0.585 at center and wraps cleanly to collar tips!
+    u_c = (u - 0.486) / 0.462
+    in_x = np.clip((1.0 - np.abs(u_c)) / 0.06, 0.0, 1.0)
+    v_top = 0.578 + 0.038 * (u_c ** 2)
+    in_y = np.clip((v - v_top) / 0.022, 0.0, 1.0)
+    collar_a = in_x * in_y
+
+    # Subtle shaded dark charcoal inner turtleneck lining + soft rim highlight at top curve
+    rim_band = np.exp(-((v - (v_top + 0.012)) / 0.014) ** 2) * in_x
+    collar_rgb = np.zeros((h, w, 3), dtype=np.float32)
+    collar_rgb[..., 0] = 28.0 + 18.0 * rim_band
+    collar_rgb[..., 1] = 28.0 + 18.0 * rim_band
+    collar_rgb[..., 2] = 32.0 + 20.0 * rim_band
+
+    # Subtle soft collar contact shadow on lower neck skin just above the front collar dip
+    v_front = 0.655 - 0.035 * (u_c ** 2)
+    sh_w = np.clip((v - (v_front - 0.075)) / 0.075, 0.0, 1.0) * np.clip((v_front + 0.05 - v) / 0.04, 0.0, 1.0) * a
+    rgb = rgb * (1.0 - 0.14 * sh_w[..., None])
+
+    # Composite neck OVER back-of-collar ring (so the ring shows cleanly behind the neck sides!)
+    out_a = a + collar_a * (1.0 - a)
+    out_premul = rgb * a[..., None] + collar_rgb * (collar_a * (1.0 - a))[..., None]
+
+    out = np.zeros((h, w, 4), dtype=np.uint8)
+    out[..., :3] = np.clip(np.rint(out_premul), 0, 255).astype(np.uint8)
+    out[..., 3] = np.clip(np.rint(out_a * 255.0), 0, 255).astype(np.uint8)
+    out[out[..., 3] == 0] = 0
+    buf = io.BytesIO()
+    Image.fromarray(out).save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
+def _smooth_raised_upper_arm_cap(arm_premul_bytes: bytes, is_left: bool) -> bytes:
+    """Round off the flat y=0 top shoulder-border cut on raised wave arms (tex[53]/tex[54])
+    so waving blends smoothly into the shoulder with zero flat horizontal ledge."""
+    im = Image.open(io.BytesIO(arm_premul_bytes)).convert("RGBA")
+    arr = np.array(im, dtype=np.float32)
+    h, w = arr.shape[:2]
+    a = arr[..., 3] / 255.0
+    rgb = np.zeros((h, w, 3), dtype=np.float32)
+    m = a > 0.01
+    rgb[m] = np.clip(arr[m, :3] / np.maximum(a[m, None], 0.01), 0.0, 255.0)
+
+    # Gently feather the top 26px border where the original v27 arm hit y=0 flat!
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    u = (1.0 - xx / float(max(1, w - 1))) if is_left else (xx / float(max(1, w - 1)))
+    # Top-right shoulder cap sits at u in [0.70..1.00], y in [0..34]
+    cap_y = 24.0 * np.clip((u - 0.72) / 0.28, 0.0, 1.0) ** 1.6
+    top_fade = np.clip((yy - cap_y) / 14.0, 0.0, 1.0)
+    a = a * np.where(yy < 48.0, top_fade, 1.0)
+
+    out = np.zeros((h, w, 4), dtype=np.uint8)
+    out[..., :3] = np.clip(np.rint(rgb * a[..., None]), 0, 255).astype(np.uint8)
+    out[..., 3] = np.clip(np.rint(a * 255.0), 0, 255).astype(np.uint8)
+    out[out[..., 3] == 0] = 0
+    buf = io.BytesIO()
+    Image.fromarray(out).save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
+def _upgrade_spring_physics(header: bytes) -> bytes:
+    """Upgrade Hikari's rig to flagship Live2D-style SpringPendulum physics:
+    1) Wires anatomical 2-cup Gaussian squash-and-stretch bust deform bindings onto Chest Y (5094) & Chest X (5095)
+       on ArtMeshTopwear (1005), keeping collar, shoulders & waist 100% locked!
+    2) Adds a moving Chest Physics Anchor (52000) + dual XY/YX SpringPendulum drivers (52001, 52002).
+    3) Upgrades existing hair, twintail, ahoge, skirt, top-fabric, eye-jelly & arm drivers to juicy SpringPendulum."""
+    puppet = json.loads(header[12:])
+    nodes: dict[int, dict[str, Any]] = {}
+    stack = [puppet["nodes"]]
+    while stack:
+        n = stack.pop()
+        nodes[n["uuid"]] = n
+        stack.extend(n.get("children", ()))
+
+    # 1) Upgrade all 31 existing SimplePhysics drivers from stiff Pendulum -> juicy SpringPendulum!
+    for n in nodes.values():
+        if n.get("type") != "SimplePhysics":
+            continue
+        nm = str(n.get("name") or "").lower()
+        os_x, os_y = n.get("output_scale", [1.0, 0.0])
+        if "ahoge" in nm:
+            n["model_type"] = "SpringPendulum"
+            n["angle_damping"] = 0.16
+            n["length_damping"] = 0.20
+            n["frequency"] = max(1.75, float(n.get("frequency", 1.55)))
+            n["output_scale"] = [round(float(os_x) * 1.45, 4), round(float(os_y) * 1.45, 4)]
+        elif "back hair" in nm:
+            n["model_type"] = "SpringPendulum"
+            n["angle_damping"] = 0.22
+            n["length_damping"] = 0.26
+            n["output_scale"] = [round(float(os_x) * 1.38, 4), round(float(os_y) * 1.38, 4)]
+        elif "front hair" in nm:
+            n["model_type"] = "SpringPendulum"
+            n["angle_damping"] = 0.24
+            n["length_damping"] = 0.28
+            n["output_scale"] = [round(float(os_x) * 1.32, 4), round(float(os_y) * 1.32, 4)]
+        elif "skirt" in nm:
+            n["model_type"] = "SpringPendulum"
+            n["angle_damping"] = 0.20
+            n["length_damping"] = 0.26
+            n["output_scale"] = [round(float(os_x) * 1.40, 4), round(float(os_y) * 1.40, 4)]
+        elif "top fabric" in nm:
+            n["model_type"] = "SpringPendulum"
+            n["angle_damping"] = 0.28
+            n["length_damping"] = 0.28
+            n["output_scale"] = [round(float(os_x) * 1.35, 4), round(float(os_y) * 1.35, 4)]
+        elif "eye jelly" in nm or "eyelbounce" in nm or "eyerbounce" in nm:
+            n["model_type"] = "SpringPendulum"
+            n["angle_damping"] = 0.78
+            n["length_damping"] = 0.78
+            n["output_scale"] = [round(float(os_x) * 0.35, 4), round(float(os_y) * 0.35, 4)]
+        elif "arm swing" in nm:
+            n["angle_damping"] = 0.30
+            n["output_scale"] = [round(float(os_x) * 1.28, 4), round(float(os_y) * 1.28, 4)]
+        elif "brow" in nm or "mouth" in nm:
+            n["model_type"] = "SpringPendulum"
+            n["angle_damping"] = 0.36
+            n["length_damping"] = 0.36
+            n["output_scale"] = [round(float(os_x) * 1.25, 4), round(float(os_y) * 1.25, 4)]
+
+    # 2) Wire anatomical 2-cup Gaussian squash-and-stretch deform bindings onto Chest Y (5094) & Chest X (5095)
+    top_node = nodes.get(1005)
+    body_node = nodes.get(104)
+    if top_node and top_node.get("mesh") and body_node is not None:
+        uvs = np.array(top_node["mesh"]["uvs"], dtype=np.float64).reshape(-1, 2)
+        n_verts = len(uvs)
+        u = uvs[:, 0]
+        v = uvs[:, 1]
+
+        # Symmetrical 2-cup Gaussian bust weights (collar/shoulders v<0.31 and waist v>0.79 strictly 0.0!)
+        w_l = np.exp(-(((u - 0.30) / 0.23) ** 2 + ((v - 0.56) / 0.15) ** 2))
+        w_r = np.exp(-(((u - 0.70) / 0.23) ** 2 + ((v - 0.56) / 0.15) ** 2))
+        w_raw = np.clip(np.maximum(w_l, w_r) + 0.35 * np.minimum(w_l, w_r), 0.0, 1.0)
+        # Hard guard: zero on collar/shoulders (v < 0.31) and waist/belly (v > 0.78)
+        v_guard = np.clip((v - 0.31) / 0.08, 0.0, 1.0) * np.clip((0.79 - v) / 0.08, 0.0, 1.0)
+        w = w_raw * v_guard
+        side_sgn = np.where(u < 0.5, -1.0, 1.0)
+
+        # Chest Y (5094): -1.0 = drop + soft outward squash, 0.0 = rest, +1.0 = lift + subtle perk
+        def_y_neg = [[round(float(2.8 * side_sgn[i] * w[i]), 3), round(float(10.5 * w[i]), 3)] for i in range(n_verts)]
+        def_zero = [[0.0, 0.0] for _ in range(n_verts)]
+        def_y_pos = [[round(float(-2.2 * side_sgn[i] * w[i]), 3), round(float(-9.5 * w[i]), 3)] for i in range(n_verts)]
+
+        # Chest X (5095): -1.0 = sway left, 0.0 = rest, +1.0 = sway right (with subtle natural arc)
+        def_x_neg = [[round(float(-8.5 * w[i]), 3), round(float(1.6 * w[i]), 3)] for i in range(n_verts)]
+        def_x_pos = [[round(float(8.5 * w[i]), 3), round(float(1.6 * w[i]), 3)] for i in range(n_verts)]
+
+        is_set = [[True, True], [True, True], [True, True]]
+        for param in puppet.get("param", []):
+            pid = param.get("uuid")
+            if pid == 5094:
+                param["bindings"] = [
+                    b for b in param.get("bindings", []) if b.get("node") != 1005
+                ] + [{
+                    "interpolate_mode": "Linear",
+                    "isSet": is_set,
+                    "node": 1005,
+                    "param_name": "deform",
+                    "values": [
+                        [def_y_neg, def_y_neg],
+                        [def_zero, def_zero],
+                        [def_y_pos, def_y_pos],
+                    ],
+                }]
+            elif pid == 5095:
+                param["bindings"] = [
+                    b for b in param.get("bindings", []) if b.get("node") != 1005
+                ] + [{
+                    "interpolate_mode": "Linear",
+                    "isSet": is_set,
+                    "node": 1005,
+                    "param_name": "deform",
+                    "values": [
+                        [def_x_neg, def_x_neg],
+                        [def_zero, def_zero],
+                        [def_x_pos, def_x_pos],
+                    ],
+                }]
+
+        # 3) Attach moving Chest Physics Anchor (52000) + dual XY/YX SpringPendulum drivers (52001, 52002)
+        children = body_node.setdefault("children", [])
+        children[:] = [c for c in children if c.get("uuid") != 52000]
+        chest_anchor = {
+            "uuid": 52000,
+            "name": "Physics: Chest Spring Anchor",
+            "type": "Node",
+            "enabled": True,
+            "zsort": 0.0,
+            "lockToRoot": False,
+            "transform": {"trans": [0.0, -210.0, 0.0], "rot": [0.0, 0.0, 0.0], "scale": [1.0, 1.0]},
+            "children": [
+                {
+                    "uuid": 52001,
+                    "name": "Chest Spring X -> Chest X",
+                    "type": "SimplePhysics",
+                    "enabled": True,
+                    "zsort": 0.0,
+                    "lockToRoot": False,
+                    "transform": {"trans": [0.0, 0.0, 0.0], "rot": [0.0, 0.0, 0.0], "scale": [1.0, 1.0]},
+                    "param": 5095,
+                    "model_type": "SpringPendulum",
+                    "map_mode": "XY",
+                    "gravity": 1.0,
+                    "length": 26.0,
+                    "frequency": 2.35,
+                    "angle_damping": 0.22,
+                    "length_damping": 0.22,
+                    "output_scale": [4.2, 0.0],
+                    "local_only": False,
+                    "children": [],
+                },
+                {
+                    "uuid": 52002,
+                    "name": "Chest Spring Y -> Chest Y",
+                    "type": "SimplePhysics",
+                    "enabled": True,
+                    "zsort": 0.0,
+                    "lockToRoot": False,
+                    "transform": {"trans": [0.0, 0.0, 0.0], "rot": [0.0, 0.0, 0.0], "scale": [1.0, 1.0]},
+                    "param": 5094,
+                    "model_type": "SpringPendulum",
+                    "map_mode": "YX",
+                    "gravity": 1.0,
+                    "length": 26.0,
+                    "frequency": 2.45,
+                    "angle_damping": 0.22,
+                    "length_damping": 0.20,
+                    "output_scale": [5.4, 0.0],
+                    "local_only": False,
+                    "children": [],
+                },
+            ],
+        }
+        children.append(chest_anchor)
+
+        # Drive Chest Physics Anchor (52000) in world X & Y from Body Angle X/Y/Z, Body Lean, and Breath!
+        for param in puppet.get("param", []):
+            pname = str(param.get("name") or "")
+            bs = param.setdefault("bindings", [])
+            bs[:] = [b for b in bs if b.get("node") != 52000]
+            if pname == "Body Angle X":
+                bs.append({"interpolate_mode": "Linear", "isSet": is_set, "node": 52000, "param_name": "transform.t.x", "values": [[-28.0, -28.0], [0.0, 0.0], [28.0, 28.0]]})
+            elif pname == "Body Angle Z":
+                bs.append({"interpolate_mode": "Linear", "isSet": is_set, "node": 52000, "param_name": "transform.t.x", "values": [[-22.0, -22.0], [0.0, 0.0], [22.0, 22.0]]})
+            elif pname == "Body Lean":
+                bs.append({"interpolate_mode": "Linear", "isSet": is_set, "node": 52000, "param_name": "transform.t.x", "values": [[-20.0, -20.0], [0.0, 0.0], [20.0, 20.0]]})
+            elif pname == "Body Angle Y":
+                bs.append({"interpolate_mode": "Linear", "isSet": is_set, "node": 52000, "param_name": "transform.t.y", "values": [[32.0, 32.0], [0.0, 0.0], [-32.0, -32.0]]})
+            elif pname == "Breath":
+                nx = len(param.get("axis_points", [[0.0, 1.0]])[0])
+                ny = len(param.get("axis_points", [[0.0, 1.0], [0.0, 1.0]])[1])
+                b_vals = [[round(-18.0 * (ix / max(1, nx - 1)), 3) for _ in range(ny)] for ix in range(nx)]
+                b_set = [[True for _ in range(ny)] for _ in range(nx)]
+                bs.append({"interpolate_mode": "Linear", "isSet": b_set, "node": 52000, "param_name": "transform.t.y", "values": b_vals})
+
+    content = json.dumps(puppet, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return header[:8] + len(content).to_bytes(4, "big") + content
+
+
+def _clean_wave_arm_premul(img_path: Path, is_upper: bool = False, is_left: bool = False) -> bytes:
+    """Load Codex HD wave arm PNG cleanly while defringing any stray dark 2px boundary specks
+    so skin edges stay crisp and clean against both dark rooms and shoulders."""
+    im = Image.open(img_path).convert("RGBA")
+    arr = np.array(im, dtype=np.float32)
+    rgb = arr[..., :3].copy()
+    a = arr[..., 3] / 255.0
+
+    # Replace isolated dark black-matte boundary specks (lum < 95 right on alpha edge) with local peach skin!
+    lum = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+    dist_in = cv2.distanceTransform((a >= 0.30).astype(np.uint8), cv2.DIST_L2, 5)
+    is_peach = (a > 0.70) & (rgb[..., 0] > 180.0) & (rgb[..., 0] > rgb[..., 2] + 15.0)
+    dark_speck = (a > 0.03) & (dist_in <= 4.5) & (lum < 110.0)
+    if np.any(dark_speck) and np.any(is_peach):
+        wp = cv2.GaussianBlur(is_peach.astype(np.float32), (0, 0), 4.0)
+        pfill = np.stack([
+            cv2.GaussianBlur(rgb[..., c] * is_peach.astype(np.float32), (0, 0), 4.0) / np.maximum(1e-4, wp)
+            for c in range(3)
+        ], axis=-1)
+        m_sp = (dark_speck & (wp > 0.02))[..., None]
+        # Keep natural warm-brown hand outline on hands (only defringe upper & forearm black crust!)
+        rgb = np.where(m_sp, pfill * 0.88 + rgb * 0.12, rgb)
+
+    # Gently round off any flat y=0 top shoulder border on upper wave arm
+    # AND boost medial shoulder opacity underneath topwear's feather zone so 0% dark background bleeds through!
+    if is_upper:
+        h, w = a.shape
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        u = (1.0 - xx / float(max(1, w - 1))) if is_left else (xx / float(max(1, w - 1)))
+        # Keep medial shoulder (u in [0.76..0.94], y in [40..420]) solid opaque under topwear's 28px feather!
+        medial_band = np.clip((u - 0.74) / 0.06, 0.0, 1.0) * np.clip((0.97 - u) / 0.04, 0.0, 1.0)
+        v_band = np.clip((yy - 28.0) / 24.0, 0.0, 1.0) * np.clip((480.0 - yy) / 80.0, 0.0, 1.0)
+        boost = (a > 0.12).astype(np.float32) * medial_band * v_band
+        a = np.clip(a + boost * (1.0 - a), 0.0, 1.0)
+
+        # Smooth rounded deltoid arc across the flat y=0 top border (u in [0.58..1.0])
+        cap_y = 14.0 * np.clip((u - 0.62) / 0.38, 0.0, 1.0) ** 1.5
+        top_fade = np.clip((yy - cap_y) / 12.0, 0.0, 1.0)
+        a = a * np.where(yy < 36.0, top_fade, 1.0)
+
+    out = np.zeros_like(arr, dtype=np.uint8)
+    out[..., :3] = np.clip(np.rint(rgb * a[..., None]), 0, 255).astype(np.uint8)
+    out[..., 3] = np.clip(np.rint(a * 255.0), 0, 255).astype(np.uint8)
+    out[out[..., 3] == 0] = 0
+    buf = io.BytesIO()
+    Image.fromarray(out).save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
+def _load_wraparound_collar_asset() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]], bytes] | None:
+    """Extract the rigged wraparound halter collar node (51001), its deform bindings, and tex[61]
+    from assets/collar_preview/Hikari-v28-CollarPreview.inp."""
+    if not COLLAR_PREVIEW_INP.exists():
+        return None
+    h_col, t_col, _ = _unpack_inp(COLLAR_PREVIEW_INP)
+    if len(t_col) <= 61:
+        return None
+    p_col = json.loads(h_col[12:])
+    collar_node: dict[str, Any] | None = None
+    stack = [p_col["nodes"]]
+    while stack:
+        n = stack.pop()
+        if n.get("uuid") == 51001:
+            collar_node = n
+            break
+        stack.extend(n.get("children", ()))
+    if collar_node is None:
+        return None
+    bindings_by_param: dict[str, list[dict[str, Any]]] = {}
+    for param in p_col.get("param", []):
+        bs = [b for b in param.get("bindings", []) if b.get("node") == 51001]
+        if bs:
+            bindings_by_param[str(param["name"])] = bs
+    return collar_node, bindings_by_param, t_col[61][1]
+
+
+def _build_iris_emissive_png(iris_premul_bytes: bytes) -> bytes:
+    """Build a crisp GPU Emissive map from any iris texture (VRM Galaxy, Solid Black Pupil, Ruby, Aqua, etc.).
+    Makes catchlights + vivid inner iris glow rings shine softly while keeping black pupils velvet-dark."""
+    im = Image.open(io.BytesIO(iris_premul_bytes)).convert("RGBA")
+    arr = np.array(im, dtype=np.float32)
+    a = arr[..., 3] / 255.0
+    rgb = np.zeros_like(arr[..., :3])
+    m = a > 0.02
+    if np.any(m):
+        rgb[m] = np.clip(arr[m, :3] / np.maximum(a[m, None], 0.02), 0.0, 255.0)
+    mx = np.max(rgb, axis=-1) / 255.0
+    mn = np.min(rgb, axis=-1) / 255.0
+    sat = np.where(mx > 0.02, (mx - mn) / np.maximum(mx, 0.02), 0.0)
+    # Catchlights (bright white-pink) + vivid inner iris glow (high sat + mid-high brightness); dark pupils stay 0!
+    hi_white = np.clip((mn - 0.68) / 0.25, 0.0, 1.0)
+    hi_vivid = np.clip((mx - 0.42) / 0.42, 0.0, 1.0) * np.clip((sat - 0.32) / 0.35, 0.0, 1.0)
+    glow = np.clip(hi_white * 0.92 + hi_vivid * 0.46, 0.0, 1.0) * a
+    # Soft bloom spread inside the iris for rich studio luminescence
+    glow_soft = cv2.GaussianBlur(glow, (0, 0), 3.0)
+    em_w = np.clip(glow * 0.78 + glow_soft * 0.40, 0.0, 1.0) * a
+    em_rgb = np.clip(rgb * em_w[..., None] * 0.85, 0.0, 255.0)
+
+    out = np.zeros_like(arr, dtype=np.uint8)
+    out[..., :3] = np.clip(np.rint(em_rgb), 0, 255).astype(np.uint8)
+    out[..., 3] = np.clip(np.rint(em_w * 255.0), 0, 255).astype(np.uint8)
+    out[out[..., 3] == 0] = 0
+    buf = io.BytesIO()
+    Image.fromarray(out).save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
+def _build_topwear_cyber_emissive_png(top_premul_bytes: bytes) -> bytes:
+    """Build a crisp GPU Emissive map for ONLY the cyber-tech LED/circuit accents on the lower refined-vrm top
+    (y > 0.56, bright white/red/cyan print glyphs — 0% skin, 0% black fabric!)."""
+    im = Image.open(io.BytesIO(top_premul_bytes)).convert("RGBA")
+    arr = np.array(im, dtype=np.float32)
+    h, w = arr.shape[:2]
+    a = arr[..., 3] / 255.0
+    rgb = np.zeros_like(arr[..., :3])
+    m = a > 0.1
+    if np.any(m):
+        rgb[m] = np.clip(arr[m, :3] / np.maximum(a[m, None], 0.1), 0.0, 255.0)
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    lum = 0.299 * r + 0.587 * g + 0.114 * b
+    yy = np.arange(h, dtype=np.float32)[:, None] / float(max(1, h))
+    xx = np.arange(w, dtype=np.float32)[None, :] / float(max(1, w))
+    # Strictly inside the lower cyber-print band (y in [0.56..0.81], x in [0.08..0.92]) — never waist skin!
+    in_band = (yy >= 0.56) & (yy <= 0.805) & (xx >= 0.08) & (xx <= 0.92)
+    # Exclude peach skin explicitly
+    is_skin = (r > 180.0) & (r > g + 10.0) & (g > b - 6.0) & (lum > 165.0)
+    # Detect bright white/silver tech rings/lines AND vivid red LED indicators
+    is_led_red = (r > 135.0) & (r > g + 55.0) & (r > b + 55.0)
+    is_led_white = (lum > 155.0) & (np.abs(r - b) < 28.0) & ~is_skin
+    led = (in_band & (is_led_red | is_led_white) & (a > 0.5)).astype(np.float32)
+
+    em_rgb = np.zeros_like(rgb)
+    # Tint red LEDs vivid neon crimson & white circuits crisp cool-cyan cyber glow!
+    em_rgb[..., 0] = np.where(is_led_red, 255.0, 170.0)
+    em_rgb[..., 1] = np.where(is_led_red, 45.0, 232.0)
+    em_rgb[..., 2] = np.where(is_led_red, 72.0, 255.0)
+    glow = np.clip(led * 0.90 + cv2.GaussianBlur(led, (0, 0), 2.2) * 0.45, 0.0, 1.0) * in_band.astype(np.float32)
+
+    out = np.zeros_like(arr, dtype=np.uint8)
+    out[..., :3] = np.clip(np.rint(em_rgb * glow[..., None]), 0, 255).astype(np.uint8)
+    out[..., 3] = np.clip(np.rint(glow * 255.0), 0, 255).astype(np.uint8)
+    out[out[..., 3] == 0] = 0
+    buf = io.BytesIO()
+    Image.fromarray(out).save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
+def _attach_emissive_maps(header: bytes, part_emissive_tids: dict[int, int]) -> bytes:
+    """Attach GPU Emissive texture indices onto Part nodes and wire a live 'Emissive Glow' parameter (52010)
+    driving emissionStrength [0..2] on every glowing part."""
+    if not part_emissive_tids:
+        return header
+    puppet = json.loads(header[12:])
+    stack = [puppet["nodes"]]
+    while stack:
+        n = stack.pop()
+        uid = n.get("uuid")
+        if uid in part_emissive_tids:
+            ts = list(n.get("textures") or [4294967295, 4294967295, 4294967295])
+            while len(ts) < 3:
+                ts.append(4294967295)
+            ts[1] = part_emissive_tids[uid]
+            n["textures"] = ts
+            n["emissionStrength"] = 1.0
+        stack.extend(n.get("children", ()))
+
+    # Add/replace 'Emissive Glow' parameter (uuid 52010, range [0.0 .. 2.0], default 1.0)
+    params = puppet.setdefault("param", [])
+    params[:] = [p for p in params if p.get("uuid") != 52010]
+    bindings = []
+    for uid in sorted(part_emissive_tids.keys()):
+        # Subtle eye glow vs crisp cyber LED glow
+        hi_val = 0.95 if uid in (1023, 1024) else 0.78
+        bindings.append({
+            "interpolate_mode": "Linear",
+            "isSet": [[True, True], [True, True]],
+            "node": uid,
+            "param_name": "emissionStrength",
+            "values": [[0.0, 0.0], [hi_val * 2.0, hi_val * 2.0]],
+        })
+    params.append({
+        "axis_points": [[0.0, 1.0], [0.0, 1.0]],
+        "bindings": bindings,
+        "defaults": [1.0, 0.0],
+        "is_vec2": False,
+        "max": [2.0, 1.0],
+        "merge_mode": "Additive",
+        "min": [0.0, 0.0],
+        "name": "Emissive Glow",
+        "uuid": 52010,
+    })
+    content = json.dumps(puppet, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return header[:8] + len(content).to_bytes(4, "big") + content
+
+
+def _attach_wraparound_collar(
+    header: bytes,
+    collar_node: dict[str, Any],
+    bindings_by_param: dict[str, list[dict[str, Any]]],
+    tex_index: int,
+) -> bytes:
+    """Attach wraparound collar mesh node 51001 under Body (104) with all deform bindings cleanly."""
+    puppet = json.loads(header[12:])
+    node_copy = json.loads(json.dumps(collar_node))
+    node_copy["textures"] = [tex_index, 4294967295, 4294967295]
+    stack = [puppet["nodes"]]
+    while stack:
+        n = stack.pop()
+        if n.get("uuid") == 104:
+            children = n.setdefault("children", [])
+            children[:] = [c for c in children if c.get("uuid") != 51001]
+            children.append(node_copy)
+            break
+        stack.extend(n.get("children", ()))
+    for param in puppet.get("param", []):
+        pname = str(param.get("name") or "")
+        if pname in bindings_by_param:
+            bs = param.setdefault("bindings", [])
+            bs[:] = [b for b in bs if b.get("node") != 51001]
+            bs.extend(json.loads(json.dumps(bindings_by_param[pname])))
+    content = json.dumps(puppet, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return header[:8] + len(content).to_bytes(4, "big") + content
+
+
+class CharacterCustomizer:
+    """Caches base 4x-upscaled textures in RAM so applying ANY eye/hair/outfit tweak rebuilds the INP in ~0.25s!"""
+    def __init__(self, src_inp: Path, cache_dir: Path, vrm_assets_dir: Path) -> None:
+        self.src_inp = src_inp
+        self.cache_dir = cache_dir
+        self.vrm_assets_dir = vrm_assets_dir
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.vrm_assets_dir.mkdir(parents=True, exist_ok=True)
+
+        header, self._raw_textures, self._trailing = _unpack_inp(src_inp)
+        header = _pad_all_meshes(header, self._raw_textures)
+        header = _upgrade_spring_physics(header)
+        self._header_seethrough = header
+        self._header_solid = _sweep_front_bangs(header)
+        self._header_json = self._header_solid
+        self.wardrobe_seethrough = Wardrobe(self._header_seethrough)
+        self.wardrobe = Wardrobe(self._header_solid)
+        self._base_hd_textures: list[tuple[int, bytes]] | None = None
+        self._premul_cache: dict[Path, tuple[float, bytes]] = {}
+        self._smooth_wardrobe_cache: dict[str, bytes] = {}
+        self._wraparound_collar = _load_wraparound_collar_asset()
+        self.vrm_eyes: dict[str, Path] = {}
+        self._ensure_default_vrm_eyes()
+
+    def _load_premul_cached(self, img_path: Path, feather_shoulder_tabs: bool = False) -> bytes:
+        mtime = img_path.stat().st_mtime
+        key = img_path.with_name(f"{img_path.name}__seam") if feather_shoulder_tabs else img_path
+        cached = self._premul_cache.get(key)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        data = _straight_png_to_premul(img_path, feather_shoulder_tabs=feather_shoulder_tabs)
+        self._premul_cache[key] = (mtime, data)
+        return data
+
+    def _ensure_default_vrm_eyes(self) -> None:
+        ir = self.vrm_assets_dir / "vrm_iris_r.png"
+        il = self.vrm_assets_dir / "vrm_iris_l.png"
+        hr = self.vrm_assets_dir / "vrm_hi_r.png"
+        hl = self.vrm_assets_dir / "vrm_hi_l.png"
+        if ir.exists() and il.exists():
+            self.vrm_eyes = {"iris_r": ir, "iris_l": il}
+            if hr.exists():
+                self.vrm_eyes["hi_r"] = hr
+            if hl.exists():
+                self.vrm_eyes["hi_l"] = hl
+            return
+        if DEFAULT_VRM_PATH.exists():
+            self.vrm_eyes = extract_vrm_eye_assets(DEFAULT_VRM_PATH, self.vrm_assets_dir)
+
+    def import_vrm(self, vrm_path: Path) -> dict[str, str]:
+        self.vrm_eyes = extract_vrm_eye_assets(vrm_path, self.vrm_assets_dir)
+        return {k: str(v) for k, v in self.vrm_eyes.items()}
+
+    def _ensure_base_hd(self) -> list[tuple[int, bytes]]:
+        if self._base_hd_textures is not None:
+            return self._base_hd_textures
+        base_file = self.cache_dir / "Hikari-v28-BaseHD-v5.inp"
+        if base_file.exists() and base_file.stat().st_mtime >= self.src_inp.stat().st_mtime:
+            _, texs, _ = _unpack_inp(base_file)
+            self._base_hd_textures = texs
+            return texs
+
+        out = []
+        for idx, (ttype, tdata) in enumerate(self._raw_textures):
+            if ttype != 0:
+                out.append((ttype, tdata))
+            elif idx in TEX_SCLERA:
+                out.append((ttype, _upscale_eyelash_or_sclera_hd(tdata, is_sclera=True)))
+            elif idx in TEX_LASH_BROW:
+                out.append((ttype, _upscale_eyelash_or_sclera_hd(tdata, is_sclera=False)))
+            else:
+                out.append((ttype, _upscale_premul_png(tdata, target_scale=4)))
+
+        # Enforce 100% mirror-symmetrical eyes & brows (clean vector-smoothed Right Eye R -> Left Eye L!)
+        for src_r, dst_list in (
+            (14, (15,)),         # Sclera R -> L
+            (16, (17, 18)),      # Lower lash R -> L
+            (19, (21, 22)),      # Upper lash + double-eyelid crease R -> L
+            (27, (29, 30)),      # Closed eye R -> L
+            (31, (33, 34)),      # Eyebrow R -> L
+        ):
+            r_png = out[src_r][1]
+            for dst_l in dst_list:
+                if dst_l < len(out) and out[dst_l][0] == 0:
+                    ref_size = Image.open(io.BytesIO(out[dst_l][1])).size
+                    out[dst_l] = (0, _mirror_premul_png_h(r_png, target_size=ref_size))
+
+        base_file.write_bytes(_pack_inp(self._header_json, out, self._trailing))
+        self._base_hd_textures = out
+        return out
+
+    def build_custom_model(self, cfg: dict[str, Any], out_inp: Path) -> Path:
+        base_texs = self._ensure_base_hd()
+        out_texs = list(base_texs)
+
+        style = str(cfg.get("eyeStyle") or "vrm_refined")
+        custom_eye = Path(str(cfg.get("customEyePath") or "")) if cfg.get("customEyePath") else None
+
+        # 1) Eyes (VRM Refined / VRM Color Variants / Custom PNG / Clean Original HD)
+        if style == "custom" and custom_eye and custom_eye.exists():
+            out_texs[TEX_IRIS_R] = (0, _build_vrm_mapped_iris(self._raw_textures[TEX_IRIS_R][1], custom_eye, None, False, cfg))
+            out_texs[TEX_IRIS_L] = (0, _build_vrm_mapped_iris(self._raw_textures[TEX_IRIS_L][1], custom_eye, None, True, cfg))
+            # Hide old blurry 19x15 catchlight layer when custom/VRM iris carries its own crisp highlights!
+            out_texs[TEX_HI_R] = (0, _transparent_png())
+            out_texs[TEX_HI_L] = (0, _transparent_png())
+        elif style == "original_solid_pupil":
+            out_texs[TEX_IRIS_R] = (0, _build_original_solid_pupil_iris(self._raw_textures[TEX_IRIS_R][1], False, cfg))
+            out_texs[TEX_IRIS_L] = (0, _build_original_solid_pupil_iris(self._raw_textures[TEX_IRIS_L][1], True, cfg))
+            out_texs[TEX_HI_R] = (0, _transparent_png())
+            out_texs[TEX_HI_L] = (0, _transparent_png())
+        elif style != "original_hd" and "iris_r" in self.vrm_eyes and "iris_l" in self.vrm_eyes:
+            out_texs[TEX_IRIS_R] = (0, _build_vrm_mapped_iris(
+                self._raw_textures[TEX_IRIS_R][1], self.vrm_eyes["iris_r"], self.vrm_eyes.get("hi_r"), False, cfg
+            ))
+            out_texs[TEX_IRIS_L] = (0, _build_vrm_mapped_iris(
+                self._raw_textures[TEX_IRIS_L][1], self.vrm_eyes["iris_l"], self.vrm_eyes.get("hi_l"), True, cfg
+            ))
+            # Clear the old 19x15 blurry catchlight blotches since VRM highlights are crisp & baked cleanly!
+            out_texs[TEX_HI_R] = (0, _transparent_png())
+            out_texs[TEX_HI_L] = (0, _transparent_png())
+        else:
+            # Clean original 2D eye art upscaled + HSV tint (NO snake pupil!)
+            out_texs[TEX_IRIS_R] = (0, _tint_premul_png(base_texs[TEX_IRIS_R][1], float(cfg.get("eyeHue", 0)), float(cfg.get("eyeSat", 1)), float(cfg.get("eyeVal", 1))))
+            out_texs[TEX_IRIS_L] = (0, _tint_premul_png(base_texs[TEX_IRIS_L][1], float(cfg.get("eyeHue", 0)), float(cfg.get("eyeSat", 1)), float(cfg.get("eyeVal", 1))))
+
+        # Remove the tiny floating smudge dash on the lower inner eyelid (ArtMeshEyelashR2/L2: tex 16, 17, 18)
+        for tid_low in (16, 17, 18):
+            if tid_low < len(out_texs):
+                out_texs[tid_low] = (0, _transparent_png())
+
+        # 1.5) HD Front & Back Hair (clean natural-outline bangs + matching HD twintails, or custom PNG)
+        bangs_mode = str(cfg.get("bangsMode") or "solid")
+        custom_fh = Path(str(cfg.get("customFrontHairPath") or "")) if cfg.get("customFrontHairPath") else None
+        if DEFAULT_BACK_HAIR_HD.exists():
+            out_texs[8] = (0, self._load_premul_cached(DEFAULT_BACK_HAIR_HD))
+        if bangs_mode == "custom" and custom_fh and custom_fh.exists():
+            out_texs[35] = (0, self._load_premul_cached(custom_fh))
+        elif DEFAULT_FRONT_HAIR_HD.exists():
+            hd_front = self._load_premul_cached(DEFAULT_FRONT_HAIR_HD)
+            out_texs[35] = (0, hd_front)
+            if bangs_mode == "seethrough":
+                out_texs[36] = (0, hd_front)
+
+        # 1.6) HD Body Parts (face, neck, mirrored symmetrical arms/legs, pleated skirt) — full native crispness!
+        if HD_FACE.exists():
+            out_texs[11] = (0, self._load_premul_cached(HD_FACE))
+        if HD_NECK.exists():
+            out_texs[3] = (0, self._load_premul_cached(HD_NECK))
+        if HD_ARM_RIGHT.exists():
+            arm_r_bytes = self._load_premul_cached(HD_ARM_RIGHT)
+            out_texs[46] = (0, arm_r_bytes)
+            arm_l_key = HD_ARM_RIGHT.with_name("_arm_left_mirror")
+            mtime = HD_ARM_RIGHT.stat().st_mtime
+            cached_l = self._premul_cache.get(arm_l_key)
+            if cached_l is None or cached_l[0] != mtime:
+                arm_l_bytes = _mirror_premul_png_h(arm_r_bytes)
+                self._premul_cache[arm_l_key] = (mtime, arm_l_bytes)
+            else:
+                arm_l_bytes = cached_l[1]
+            out_texs[0] = (0, arm_l_bytes)
+        if HD_BOTTOMWEAR.exists():
+            out_texs[4] = (0, self._load_premul_cached(HD_BOTTOMWEAR))
+        if HD_LEG_RIGHT.exists():
+            leg_r_bytes = self._load_premul_cached(HD_LEG_RIGHT)
+            out_texs[1] = (0, leg_r_bytes)
+            leg_l_key = HD_LEG_RIGHT.with_name("_leg_left_mirror")
+            mtime = HD_LEG_RIGHT.stat().st_mtime
+            cached_ll = self._premul_cache.get(leg_l_key)
+            if cached_ll is None or cached_ll[0] != mtime:
+                leg_l_bytes = _mirror_premul_png_h(leg_r_bytes)
+                self._premul_cache[leg_l_key] = (mtime, leg_l_bytes)
+            else:
+                leg_l_bytes = cached_ll[1]
+            out_texs[2] = (0, leg_l_bytes)
+
+        # 2) Hair Color Customization (Direct Color Picker OR Hue/Sat/Val sliders across 100% of hair layers!)
+        h_col = str(cfg.get("hairColor") or "#ff6a9e")
+        h_cstr = float(cfg.get("hairColorStrength", 0.0))
+        h_hue = float(cfg.get("hairHue", 0.0))
+        h_sat = float(cfg.get("hairSat", 1.0))
+        h_val = float(cfg.get("hairVal", 1.0))
+        if h_cstr >= 0.01:
+            for tid in TEX_HAIR:
+                if tid < len(out_texs) and out_texs[tid][0] == 0:
+                    out_texs[tid] = (0, _recolor_hair_direct_png(out_texs[tid][1], h_col, h_cstr, h_sat, h_val))
+        elif abs(h_hue) >= 0.5 or abs(h_sat - 1.0) >= 0.01 or abs(h_val - 1.0) >= 0.01:
+            for tid in TEX_HAIR:
+                if tid < len(out_texs) and out_texs[tid][0] == 0:
+                    out_texs[tid] = (0, _tint_premul_png(out_texs[tid][1], h_hue, h_sat, h_val))
+
+        # Select original or alternate artwork verbatim (no procedural cutout hacking!) before applying fabric tint.
+        top_style = cfg.get("outfitStyle", "original")
+        is_high_top = cfg.get("shoeStyle") == "d3-high-top"
+        if top_style == "hikari-stripe":
+            out_texs[TOP_TEXTURE] = (0, self.wardrobe.stripe_top)
+        elif top_style == "refined-vrm":
+            if HD_TOPWEAR_REFINED.exists():
+                out_texs[TOP_TEXTURE] = (0, self._load_premul_cached(HD_TOPWEAR_REFINED, feather_shoulder_tabs=True))
+            else:
+                out_texs[TOP_TEXTURE] = (0, self.wardrobe.refined_top)
+            if self._wraparound_collar is None and out_texs[3][0] == 0:
+                out_texs[3] = (0, _add_neck_back_collar_ring(out_texs[3][1]))
+        # Load clean HD wave arms (tex 53..58) with edge-crust defringe when present!
+        if len(out_texs) > 58:
+            wave_map = (
+                (53, HD_WAVE_DIR / "wave-right-upper-hd.png", True, False, True),
+                (54, HD_WAVE_DIR / "wave-left-upper-hd.png", True, True, True),
+                (55, HD_WAVE_DIR / "wave-right-forearm-hd.png", False, False, True),
+                (56, HD_WAVE_DIR / "wave-left-forearm-hd.png", False, True, True),
+                (57, HD_WAVE_DIR / "wave-right-hand-hd.png", False, False, False),
+                (58, HD_WAVE_DIR / "wave-left-hand-hd.png", False, True, False),
+            )
+            for tid_w, wpath, is_up, is_l, defringe in wave_map:
+                if wpath.exists():
+                    ckey = f"wave_{tid_w}_{wpath.stat().st_mtime}"
+                    if ckey not in self._smooth_wardrobe_cache:
+                        if defringe:
+                            self._smooth_wardrobe_cache[ckey] = _clean_wave_arm_premul(wpath, is_upper=is_up, is_left=is_l)
+                        else:
+                            self._smooth_wardrobe_cache[ckey] = _straight_png_to_premul(wpath)
+                    out_texs[tid_w] = (0, self._smooth_wardrobe_cache[ckey])
+                elif tid_w in (53, 54):
+                    ckey = f"raised_{tid_w}"
+                    if ckey not in self._smooth_wardrobe_cache:
+                        self._smooth_wardrobe_cache[ckey] = _smooth_raised_upper_arm_cap(out_texs[tid_w][1], is_left=is_l)
+                    out_texs[tid_w] = (0, self._smooth_wardrobe_cache[ckey])
+        if is_high_top:
+            for texture_index, paint in zip(SHOE_TEXTURES, self.wardrobe.high_tops, strict=True):
+                out_texs[texture_index] = (0, paint)
+        o_tint = str(cfg.get("outfitTint") or "#ffffff")
+        o_str = float(cfg.get("outfitTintStrength", 0.0))
+        o_val = float(cfg.get("outfitVal", 1.0))
+        if o_str >= 0.01 or abs(o_val - 1.0) >= 0.01:
+            for tid in TEX_OUTFIT:
+                if tid < len(out_texs) and out_texs[tid][0] == 0:
+                    preserve_print = (top_style != "original" and tid == TOP_TEXTURE) or (
+                        is_high_top and tid in SHOE_TEXTURES
+                    )
+                    painted = _recolor_outfit_skin_safe_png(
+                        out_texs[tid][1], o_tint, o_str, o_val, preserve_print=preserve_print,
+                    )
+                    out_texs[tid] = (0, painted)
+
+        use_seethrough = (bangs_mode == "seethrough")
+        active_wardrobe = self.wardrobe_seethrough if use_seethrough else self.wardrobe
+        base_header = self._header_seethrough if use_seethrough else self._header_solid
+        header = active_wardrobe.raised_shoe_header if is_high_top else base_header
+
+        # Attach real rigged 3D wraparound collar mesh (51001) behind neck for refined-vrm halter!
+        if top_style == "refined-vrm" and self._wraparound_collar is not None:
+            collar_node, collar_binds, collar_tex = self._wraparound_collar
+            if o_str >= 0.01 or abs(o_val - 1.0) >= 0.01:
+                collar_tex = _recolor_outfit_skin_safe_png(collar_tex, o_tint, o_str, o_val, preserve_print=False)
+            collar_tid = len(out_texs)
+            out_texs.append((0, collar_tex))
+            header = _attach_wraparound_collar(header, collar_node, collar_binds, collar_tid)
+
+        # Attach real GPU Emissive Glow maps (Galaxy / Solid-Pupil Eyes + Cyber Halter Top LEDs!)
+        emissive_map: dict[int, int] = {}
+        em_r = _build_iris_emissive_png(out_texs[TEX_IRIS_R][1])
+        em_l = _build_iris_emissive_png(out_texs[TEX_IRIS_L][1])
+        emissive_map[1023] = len(out_texs)
+        out_texs.append((0, em_r))
+        emissive_map[1024] = len(out_texs)
+        out_texs.append((0, em_l))
+        if top_style == "refined-vrm":
+            em_top = _build_topwear_cyber_emissive_png(out_texs[TOP_TEXTURE][1])
+            emissive_map[1005] = len(out_texs)
+            out_texs.append((0, em_top))
+        header = _attach_emissive_maps(header, emissive_map)
+
+        tmp = out_inp.with_suffix(".tmp")
+        tmp.write_bytes(_pack_inp(header, out_texs, self._trailing))
+        tmp.replace(out_inp)
+        return out_inp

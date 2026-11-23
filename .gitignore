@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+
+# Environment & local secrets / runtime settings
+.env
+.env.*
+settings.json
+
+# Runtime memory DBs, private uploads & backups
+data/
+uploads/
+web.bak-*/
+*.bak
+*.tmp
+*.log
+
+# Keep only the active HD base puppet (Hikari-v28-BaseHD-v5.inp);
+# Hikari-v28-Custom.inp is rebuilt automatically on startup.
+models/Hikari-v28-BaseHD.inp
+models/Hikari-v28-BaseHD-v3.inp
+models/Hikari-v28-BaseHD-v4.inp
+models/Hikari-v28-HD.inp
+models/Hikari-v28-WaveHD-Preview.inp
+models/Hikari-v28-Custom.inp
+
+# Native D engine build intermediates
+engine/.dub/
+engine/*.obj
+engine/*.pdb
+engine/*.new.exe
+engine/*.prev.exe
+
+# Rust / Tauri / Node build artifacts
+desktop-tauri/src-tauri/target/
+desktop-tauri/node_modules/
+node_modules/
+
+# Personal SLEEP Lab datasets, training bundles & run logs
+sleep_lab/datasets/
+sleep_lab/dist/
+sleep_lab/outputs/
+sleep_lab/models/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

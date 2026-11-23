@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Hikari Studio</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0e0e11; color: #d8d3e6; font: 14px/1.5 "Segoe UI", system-ui, sans-serif; }
+  body { display: grid; place-items: center; user-select: none; }
+  .box { text-align: center; }
+  h1 { margin: 0 0 6px; font-weight: 600; font-size: 22px; letter-spacing: .04em; color: #ffb4dc; }
+  .dot { display: inline-block; width: 8px; height: 8px; margin-right: 8px; border-radius: 50%; background: #ff7ac6; animation: p 1.2s ease-in-out infinite; vertical-align: middle; }
+  #status { opacity: .8; }
+  .err #status { color: #ff8a8a; opacity: 1; }
+  .err .dot { background: #ff5a5a; animation: none; }
+  @keyframes p { 50% { opacity: .25; } }
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>Hikari Studio</h1>
+  <div><span class="dot"></span><span id="status">Starting…</span></div>
+</div>
+<script>
+  // Rust calls hikariStatus(text, isError). A restart passes its message in the URL hash.
+  window.hikariStatus = function (text, isError) {
+    document.getElementById('status').textContent = text;
+    document.body.classList.toggle('err', !!isError);
+  };
+  if (location.hash.length > 1) hikariStatus(decodeURIComponent(location.hash.slice(1)));
+</script>
+</body>
+</html>

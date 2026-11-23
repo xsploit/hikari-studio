@@ -1,0 +1,8 @@
+# Private Hikari memory data and build outputs never go to git
+datasets/
+dist/
+outputs/
+*.gguf
+*.safetensors
+__pycache__/
+.ipynb_checkpoints/
