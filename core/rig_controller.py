@@ -5,8 +5,8 @@ Combines cleanly in strict layered priority:
   2. Interaction state layer (idle | listening | thinking | speaking) + mood momentum (valence, arousal)
   3. Autonomous gaze + mouse look-at (eyes lead, head follows)
   4. Spring-smoothed Expression Preset + asymmetric brow micro-life + cheek blush
-  5. Arms: 3-bone resting arms (relaxed bend, breath drift, Prepare -> Stroke -> Hold -> Relax talking gestures)
-     and the raised wave arms (Rest / Right Wave / Left Gesture / Both Cheer)
+  5. Arms: the original seamless resting arms sway with body / breath physics (Arm L/R Swing); the raised wave arms
+     (Right Wave / Left Gesture / Both Cheer) come up for emotes, AI actions and real excited peaks in speech
   6. Live 6-axis VBridger lip-sync + syllable-onset head beats + pitch-coupled brows / chin
   7. Motion Lab video-clip retargeting blend (0-100% mix)
   8. Raw user parameter overrides (finite-checked)
@@ -156,25 +156,10 @@ def validate_motion_clip(data: Any) -> dict[str, Any]:
 INTERACTION_STATES = ("idle", "listening", "thinking", "speaking")
 
 # Physics-owned parameters (SimplePhysics outputs): Inochi2D 0.8.7 ignores script values for these while drivers run.
-PHYSICS_OWNED = ("Chest Y", "Chest X", "Eye Jelly", "Mouth Spring")
+PHYSICS_OWNED = ("Chest Y", "Chest X", "Eye Jelly", "Mouth Spring", "Arm R Swing", "Arm L Swing")
 
 # Legacy parameter names some plugins still write -> real rig names.
 LEGACY_PARAM_ALIASES = {"Brow L Y": "Left Brow Y", "Brow R Y": "Right Brow Y"}
-
-# Rest-arm pose layered in by emotes that keep the arms down: (shoulder, elbow, wrist) per side, -1..+1 params
-# (+shoulder = away from body, +elbow = bend inward, +wrist = flex inward).
-EMOTE_REST_ARMS: dict[str, tuple[tuple[float, float, float], tuple[float, float, float]]] = {
-    "shy_blush":     ((-0.04, 0.62, 0.40), (-0.04, 0.58, 0.42)),    # hands drawn together in front
-    "gloom_shake":   ((-0.10, 0.05, 0.30), (-0.10, 0.05, 0.30)),    # limp, drooping
-    "curious_lean":  ((0.02, 0.30, 0.10), (0.06, 0.48, 0.30)),
-    "pout_puff":     ((0.10, 0.80, 0.45), (0.10, 0.78, 0.45)),      # arms folded in, sulky
-    "heart_sparkle": ((-0.02, 0.66, 0.48), (-0.02, 0.66, 0.48)),    # hands together, happy sway
-    "smug_tease":    ((0.38, 0.95, 0.55), (0.02, 0.22, 0.10)),      # one hand on the hip
-    "starry_awe":    ((0.16, 0.42, -0.35), (0.16, 0.42, -0.35)),    # open hands
-    "gentle_nod":    ((0.00, 0.36, 0.20), (0.00, 0.30, 0.20)),
-    "chibi_pop":     ((0.10, 0.40, -0.20), (0.10, 0.40, -0.20)),
-}
-
 
 def _ff(v: Any, default: float) -> float:
     """Finite float or default (a bad setting must never break the 60 FPS step)."""
@@ -212,7 +197,6 @@ class RigController:
         self._rnd = rnd
 
         # Optional rig features (feature-detected from the loaded .inp; older models just skip them)
-        self._has_rest_arms = all(f"Rest Arm {s} {j}" in self._known for s in "RL" for j in ("Shoulder", "Elbow", "Wrist"))
         self._has_raised_joints = all(f"Arm {s} {j}" in self._known for s in "RL" for j in ("Elbow", "Wrist"))
         self._has_brow_angle = "Brow L Angle" in self._known and "Brow R Angle" in self._known
         self._has_cheek = "Cheek" in self._known
@@ -265,19 +249,10 @@ class RigController:
         self.sp_arm_r_wlag = Spring2nd(0.0)       # raised-wrist follow-through (lags the gesture)
         self.sp_arm_l_wlag = Spring2nd(0.0)
 
-        # 3-bone resting arm joint springs: [shoulder, elbow, wrist] per side, start in the relaxed bend
-        self._rest_base = {"R": (0.0, 0.225, 0.12), "L": (0.0, 0.195, 0.14)}
-        self.sp_rest = {s: [Spring2nd(v) for v in self._rest_base[s]] for s in ("R", "L")}
-        # Talking-gesture state machine (Prepare -> Stroke -> Hold -> Relax)
-        self._gest_phase = "rest"
-        self._gest_t0 = 0.0
-        self._gest_dur = 0.0
-        self._gest_side = "R" if rnd.random() < 0.5 else "L"
-        self._gest_both = False
-        self._gest_open = False
-        self._gest_peak: dict[str, tuple[float, float, float]] = {}
-        self._gest_next = now + 0.4
-        self._gest_beat = Spring2nd(0.0)
+        # Excited-moment raise of the clean wave arm (rare, cooled down; normal chatter keeps the arms resting)
+        self._raise_side = "R" if rnd.random() < 0.5 else "L"
+        self._raise_until = 0.0
+        self._raise_next = now + 4.0
         self._speech_on_since = 0.0
         self._speech_off_since = now
         self._was_speaking = False
@@ -290,6 +265,7 @@ class RigController:
         # Script-side fallback springs, only used while engine physics is OFF
         self.sp_fb_chest_y = Spring2nd(0.0)
         self.sp_fb_chest_x = Spring2nd(0.0)
+        self.sp_fb_arm_swing = Spring2nd(0.0)
         self._prev_body_x = 0.0
         self._prev_body_y = 0.0
         self._prev_breath = 0.0
@@ -569,76 +545,6 @@ class RigController:
             self._blink_queue_double = r > 0.84      # ~16 % double blink
         self._blink_active = True
         self._blink_phase = 0.0
-
-    def _gesture_step(self, t_now: float, dt: float, speaking: bool, energy: float, stress: float, onset: float,
-                      excited: bool, gain: float, allowed: bool) -> dict[str, tuple[float, float, float]]:
-        """Talking-arm gesture state machine on the 3-bone resting arms.
-        Returns per-side (shoulder, elbow, wrist) offsets added to the relaxed base pose."""
-        rnd = self._rnd
-        silent_for = (t_now - self._speech_off_since) if not speaking else 0.0
-
-        def go(phase: str, dur: float) -> None:
-            self._gest_phase, self._gest_t0, self._gest_dur = phase, t_now, dur
-
-        if self._gest_phase in ("prepare", "stroke", "hold") and (not allowed or silent_for > 0.35):
-            go("relax", 0.6 if allowed else 0.45)
-        el = t_now - self._gest_t0
-        ph = self._gest_phase
-        if ph == "rest":
-            phrase_start = speaking and (t_now - self._speech_on_since) < 0.45
-            trigger = onset > 0.28 or stress > 0.32 or phrase_start
-            if allowed and speaking and t_now >= self._gest_next and trigger:
-                side = self._gest_side
-                if rnd.random() < 0.72:                      # mostly alternate the dominant hand
-                    side = "L" if side == "R" else "R"
-                self._gest_side = side
-                big = excited or stress > 0.72
-                self._gest_open = big and rnd.random() < 0.65
-                self._gest_both = rnd.random() < (0.45 if big else 0.22)
-                amp = _clamp(gain, 0.0, 1.6)
-                peaks: dict[str, tuple[float, float, float]] = {}
-                for s in ("R", "L"):
-                    k = 1.0 if s == side else (rnd.uniform(0.35, 0.55) if self._gest_both else 0.0)
-                    if k <= 0.0:
-                        continue
-                    # Elbow peak = TOTAL bend 25-55 deg (stressed peaks reach the top), expressed relative to the base.
-                    elbow_deg = (rnd.uniform(40.0, 55.0) if self._gest_open else rnd.uniform(25.0, 47.0)) + 8.0 * stress
-                    d_elbow = max(0.05, min(52.0, elbow_deg) / 75.0 - self._rest_base[s][1])   # + stroke overshoot ~= 55
-                    if self._gest_open:                      # expressive open hand: arm out, palm turned out
-                        peaks[s] = (k * amp * rnd.uniform(0.16, 0.32), k * amp * d_elbow, k * amp * rnd.uniform(-0.55, -0.25))
-                    else:                                    # beat / point: forearm up and in, wrist follows
-                        peaks[s] = (k * amp * rnd.uniform(-0.02, 0.10), k * amp * d_elbow, k * amp * rnd.uniform(0.05, 0.35))
-                self._gest_peak = peaks
-                go("prepare", rnd.uniform(0.16, 0.28))
-        elif ph == "prepare" and el >= self._gest_dur:
-            go("stroke", rnd.uniform(0.14, 0.24))
-            self._gest_beat.v += 1.6
-        elif ph == "stroke" and el >= self._gest_dur:
-            go("hold", rnd.uniform(0.25, 0.9) + (0.5 if excited else 0.0))
-        elif ph == "hold":
-            if onset > 0.3:                                 # beat accents ride on stressed syllables
-                self._gest_beat.v += 0.9 * onset
-            if el >= self._gest_dur:
-                go("relax", rnd.uniform(0.5, 0.9))
-        elif ph == "relax" and el >= self._gest_dur:
-            go("rest", 0.0)
-            self._gest_next = t_now + rnd.uniform(0.25, 0.7 if excited else 1.2)
-            self._gest_peak = {}
-        ph = self._gest_phase
-
-        # Envelope: prepare lifts a little (anticipation), stroke snaps to the peak, hold keeps it, relax lets go.
-        u = _clamp((t_now - self._gest_t0) / max(0.05, self._gest_dur), 0.0, 1.0)
-        su = u * u * (3.0 - 2.0 * u)
-        env = {"rest": 0.0, "prepare": 0.32 * su, "stroke": 0.32 + 0.68 * su, "hold": 1.0, "relax": 1.0 - su}[ph]
-        beat = self._gest_beat.step(0.0, dt, 16.0, 0.45)
-        out: dict[str, tuple[float, float, float]] = {}
-        for s, (sh, elb, wr) in self._gest_peak.items():
-            lead = 1.0 if s == self._gest_side else 0.85      # the minor hand trails a touch
-            e = env * lead
-            # Wrist anticipates against the stroke during prepare, then follows through (springs add the lag).
-            wr_t = wr * e - (0.18 * su if ph == "prepare" else 0.0)
-            out[s] = (sh * e, elb * e + 0.05 * beat * (1.0 if s == self._gest_side else 0.5), wr_t + 0.04 * beat)
-        return out
 
     # ------------------------------------------------------------------ frame
     def step(self, dt: float, cfg: dict[str, Any], ctx: Any) -> tuple[dict[str, tuple[float, float]], dict[str, Any], dict[str, Any]]:
@@ -922,6 +828,7 @@ class RigController:
             self.sp_beat_y.v -= 30.0 * beat_strength * nod_gain
             self.sp_beat_z.v += self._beat_sign * 10.0 * beat_strength * nod_gain
             self.sp_chest_y.v += 1.8 * beat_strength * min(1.5, jiggle)      # tiny body bounce -> chest physics
+            self.sp_chest_x.v += 1.1 * self._beat_sign * beat_strength * min(1.5, jiggle)   # -> Arm L/R Swing
             if beat_strength > 0.95 and rnd.random() < 0.35 and t_now - self._brow_ev_start > self._brow_ev_dur:
                 self._brow_ev_side = -1.0 if rnd.random() < 0.5 else 1.0     # asymmetric emphasis brow
                 self._brow_ev_start, self._brow_ev_dur, self._brow_ev_amp = t_now, rnd.uniform(0.45, 0.8), rnd.uniform(0.18, 0.3)
@@ -1030,15 +937,18 @@ class RigController:
         t_arm_r = _ff(temp["armR"], 0.0) if temp and "armR" in temp else _ff(rig_cfg.get("armRPose", 0.0), 0.0)
         t_arm_l = _ff(temp["armL"], 0.0) if temp and "armL" in temp else _ff(rig_cfg.get("armLPose", 0.0), 0.0)
 
-        # 7.1 Talking-arm gesture state machine (3-bone resting arms; automatic whenever she speaks)
-        excited = stress > 0.72 or ma > 0.45 or expr_name == "excited" or (expr_name == "happy" and stress > 0.5)
+        # 7.1 Excited / greeting peaks: raise the clean wave arm for one phrase, rarely (8-14 s cooldown). Normal chatter
+        #     keeps the original resting arms down; they sway through Arm L/R Swing physics with posture & beats.
         rest_free = (t_arm_r < 0.5 and t_arm_l < 0.5) and not em_id and m_clip is None
-        gest_allowed = auto_gest and rest_free and ag_gain > 0.0
-        gest = self._gesture_step(t_now, dt, speaking, energy, stress, onset, excited,
-                                  ag_gain / 0.75, gest_allowed)
-        if not self._has_rest_arms and auto_gest and self._gest_phase in ("prepare", "stroke", "hold"):
-            # Older models without the 3-bone rest rig: raise the dominant arm for the phrase instead.
-            if self._gest_side == "R":
+        excited_peak = speaking and stress > 0.72 and (ma > 0.35 or expr_name == "excited")
+        if auto_gest and ag_gain > 0.0 and rest_free and excited_peak and t_now >= self._raise_next and t_now >= self._raise_until:
+            self._raise_side = "L" if self._raise_side == "R" else "R"
+            self._raise_until = t_now + rnd.uniform(1.4, 2.6)
+            self._raise_next = self._raise_until + rnd.uniform(8.0, 14.0)
+        if t_now < self._raise_until:
+            if not auto_gest or not rest_free or (not speaking and t_now - self._speech_off_since > 0.4):
+                self._raise_until = t_now                            # phrase over / something else owns the arms
+            elif self._raise_side == "R":
                 t_arm_r = max(t_arm_r, 1.0)
             else:
                 t_arm_l = max(t_arm_l, 1.0)
@@ -1073,43 +983,6 @@ class RigController:
         # Raised wrist follow-through: a slow copy of the gesture; the difference flicks the hand.
         lag_r = self.sp_arm_r_wlag.step(arm_r_gest, dt, 6.0, 0.7)
         lag_l = self.sp_arm_l_wlag.step(arm_l_gest, dt, 6.0, 0.7)
-
-        # 7.2 3-bone resting arms: relaxed bend + breath drift + posture coupling + state poses + gestures
-        rest_vals: dict[str, tuple[float, float, float]] = {}
-        if self._has_rest_arms:
-            gp = self._gest_phase
-            om = {"rest": 3.4, "prepare": 7.5, "stroke": 13.0, "hold": 9.0, "relax": 4.4}[gp]
-            em_arm = EMOTE_REST_ARMS.get(em_id) if em_id else None
-            em_env = 0.0
-            if em_arm is not None and em_dur > 0.1:
-                u_e = _clamp(em_el / em_dur, 0.0, 1.0)
-                em_env = _smooth(u_e / 0.2) * _smooth((1.0 - u_e) / 0.3)
-            for idx, s in enumerate(("R", "L")):
-                sgn = 1.0 if s == "R" else -1.0
-                b_sh, b_el, b_wr = self._rest_base[s]
-                sh = b_sh + 0.035 * (breath_val - 0.4) - 0.012 * sgn * body_z
-                el_ = b_el + 0.03 * ma + 0.025 * (breath_val - 0.4) + 0.04 * w_l
-                wr = b_wr + 0.02 * mv
-                # Thinking: the glance-side hand drifts up toward the waist / front.
-                think_k = w_t * (0.25 + 0.75 * (tl if s == "L" else tr))
-                sh -= 0.05 * think_k
-                el_ += 0.42 * think_k
-                wr += 0.28 * think_k
-                g = gest.get(s)
-                if g is not None:
-                    sh += g[0]
-                    el_ += g[1]
-                    wr += g[2]
-                if em_arm is not None:
-                    tgt = em_arm[idx]
-                    sh = sh * (1.0 - em_env) + tgt[0] * em_env
-                    el_ = el_ * (1.0 - em_env) + tgt[1] * em_env
-                    wr = wr * (1.0 - em_env) + tgt[2] * em_env
-                sp = self.sp_rest[s]
-                v_sh = sp[0].step(sh, dt, om * 0.85, 0.92)
-                v_el = sp[1].step(el_, dt, om, 0.78 if gp == "stroke" else 0.9)
-                v_wr = sp[2].step(wr, dt, om * 0.7, 0.55)            # wrist lags + overshoots: follow-through
-                rest_vals[s] = (_clamp(v_sh, -1.0, 1.0), _clamp(v_el, -1.0, 1.0), _clamp(v_wr, -1.0, 1.0))
 
         # 8. Motion Lab clip blend (head, body, blinks & arms only — never the live mouth)
         if m_clip is not None:
@@ -1231,12 +1104,6 @@ class RigController:
             p["Arm L Elbow"] = (_clamp(0.10 * arm_l_pose * math.sin(t_now * 1.1 + 0.7), -1.0, 1.0), 0.0)
             p["Arm R Wrist"] = (_clamp(1.4 * (lag_r - arm_r_gest) * arm_r_pose, -1.0, 1.0), 0.0)
             p["Arm L Wrist"] = (_clamp(1.4 * (lag_l - arm_l_gest) * arm_l_pose, -1.0, 1.0), 0.0)
-        if rest_vals:
-            for s, (v_sh, v_el, v_wr) in rest_vals.items():
-                p[f"Rest Arm {s} Shoulder"] = (v_sh, 0.0)
-                p[f"Rest Arm {s} Elbow"] = (v_el, 0.0)
-                p[f"Rest Arm {s} Wrist"] = (v_wr, 0.0)
-
         p["Sparkle Eyes"] = (sparkle, 0.0)
         p["Anime Blush Lines"] = (blush, 0.0)
 
@@ -1525,6 +1392,12 @@ class RigController:
                 p["Eye Jelly"] = (_clamp(0.6 * squash, -0.22, 0.22), 0.0)
             if "Mouth Spring" in p and m_spring is not None:
                 p["Mouth Spring"] = (m_spring, 0.0)
+            self.sp_fb_arm_swing.v += jiggle * (-v_bx * 0.05) * dt * 12.0
+            swing = _clamp(self.sp_fb_arm_swing.step(0.0, dt, 4.6, 0.35), -1.0, 1.0)
+            if "Arm R Swing" in p:
+                p["Arm R Swing"] = (swing, 0.0)
+            if "Arm L Swing" in p:
+                p["Arm L Swing"] = (swing, 0.0)
         self._prev_body_x = body_x
         self._prev_body_y = body_y
         self._prev_breath = breath_val
@@ -1550,8 +1423,7 @@ class RigController:
         self.last_shader = shader_cfg
         self.last_camera = cam_cfg
         self.last_state = {
-            "interaction": istate, "mood": (round(mv, 3), round(ma, 3)), "gesture": self._gest_phase,
-            "gestureSide": self._gest_side, "breathSigh": self._breath_is_sigh, "blink": self._blink_kind if self._blink_active else "",
+            "interaction": istate, "mood": (round(mv, 3), round(ma, 3)), "armRaise": (self._raise_side if t_now < self._raise_until else ""), "breathSigh": self._breath_is_sigh, "blink": self._blink_kind if self._blink_active else "",
             "pitchRel": round(pr, 3),
         }
         return p, shader_cfg, cam_cfg

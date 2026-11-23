@@ -216,3 +216,153 @@ export function choiceRows(items, { active, onPick, name = 'choice' } = {}) {
     ]);
   });
 }
+
+/* ───────────────────────── Settings search ─────────────────────────
+ * Index = every group heading, row title, subtitle, disclosure title and control text (buttons, chips,
+ * segmented pills, <select> options) of each settings tab, extracted from rendered (detached) panels.
+ * So "Full Body", room names, emote names, model names… are all searchable without a hand-kept list. */
+
+export const normSearch = (s) => String(s ?? '').toLowerCase()
+  .normalize('NFKD').replace(/[\u0300-\u036f]/g, '')   // strip accents
+  .replace(/[^\p{L}\p{N}]+/gu, ' ')                       // every symbol/punctuation/glyph -> word break
+  .trim();
+
+// Query term → alternatives (any match counts). Multi-word keys are matched as phrases first.
+const SEARCH_SYNONYMS = {
+  'full body': ['full body', 'framing'], 'half body': ['waist up', 'framing'], 'upper body': ['waist up', 'framing'],
+  'close up': ['bust', 'framing'], closeup: ['bust', 'framing'], portrait: ['bust', 'framing'], headshot: ['bust', 'framing'],
+  waist: ['waist up', 'framing'], bust: ['bust', 'framing'], framing: ['framing', 'camera'],
+  zoom: ['zoom', 'scale', 'framing'], camera: ['camera', 'framing', 'zoom'], position: ['position', 'lift', 'framing'],
+  hand: ['arm', 'gesture'], hands: ['arm', 'gesture'], arm: ['arm'], arms: ['arm'], gesture: ['gesture', 'arm'], wave: ['wave'],
+  'lip sync': ['lip sync', 'viseme', 'mouth'], lipsync: ['lip sync', 'viseme', 'mouth'], lips: ['lip', 'mouth', 'viseme'],
+  mouth: ['mouth', 'viseme', 'lip'], viseme: ['viseme'], phoneme: ['phoneme', 'viseme', 'vowel'], vowel: ['vowel', 'calibrat'],
+  mic: ['mic', 'microphone'], microphone: ['mic', 'microphone'],
+  voice: ['voice', 'fish', 'speech', 'tts'], tts: ['tts', 'speech'], speech: ['speech', 'tts', 'voice'], fish: ['fish'],
+  call: ['call', 'duplex'], duplex: ['duplex', 'call'],
+  gateway: ['gateway', 'vercel'], vercel: ['vercel', 'gateway'], key: ['key', 'token'], token: ['token', 'key'], api: ['api', 'key'],
+  hair: ['hair', 'bangs'], bangs: ['bangs', 'hair'], eye: ['eye', 'iris'], eyes: ['eye', 'iris'], iris: ['iris', 'eye'],
+  outfit: ['outfit', 'wardrobe', 'fabric', 'halter'], clothes: ['outfit', 'wardrobe', 'fabric'], dress: ['outfit', 'wardrobe'],
+  shoes: ['shoes', 'sneakers', 'high tops'], color: ['color', 'tint', 'hue'], colour: ['color', 'tint', 'hue'],
+  sleep: ['sleep', 'memory'], dream: ['dream'], dreams: ['dream'], memory: ['memory', 'memories', 'fact'], memories: ['memor', 'fact'],
+  fact: ['fact', 'memor'], facts: ['fact', 'memor'], mood: ['mood', 'expression'], pin: ['pin'], recap: ['recap'], lora: ['lora', 'colab'],
+  background: ['room', 'background'], room: ['room', 'background'], obs: ['obs', 'chroma', 'transparent', 'broadcast'],
+  green: ['chroma', 'green'], transparent: ['transparent'], particles: ['particles', 'sakura', 'embers', 'rain', 'dust'],
+  light: ['light', 'rim'], lighting: ['light', 'rim'], rim: ['rim'], glow: ['glow', 'emissive', 'bloom'], bloom: ['bloom', 'glow'],
+  shader: ['shader', 'look preset'], sharp: ['sharp'], blur: ['blur', 'bokeh'],
+  emote: ['emote'], emotes: ['emote'], expression: ['expression', 'mood'], face: ['face', 'expression', 'blush', 'eye'],
+  blink: ['blink'], gaze: ['gaze', 'look at', 'mouse'], look: ['look', 'gaze'], physics: ['physics', 'jiggle', 'bounce', 'spring'],
+  jiggle: ['jiggle', 'bounce'], bounce: ['bounce', 'jiggle'], chibi: ['chibi', 'proportion'], pat: ['pat', 'poke'], poke: ['poke', 'pat'],
+  decider: ['decision', 'decider'], decision: ['decision', 'decider'], brain: ['brain', 'llm', 'decision'], llm: ['llm', 'model'],
+  ai: ['ai', 'llm', 'brain', 'gateway'], persona: ['persona', 'personality'], personality: ['personality', 'persona'],
+  plugin: ['plugin'], plugins: ['plugin'], param: ['parameter'], params: ['parameter'], parameter: ['parameter'], preset: ['preset'],
+  motion: ['motion', 'clip', 'retarget'], video: ['video', 'motion lab'], save: ['save', 'preset'],
+};
+const SYN_PHRASES = Object.keys(SEARCH_SYNONYMS).filter((k) => k.includes(' ')).sort((a, b) => b.length - a.length);
+
+/** Split a query into term groups: [[alt, alt…], …] — every group must match. */
+export function searchTerms(query) {
+  let q = ` ${normSearch(query)} `;
+  const groups = [];
+  for (const phrase of SYN_PHRASES) {
+    if (q.includes(` ${phrase} `)) {
+      groups.push([...new Set([phrase, ...SEARCH_SYNONYMS[phrase]].map(normSearch))]);
+      q = q.replace(` ${phrase} `, ' ');
+    }
+  }
+  for (const w of q.trim().split(' ').filter(Boolean)) {
+    groups.push([...new Set([w, ...(SEARCH_SYNONYMS[w] || [])].map(normSearch))]);
+  }
+  return groups;
+}
+
+/** Extract searchable entries from a rendered settings tab. Locator = group + title + nth occurrence. */
+export function extractSearchEntries(root, tab, tabTitle) {
+  const entries = [];
+  const occ = new Map();
+  const add = (e) => {
+    const k = `${e.kind === 'group' ? 'G' : 'R'}\u0000${e.group}\u0000${e.title}`;
+    const n = occ.get(k) || 0;
+    occ.set(k, n + 1);
+    entries.push({
+      ...e, tab, tabTitle, occ: n,
+      hTitle: normSearch(e.title), hDesc: normSearch(e.desc), hKw: normSearch(e.kw), hGroup: normSearch(e.group),
+    });
+  };
+  root.querySelectorAll('.s-group').forEach((g) => {
+    const group = g.querySelector('.s-group-head h2')?.textContent.trim() || '';
+    if (!group) return;
+    add({ kind: 'group', group, title: group, desc: g.querySelector('.s-group-head p')?.textContent.trim() || '', kw: '' });
+    g.querySelectorAll('.s-row').forEach((r) => {
+      const title = r.querySelector(':scope > .s-row-text > .s-title')?.textContent.trim();
+      if (!title) return;
+      const desc = r.querySelector(':scope > .s-row-text > .s-desc')?.textContent.trim() || '';
+      const ctrl = r.querySelector(':scope > .s-ctrl');
+      const kw = ctrl ? [...ctrl.querySelectorAll('button, option, optgroup, a')]
+        .map((n) => n.label || n.textContent || n.getAttribute('aria-label') || '').join(' ').slice(0, 600) : '';
+      const parent = r.parentElement?.closest('.s-more-body')
+        ? (r.parentElement.closest('.s-more')?.querySelector(':scope > .s-more-head .s-title')?.textContent.trim() || '') : '';
+      add({ kind: r.classList.contains('s-more-head') ? 'section' : 'row', group, title, desc, kw, parent });
+    });
+  });
+  return entries;
+}
+
+const atWord = (hay, term) => hay.startsWith(term) || hay.includes(` ${term}`);
+
+/** Score entries against a query; returns the best `limit` matches (every term group must match somewhere). */
+export function searchSettings(entries, query, limit = 10) {
+  const groups = searchTerms(query);
+  if (!groups.length) return [];
+  const scored = [];
+  for (const e of entries) {
+    let score = 0;
+    let ok = true;
+    for (const alts of groups) {
+      let best = 0;
+      alts.forEach((a, i) => {
+        if (!a) return;
+        // The typed word (or the same word spaced differently, e.g. lipsync / lip sync) beats a synonym.
+        const w = i === 0 || a.replace(/ /g, '') === alts[0].replace(/ /g, '') ? 1 : 0.8;
+        // Match at word starts only ("arm" must not hit "warmth"); descriptions outrank button/option text.
+        if (e.hTitle.startsWith(a)) best = Math.max(best, 6 * w);
+        else if (atWord(e.hTitle, a)) best = Math.max(best, 4.5 * w);
+        else if (atWord(e.hDesc, a)) best = Math.max(best, 2.6 * w);
+        else if (atWord(e.hKw, a)) best = Math.max(best, 2.4 * w);
+        else if (atWord(e.hGroup, a)) best = Math.max(best, 1.2 * w);
+      });
+      if (!best) { ok = false; break; }
+      score += best;
+    }
+    if (!ok) continue;
+    if (e.kind === 'group') score -= 0.5;           // prefer concrete rows over headings
+    if (e.kind === 'section') score -= 0.2;
+    score -= Math.min(1, e.title.length / 80);      // shorter titles first on ties
+    scored.push([score, e]);
+  }
+  scored.sort((a, b) => b[0] - a[0]);
+  const seen = new Set();
+  const out = [];
+  for (const [, e] of scored) {
+    const k = `${e.tab}|${e.kind}|${e.group}|${e.title}|${e.occ}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(e);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+/** Find the live element for an index entry inside the rendered settings body. */
+export function findSearchTarget(root, entry) {
+  for (const g of root.querySelectorAll('.s-group')) {
+    if ((g.querySelector('.s-group-head h2')?.textContent.trim() || '') !== entry.group) continue;
+    if (entry.kind === 'group') return g;
+    let n = 0;
+    for (const r of g.querySelectorAll('.s-row')) {
+      if (r.querySelector(':scope > .s-row-text > .s-title')?.textContent.trim() !== entry.title) continue;
+      if (n === entry.occ) return r;
+      n += 1;
+    }
+  }
+  return null;
+}

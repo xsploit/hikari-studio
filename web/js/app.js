@@ -12,6 +12,7 @@ import { renderAiPanel } from './panels/ai_panel.js';
 import { renderPluginsPanel } from './panels/plugins_panel.js';
 import { renderMemoryPanel } from './panels/memory_panel.js';
 import { EMOTES, emoteGrid, firePill, loadEmotes } from './panels/emotes.js';
+import { extractSearchEntries, findSearchTarget, searchSettings } from './ui.js';
 
 const TABS = {
   general:  { title: 'General & Stage',    sub: 'Room, OBS output, atmosphere, framing and presets.',
@@ -243,6 +244,7 @@ async function boot() {
   function openSettings(tab) {
     closeEmotes();
     if (tab && TABS[tab]) { store.activeTab = tab; saveTab(tab); }
+    searchIndex = null;
     clearTimeout(closeTimer);
     lastFocus = document.activeElement;
     settingsRoot.hidden = false;
@@ -258,6 +260,7 @@ async function boot() {
     if (settingsRoot.hidden) return;
     settingsRoot.classList.remove('open');
     app.classList.remove('settings-open');
+    closeSearchList();
     btnSettings.classList.remove('active');
     closeTimer = setTimeout(() => { settingsRoot.hidden = true; }, 360);
     lastFocus?.focus?.({ preventScroll: true });
@@ -276,6 +279,177 @@ async function boot() {
     b.textContent = 'Saved ✓';
     b.classList.add('saved');
     setTimeout(() => { b.textContent = 'Save settings'; b.classList.remove('saved'); }, 1400);
+  });
+
+  /* ───────── Settings search (all tabs, incl. collapsed sections) ───────── */
+  const searchIn = document.getElementById('settings-search');
+  const searchClear = document.getElementById('settings-search-clear');
+  const searchList = document.getElementById('settings-search-results');
+  const searchBox = searchIn.closest('.side-search');
+  let searchIndex = null;
+  let searchIndexAt = 0;
+  let searchResults = [];
+  let searchActive = -1;
+
+  // Render every tab off-screen and index its headings, rows, hints and control labels.
+  // Built lazily on first keystroke; rebuilt at most every 3 s so it tracks live settings.
+  function buildSearchIndex() {
+    if (searchIndex && Date.now() - searchIndexAt < 3000) return searchIndex;
+    const all = [];
+    for (const [key, tab] of Object.entries(TABS)) {
+      try {
+        const box = document.createElement('div');
+        box.append(...tab.render(store).filter(Boolean));
+        all.push(...extractSearchEntries(box, key, tab.title));
+      } catch (err) {
+        console.warn('Settings search could not index', key, err);
+      }
+    }
+    searchIndex = all;
+    searchIndexAt = Date.now();
+    return all;
+  }
+
+  // Wrap typed words found in the title with <mark> (built with text nodes — no HTML injection).
+  function highlightTitle(title, query) {
+    const words = query.toLowerCase().split(/\s+/).filter((w) => w.length > 1);
+    const lower = title.toLowerCase();
+    const spans = [];
+    for (const w of words) {
+      let i = lower.indexOf(w);
+      while (i >= 0) { spans.push([i, i + w.length]); i = lower.indexOf(w, i + w.length); }
+    }
+    spans.sort((a, b) => a[0] - b[0]);
+    const out = [];
+    let pos = 0;
+    for (const [a, b] of spans) {
+      if (a < pos) continue;
+      if (a > pos) out.push(document.createTextNode(title.slice(pos, a)));
+      const m = document.createElement('mark');
+      m.textContent = title.slice(a, b);
+      out.push(m);
+      pos = b;
+    }
+    if (pos < title.length) out.push(document.createTextNode(title.slice(pos)));
+    return out;
+  }
+
+  function setSearchActive(i) {
+    searchActive = i;
+    [...searchList.querySelectorAll('.ssr')].forEach((b, j) => {
+      b.classList.toggle('active', j === i);
+      b.setAttribute('aria-selected', String(j === i));
+      if (j === i) {
+        b.scrollIntoView({ block: 'nearest' });
+        searchIn.setAttribute('aria-activedescendant', b.id);
+      }
+    });
+  }
+
+  function closeSearchList() {
+    searchList.hidden = true;
+    searchIn.setAttribute('aria-expanded', 'false');
+    searchIn.removeAttribute('aria-activedescendant');
+  }
+
+  function renderSearchResults() {
+    const q = searchIn.value.trim();
+    searchClear.hidden = !q;
+    searchBox.classList.toggle('has-value', Boolean(q));
+    if (!q) { closeSearchList(); return; }
+    searchResults = searchSettings(buildSearchIndex(), q, 10);
+    const items = searchResults.map((r, i) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'ssr';
+      b.id = `ssr-${i}`;
+      b.setAttribute('role', 'option');
+      const t = document.createElement('span');
+      t.className = 'ssr-title';
+      t.append(...highlightTitle(r.title, q));
+      const meta = document.createElement('span');
+      meta.className = 'ssr-meta';
+      const where = [r.tabTitle];
+      if (r.kind !== 'group' && r.group) where.push(r.group);
+      if (r.parent) where.push(r.parent);
+      meta.textContent = where.join(' · ');
+      b.append(t, meta);
+      b.addEventListener('mousedown', (e) => e.preventDefault()); // keep focus in the input
+      b.addEventListener('mousemove', () => { if (searchActive !== i) setSearchActive(i); });
+      b.addEventListener('click', () => jumpToSetting(r));
+      return b;
+    });
+    if (!items.length) {
+      const none = document.createElement('div');
+      none.className = 'ssr-empty';
+      none.textContent = `No settings match “${q}”`;
+      items.push(none);
+    }
+    searchList.replaceChildren(...items);
+    searchList.hidden = false;
+    searchIn.setAttribute('aria-expanded', 'true');
+    setSearchActive(searchResults.length ? 0 : -1);
+  }
+
+  function jumpToSetting(r) {
+    closeSearchList();
+    if (store.activeTab !== r.tab) {
+      store.activeTab = r.tab;
+      saveTab(r.tab);
+      store.rerenderPanel(true);
+    }
+    const body = document.getElementById('inspector-body');
+    const target = findSearchTarget(body, r);
+    if (!target) return;
+    // Open every collapsed disclosure around the target (and the target's own, for section hits).
+    const toOpen = [];
+    for (let m = target.parentElement?.closest('.s-more'); m; m = m.parentElement?.closest('.s-more')) toOpen.push(m);
+    if (target.classList.contains('s-more-head')) toOpen.push(target.closest('.s-more'));
+    toOpen.reverse().forEach((m) => {
+      if (m && !m.classList.contains('open')) m.querySelector(':scope > .s-more-head')?.click();
+    });
+    const flash = target.matches('.s-group') ? (target.querySelector('.s-card') || target) : target;
+    requestAnimationFrame(() => {
+      target.scrollIntoView({ behavior: 'smooth', block: target.matches('.s-group') ? 'start' : 'center' });
+      flash.classList.remove('search-flash');
+      void flash.offsetWidth; // restart the animation
+      flash.classList.add('search-flash');
+      setTimeout(() => flash.classList.remove('search-flash'), 2000);
+    });
+  }
+
+  function focusSearch() {
+    if (settingsRoot.hidden) openSettings();
+    requestAnimationFrame(() => { searchIn.focus(); searchIn.select(); });
+  }
+
+  searchIn.addEventListener('input', renderSearchResults);
+  searchIn.addEventListener('focus', () => { if (searchIn.value.trim()) renderSearchResults(); });
+  searchIn.addEventListener('blur', () => closeSearchList());
+  searchIn.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      if (searchList.hidden) { renderSearchResults(); return; }
+      e.preventDefault();
+      if (!searchResults.length) return;
+      const n = searchResults.length;
+      setSearchActive((searchActive + (e.key === 'ArrowDown' ? 1 : -1) + n) % n);
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      const r = searchResults[searchActive];
+      if (r && !searchList.hidden) jumpToSetting(r);
+    } else if (e.key === 'Escape') {
+      if (searchIn.value) {           // first Esc clears; an empty field lets Esc close Settings
+        e.preventDefault();
+        e.stopPropagation();
+        searchIn.value = '';
+        renderSearchResults();
+      }
+    }
+  });
+  searchClear.addEventListener('click', () => {
+    searchIn.value = '';
+    renderSearchResults();
+    searchIn.focus();
   });
 
   /* ───────── Quick-emote popover ───────── */
@@ -311,6 +485,16 @@ async function boot() {
     if (e.key === 'Escape') {
       if (!emotePop.hidden) { closeEmotes(); return; }
       if (!settingsRoot.hidden) { closeSettings(); return; }
+    }
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'k' || e.key === 'K')) {
+      e.preventDefault();
+      focusSearch();
+      return;
+    }
+    if (e.key === '/' && !typing && !settingsRoot.hidden && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      focusSearch();
+      return;
     }
     if ((e.ctrlKey || e.metaKey) && e.key === ',') {
       e.preventDefault();
