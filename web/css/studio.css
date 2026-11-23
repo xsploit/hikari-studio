@@ -564,3 +564,13 @@ kbd {
 .icon-x:hover { background: rgba(255, 92, 114, 0.12); color: var(--danger); }
 .icon-x:disabled { opacity: .4; cursor: default; }
 @container (max-width: 420px) { .stat-grid { grid-template-columns: 1fr 1fr; } }
+
+/* ───────────── Decider (Vercel AI Gateway) ───────────── */
+.pill-select.wide { min-width: 0; width: 290px; max-width: 100%; }
+.pill-select optgroup { background: #18181b; color: var(--muted); font-style: normal; font-weight: 600; }
+.pill-select optgroup option { color: var(--text); font-weight: 400; }
+@container (max-width: 470px) {
+  .s-row:has(.pill-select.wide) { flex-direction: column; align-items: stretch; gap: 8px; }
+  .s-row:has(.pill-select.wide) .s-ctrl { max-width: none; }
+  .pill-select.wide { width: 100%; }
+}

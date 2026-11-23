@@ -41,7 +41,9 @@ from modules.fish_duplex import FishDuplexController
 from modules.fish_tts_stream import FISH_TRANSPORTS
 from modules.lipsync import LiveLipSyncEngine
 from modules.sleep_memory import COLAB_BASE_MODELS, MEMORY_KINDS, SleepMemory
-from modules.vercel_gateway import complete_openai_compat, local_backend_hint, local_chat_request
+from modules.vercel_gateway import (
+    catalog_entries, complete_openai_compat, evaluation_catalog, local_backend_hint, local_chat_request,
+)
 from modules.video_retarget import extract_motion_from_video
 
 HERE = Path(__file__).resolve().parent
@@ -797,6 +799,24 @@ def build_app(runtime: StudioRuntime) -> web.Application:
     async def api_decision_status(_req):
         return web.json_response({"ok": True, **runtime.decisions.status()})
 
+    async def api_decider_models(req):
+        """Vercel AI Gateway `type: evaluation` models (catalog cached 10 min; curated list if offline)."""
+        from modules.decision_engine import decider_configured, decider_model
+        cat = await evaluation_catalog(runtime.config.data["ai"], force=req.query.get("refresh") == "1")
+        dec = runtime.decisions
+        active = dec.resolve_decider()
+        return web.json_response({
+            "ok": True,
+            "gatewayConfigured": decider_configured(dec.cfg, "gateway"),
+            "activeMode": dec.mode,
+            "activeDecider": active,
+            "activeModel": dec.route_model(active),
+            "gatewayEvalModel": decider_model(dec.cfg, "gateway"),
+            "source": cat["source"],
+            "error": cat["error"],
+            "models": catalog_entries(cat["models"]),
+        })
+
     async def api_decision_test(req):
         """Ask the Decision Engine what she'd do for a line of text. Dry run unless apply=true
         (a dry run never touches cooldowns)."""
@@ -1293,6 +1313,7 @@ def build_app(runtime: StudioRuntime) -> web.Application:
     app.router.add_get("/api/emotes", api_emotes)
     app.router.add_get("/api/config", api_get_config)
     app.router.add_get("/api/decision", api_decision_status)
+    app.router.add_get("/api/deciders/models", api_decider_models)
     app.router.add_post("/api/decision/test", api_decision_test)
     app.router.add_post("/api/fish/agent/persona", api_fish_agent_persona)
     app.router.add_post("/api/fish/emote", api_fish_emote)

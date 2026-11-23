@@ -13,15 +13,19 @@ DECISION-OPTIONS.md):
     separate wave cooldown, no immediate repeats, and slow randomized idle moments.
 
 Modes (config["ai"]["decisionMode"]):
+  "gateway"    Vercel AI Gateway evaluation-model route (ONE key, AI_GATEWAY_API_KEY): any `type: evaluation`
+               model — perplexity/pplx-decider-*, openai/gpt-6-luna-decisions, typesafe-ai/jev,
+               google/gemini-decision-1, microsoft/decision-1.1, liquid/d1.2, ... (gatewayEvalModel).
   "clef"       Cloudflare Workers AI Clef typed decision model (@cf/cloudflare/clef-flash default).
-  "pplx"       Perplexity Decisions (pplx-decider-flash-latest default).
+  "pplx"       Perplexity Decider: direct with PERPLEXITY_API_KEY, otherwise via the Vercel AI Gateway.
   "jev"        Vercel AI Gateway evaluation-model route (typesafe-ai/jev), as Waifu Studio evaluation.rs.
-  "luna"       OpenAI Decisions API (gpt-6-luna).
+  "luna"       OpenAI Decisions: direct with OPENAI_API_KEY, otherwise openai/gpt-6-luna-decisions via the Gateway.
   "llm"        bounded JSON choice call to a chat-completions endpoint (Vercel Gateway / OpenAI-compat).
   "heuristic"  zero-latency local intent + emotion classifier (greeting / farewell /
                compliment / flirt / tease / question / awe / sad / sleepy / idle ...).
-  "auto"       clef -> pplx -> jev -> luna -> llm -> heuristic: the first one with credentials that
-               has not failed in the last minute. Every model call has a strict deadline (1.5 s).
+  "auto"       gateway -> clef -> pplx -> luna -> llm -> heuristic: the first one with credentials that
+               has not failed in the last minute (a failing gateway model falls back to typesafe-ai/jev).
+               Every model call has a strict deadline (1.5 s).
 """
 from __future__ import annotations
 
@@ -81,6 +85,8 @@ DECISION_DEFAULTS: dict[str, Any] = {
     "clefModel": "@cf/cloudflare/clef-flash",     # | @cf/cloudflare/clef | @cf/cloudflare/clef-omni
     "pplxModel": "pplx-decider-flash-latest",     # | pplx-decider-latest | pplx-decider(-flash)-v1.3
     "jevModel": "typesafe-ai/jev",
+    "gatewayEvalModel": "perplexity/pplx-decider-flash-v1.3",   # any Vercel AI Gateway `type: evaluation` model
+    "deciderRoute": "auto",          # pplx / luna: auto (direct key if set, else Vercel Gateway) | gateway | direct
     "lunaModel": "gpt-6-luna",
     "cloudflareAccountId": "",       # optional; CLOUDFLARE_ACCOUNT_ID server-side (masked in /api/state)
     "cloudflareApiToken": "",        # optional; CLOUDFLARE_API_TOKEN server-side (masked)
@@ -259,17 +265,24 @@ PPLX_DECISIONS_URL = "https://api.perplexity.ai/v1/decisions"
 MAX_DECISION_BODY = 64 * 1024                 # evaluation.rs: oversized requests never leave the process
 DECISION_RESPONSE_LIMIT = 128 * 1024          # EvaluationPolicy::DECISION.response_limit
 TRIAGE_RESPONSE_LIMIT = 16 * 1024             # EvaluationPolicy::MEMORY.response_limit
-TYPED_DECIDERS = ("clef", "pplx", "jev", "luna")
+TYPED_DECIDERS = ("gateway", "clef", "pplx", "jev", "luna")
 DECISION_MODES = ("auto", *TYPED_DECIDERS, "llm", "heuristic")
-AUTO_ORDER = (*TYPED_DECIDERS, "llm")         # auto: clef -> pplx -> jev -> luna -> llm -> heuristic
+AUTO_ORDER = ("gateway", "clef", "pplx", "luna", "llm")   # auto: gateway -> clef -> pplx -> luna -> llm -> heuristic
+DEFAULT_GATEWAY_EVAL_MODEL = "perplexity/pplx-decider-flash-v1.3"
+GATEWAY_FALLBACK_MODEL = "typesafe-ai/jev"
+GATEWAY_LUNA_MODEL = "openai/gpt-6-luna-decisions"
+DECIDER_ROUTES = ("auto", "gateway", "direct")
+_EVAL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_PPLX_GATEWAY_ALIASES = {"pplx-decider-flash-latest": "pplx-decider-flash-v1.3", "pplx-decider-latest": "pplx-decider-v1.3"}
 
 DECIDER_SPECS: dict[str, dict[str, Any]] = {
+    "gateway": {"dialect": "jev", "model": DEFAULT_GATEWAY_EVAL_MODEL, "modelKey": "gatewayEvalModel", "models": ()},
     "clef": {"dialect": "typed", "model": "@cf/cloudflare/clef-flash", "modelKey": "clefModel",
              "models": ("@cf/cloudflare/clef-flash", "@cf/cloudflare/clef", "@cf/cloudflare/clef-omni")},
     "pplx": {"dialect": "typed", "model": "pplx-decider-flash-latest", "modelKey": "pplxModel",
              "models": ("pplx-decider-flash-latest", "pplx-decider-flash-v1.3", "pplx-decider-latest", "pplx-decider-v1.3")},
     "jev":  {"dialect": "jev", "model": "typesafe-ai/jev", "modelKey": "jevModel",
-             "models": ("typesafe-ai/jev", "microsoft/microsoft-decision-1")},
+             "models": ("typesafe-ai/jev", "typesafe-ai/jev-1.14.0", "typesafe-ai/jev-1.13.0", "microsoft/microsoft-decision-1")},
     "luna": {"dialect": "openai", "model": "gpt-6-luna", "modelKey": "lunaModel", "models": ("gpt-6-luna",)},
 }
 
@@ -366,9 +379,28 @@ def _secret(cfg: dict[str, Any], cfg_key: str, *env: str) -> str:
     return str(cfg.get(cfg_key) or "").strip() or server_keys.first(*env)
 
 
+def is_eval_model_id(model: str) -> bool:
+    return bool(_EVAL_ID_RE.fullmatch(str(model or ""))) and not str(model).startswith("@cf/")
+
+
+def gateway_pplx_model(model: str) -> str:
+    """pplx-decider-flash-latest -> perplexity/pplx-decider-flash-v1.3 (Gateway ids carry the vendor prefix)."""
+    m = str(model or "").strip()
+    if m.startswith("perplexity/"):
+        return m
+    return "perplexity/" + _PPLX_GATEWAY_ALIASES.get(m, m or "pplx-decider-flash-v1.3")
+
+
 def decider_model(cfg: dict[str, Any], provider: str) -> str:
     spec = DECIDER_SPECS[provider]
     dm = str(cfg.get("decisionModel") or "").strip()
+    if provider == "gateway":
+        # decisionModel is shared with the chat-completions `llm` mode, so it only steers the gateway decider
+        # when it is a known evaluation model; gatewayEvalModel may be ANY catalog evaluation id.
+        if dm and is_eval_model_id(dm) and dm in vercel_gateway.known_evaluation_models():
+            return dm
+        gm = str(cfg.get("gatewayEvalModel") or "").strip()
+        return gm if is_eval_model_id(gm) else spec["model"]
     if dm and (dm in spec["models"] or (provider == "clef" and dm.startswith("@cf/"))
                or (provider == "pplx" and dm.startswith("pplx-decider"))):
         return dm
@@ -391,22 +423,76 @@ def _decider_endpoint(cfg: dict[str, Any], provider: str, **fmt: str) -> str:
     return url
 
 
-def decider_request(cfg: dict[str, Any], provider: str, model: str | None = None) -> tuple[str, dict[str, str]]:
-    """(endpoint, headers) for a typed decider, or raises DecisionModelError if unconfigured.
-    Credentials (server-managed or saved overrides) are attached only to the provider's official host."""
-    if provider not in _DECIDER_HOSTS:
+def _direct_key(cfg: dict[str, Any], provider: str) -> str:
+    if provider == "pplx":
+        return _secret(cfg, "perplexityApiKey", "PERPLEXITY_API_KEY")
+    if provider == "luna":
+        return server_keys.get("OPENAI_API_KEY") or (
+            str(cfg.get("apiKey") or "").strip() if str(cfg.get("provider") or "").lower() == "openai" else "")
+    return ""
+
+
+def decider_transport(cfg: dict[str, Any], provider: str) -> str:
+    """'gateway' (Vercel AI Gateway evaluation route, AI_GATEWAY_API_KEY) or 'direct' (provider's own API)."""
+    if provider in ("gateway", "jev"):
+        return "gateway"
+    if provider == "clef":
+        return "direct"
+    route = str(cfg.get("deciderRoute") or "auto").lower()
+    if route == "gateway":
+        return "gateway"
+    if route == "direct":
+        return "direct"
+    # auto: the provider's own key if one is configured (or a local test endpoint), else the unified Gateway
+    local_direct = server_keys.is_local_url(str(cfg.get(f"{provider}Endpoint") or ""))
+    return "direct" if (_direct_key(cfg, provider) or local_direct) else "gateway"
+
+
+@dataclass
+class DeciderRoute:
+    provider: str
+    transport: str          # gateway | direct
+    dialect: str            # jev | typed | openai
+    model: str              # model id as selected (for status / logs)
+    wire_model: str         # model id as sent (header for the Gateway, body for direct typed/openai)
+    endpoint: str
+    headers: dict[str, str]
+
+
+def decider_route(cfg: dict[str, Any], provider: str, model: str | None = None) -> DeciderRoute:
+    """Resolve provider -> transport, dialect, model, endpoint and headers. Raises DecisionModelError when
+    unconfigured. Credentials are attached only to the official host (Astra policy, key_for_url)."""
+    if provider not in DECIDER_SPECS:
         raise DecisionModelError("Unknown decision provider")
-    model = model or decider_model(cfg, provider)
+    transport = decider_transport(cfg, provider)
     headers = {"Content-Type": "application/json"}
-    host_provider = _DECIDER_HOSTS[provider][1]
-    if provider == "jev":
-        key = _secret(cfg, "vercelApiKey", "AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN")
-        endpoint = _decider_endpoint(cfg, "jev")
-        missing = "Set AI_GATEWAY_API_KEY for the Jev decision model"
+    if transport == "gateway":
+        if model:
+            gm = gateway_pplx_model(model) if provider == "pplx" else model
+        elif provider == "pplx":
+            gm = gateway_pplx_model(decider_model(cfg, "pplx"))
+        elif provider == "luna":
+            lm = decider_model(cfg, "luna")
+            gm = lm if lm.startswith("openai/") else GATEWAY_LUNA_MODEL
+        else:
+            gm = decider_model(cfg, provider)
+        if not is_eval_model_id(gm):
+            raise DecisionModelError("Invalid evaluation model id")
+        endpoint = _decider_endpoint(cfg, "jev")          # ONE endpoint for every gateway evaluation model
+        key = server_keys.key_for_url(endpoint, "vercel",
+                                      _secret(cfg, "vercelApiKey", "AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN"))
+        if not key and not server_keys.is_local_url(endpoint):
+            raise DecisionModelError("Set AI_GATEWAY_API_KEY for Vercel AI Gateway decision models")
         # evaluation.rs headers, verbatim
         headers.update({"ai-gateway-protocol-version": "0.0.1",
-                        "ai-evaluation-model-specification-version": "4", "ai-model-id": model})
-    elif provider == "clef":
+                        "ai-evaluation-model-specification-version": "4", "ai-model-id": gm})
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        return DeciderRoute(provider, "gateway", "jev", gm, gm, endpoint, headers)
+
+    model = model or decider_model(cfg, provider)
+    host_provider = _DECIDER_HOSTS[provider][1]
+    if provider == "clef":
         key = _secret(cfg, "cloudflareApiToken", "CLOUDFLARE_API_TOKEN")
         account = _secret(cfg, "cloudflareAccountId", "CLOUDFLARE_ACCOUNT_ID")
         if not account:
@@ -416,25 +502,31 @@ def decider_request(cfg: dict[str, Any], provider: str, model: str | None = None
         endpoint = _decider_endpoint(cfg, "clef", account_id=account, model=model)
         missing = "Set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN for Clef"
     elif provider == "pplx":
-        key = _secret(cfg, "perplexityApiKey", "PERPLEXITY_API_KEY")
+        key = _direct_key(cfg, "pplx")
         endpoint = _decider_endpoint(cfg, "pplx")
-        missing = "Set PERPLEXITY_API_KEY for the Perplexity decider"
+        missing = "Set PERPLEXITY_API_KEY for the Perplexity decider (or AI_GATEWAY_API_KEY via the Gateway)"
     else:  # luna
-        key = server_keys.get("OPENAI_API_KEY") or (
-            str(cfg.get("apiKey") or "").strip() if str(cfg.get("provider") or "").lower() == "openai" else "")
+        key = _direct_key(cfg, "luna")
         endpoint = _decider_endpoint(cfg, "luna")
-        missing = "Set OPENAI_API_KEY for OpenAI Decisions (gpt-6-luna)"
+        missing = "Set OPENAI_API_KEY for OpenAI Decisions (or AI_GATEWAY_API_KEY via the Gateway)"
     key = server_keys.key_for_url(endpoint, host_provider, key)
     if not key and not server_keys.is_local_url(endpoint):
         raise DecisionModelError(missing)
     if key:
         headers["Authorization"] = f"Bearer {key}"
-    return endpoint, headers
+    dialect = DECIDER_SPECS[provider]["dialect"]
+    return DeciderRoute(provider, "direct", dialect, model, wire_model(provider, model), endpoint, headers)
+
+
+def decider_request(cfg: dict[str, Any], provider: str, model: str | None = None) -> tuple[str, dict[str, str]]:
+    """(endpoint, headers) for a typed decider (backward-compatible view of decider_route)."""
+    r = decider_route(cfg, provider, model)
+    return r.endpoint, r.headers
 
 
 def decider_configured(cfg: dict[str, Any], provider: str) -> bool:
     try:
-        decider_request(cfg, provider)
+        decider_route(cfg, provider)
         return True
     except DecisionModelError:
         return False
@@ -442,13 +534,14 @@ def decider_configured(cfg: dict[str, Any], provider: str) -> bool:
 
 async def run_typed_decision(cfg: dict[str, Any], provider: str, state: dict[str, Any],
                              questions: list[ChoiceQuestion], *, timeout: float = 1.5,
-                             response_limit: int = DECISION_RESPONSE_LIMIT, model: str | None = None
-                             ) -> dict[str, str | None]:
+                             response_limit: int = DECISION_RESPONSE_LIMIT, model: str | None = None,
+                             route_out: dict[str, Any] | None = None) -> dict[str, str | None]:
     """One bounded typed decision on the shared pooled client (evaluation.rs `evaluate`)."""
-    spec = DECIDER_SPECS[provider]
-    model = model or decider_model(cfg, provider)
-    endpoint, headers = decider_request(cfg, provider, model)
-    body = build_decision_body(spec["dialect"], wire_model(provider, model), state, questions)
+    route = decider_route(cfg, provider, model)
+    if route_out is not None:
+        route_out.update({"provider": provider, "transport": route.transport, "model": route.model})
+    endpoint, headers = route.endpoint, route.headers
+    body = build_decision_body(route.dialect, route.wire_model, state, questions)
     raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
     if len(raw) > MAX_DECISION_BODY:
         raise DecisionModelError("Decision request oversized")
@@ -544,7 +637,9 @@ class DecisionEngine:
         self._llm_busy = False
         self._llm_failed_at = -1e9
         self._failed_at: dict[str, float] = {}
+        self._model_failed_at: dict[str, float] = {}
         self.last_error = ""
+        self.last_route: dict[str, Any] = {}
         self._last_emote_at = -1e9
         self._last_wave_at = -1e9
         self._last_emote_id = ""
@@ -617,6 +712,15 @@ class DecisionEngine:
                 return provider
         return "heuristic"
 
+    def route_model(self, provider: str) -> str:
+        """Model id the provider would use right now (gateway / pplx / luna map onto Gateway ids)."""
+        if provider in ("heuristic", "llm"):
+            return provider
+        try:
+            return decider_route(self.cfg, provider).model
+        except DecisionModelError:
+            return decider_model(self.cfg, provider)
+
     def fast_model_ok(self) -> bool:
         """Latency-critical paths (live call transcripts) use a model only when it was chosen explicitly
         or auto resolves to Clef; otherwise the zero-latency heuristic."""
@@ -630,7 +734,12 @@ class DecisionEngine:
             "modes": list(DECISION_MODES),
             "decider": self.resolve_decider(),
             "deciders": {p: decider_configured(self.cfg, p) for p in TYPED_DECIDERS},
-            "deciderModels": {p: decider_model(self.cfg, p) for p in TYPED_DECIDERS},
+            "deciderModels": {p: self.route_model(p) for p in TYPED_DECIDERS},
+            "deciderRoutes": {p: decider_transport(self.cfg, p) for p in TYPED_DECIDERS},
+            "gatewayEvalModel": decider_model(self.cfg, "gateway"),
+            "gatewayFallbackModel": GATEWAY_FALLBACK_MODEL,
+            "activeModel": self.route_model(self.resolve_decider()),
+            "lastRoute": dict(self.last_route),
             "lastError": self.last_error,
             "llmAvailable": self.llm_available(),
             "llmBusy": self._llm_busy,
@@ -871,9 +980,30 @@ class DecisionEngine:
         counts = self.stats["model"]
         counts[provider] = counts.get(provider, 0) + 1
         timeout = max(0.2, min(10.0, self._f("decisionTimeoutMs") / 1000.0))
+        state, questions = self.decision_state(text, source), hikari_questions(source)
+        route: dict[str, Any] = {}
+        t_start = time.perf_counter()
         try:
-            ans = await run_typed_decision(self.cfg, provider, self.decision_state(text, source), hikari_questions(source),
-                                           timeout=timeout, response_limit=TRIAGE_RESPONSE_LIMIT)
+            model = None
+            if provider == "gateway":
+                chosen = decider_model(self.cfg, "gateway")
+                if (self._clock() - self._model_failed_at.get(chosen, -1e9)) < _LLM_FAIL_BACKOFF_SEC:
+                    model = GATEWAY_FALLBACK_MODEL          # chosen model failed recently: go straight to Jev
+            try:
+                ans = await run_typed_decision(self.cfg, provider, state, questions, timeout=timeout,
+                                               response_limit=TRIAGE_RESPONSE_LIMIT, model=model, route_out=route)
+            except DecisionModelError:
+                chosen = route.get("model") or ""
+                remaining = timeout - (time.perf_counter() - t_start)
+                if provider != "gateway" or chosen == GATEWAY_FALLBACK_MODEL or remaining < 0.25:
+                    raise
+                # the selected gateway evaluation model failed: one fallback to typesafe-ai/jev in the budget left
+                self._model_failed_at[chosen] = self._clock()
+                route = {"fallbackFrom": chosen}
+                ans = await run_typed_decision(self.cfg, provider, state, questions, timeout=remaining,
+                                               response_limit=TRIAGE_RESPONSE_LIMIT, model=GATEWAY_FALLBACK_MODEL,
+                                               route_out=route)
+            self.last_route = dict(route)
         except DecisionModelError as exc:
             fails = self.stats["modelFailures"]
             fails[provider] = fails.get(provider, 0) + 1

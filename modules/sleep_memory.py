@@ -457,8 +457,8 @@ class SleepMemory:
         if mode == "off" or self.decision_cfg is None:
             return None
         cfg = self.decision_cfg() or {}
-        provider = "jev" if mode == "auto" else mode
-        return provider if provider in ("jev", "clef", "pplx", "luna") and decider_configured(cfg, provider) else None
+        provider = "jev" if mode == "auto" else mode      # jev / gateway: Vercel AI Gateway evaluation route
+        return provider if provider in ("gateway", "jev", "clef", "pplx", "luna") and decider_configured(cfg, provider) else None
 
     def _shortlist(self, message: str) -> str | None:
         """The stored memory sharing the most words with the message (memory_triage.rs shortlist)."""
