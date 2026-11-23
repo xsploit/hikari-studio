@@ -6,6 +6,10 @@
 //! into a Windows Job Object with KILL_ON_JOB_CLOSE, so the backend and the
 //! engine die with this app even if it crashes.
 //!
+//! On a normal quit we first ask a backend we started to stop by itself
+//! (POST /api/shutdown, so it can end Fish calls and flush settings) and give
+//! it 2.5 s before the hard kill.
+//!
 //! All waiting happens on Tokio tasks; the UI thread never blocks.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -13,6 +17,8 @@
 mod job;
 
 use std::{
+    io::{self, Read as _, Write as _},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -33,6 +39,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     process::{Child, Command},
+    sync::Notify,
     time::{sleep, timeout},
 };
 
@@ -43,6 +50,11 @@ const MAIN: &str = "main";
 const OBS: &str = "obs";
 const BG: Color = Color(0x0e, 0x0e, 0x11, 0xff);
 const MAX_RESTARTS: u32 = 3;
+const BACKEND_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8800));
+/// Bound on each step (connect, write, read) of the shutdown request.
+const SHUTDOWN_IO_TIMEOUT: Duration = Duration::from_millis(400);
+/// How long server.py gets to exit on its own after /api/shutdown.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(2500);
 
 /// Lets the frameless OBS window be dragged by holding the left mouse button.
 const OBS_DRAG_JS: &str = r#"
@@ -58,7 +70,18 @@ struct Shell {
     job: Option<job::Job>,
     /// Backends we started that are NOT in the job; tree-killed on exit.
     uncontained: Mutex<Vec<u32>>,
+    /// Set once a quit starts; the supervisor never spawns or restarts after it.
     shutting_down: AtomicBool,
+    /// True while the supervisor holds a live backend that we started.
+    backend_owned: AtomicBool,
+    /// Quit -> supervisor: stop the backend gracefully.
+    stop: Notify,
+    /// Supervisor -> quit: the backend is gone (or the grace period ended).
+    stopped: Notify,
+    /// Hard kill already done (it runs once).
+    killed: AtomicBool,
+    /// Cleanup finished; the next exit request is allowed through.
+    exit_ready: AtomicBool,
     /// The splash page URL, so a restart can go back to it.
     splash: Mutex<Option<Url>>,
 }
@@ -71,6 +94,11 @@ fn main() {
                 .ok(),
             uncontained: Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
+            backend_owned: AtomicBool::new(false),
+            stop: Notify::new(),
+            stopped: Notify::new(),
+            killed: AtomicBool::new(false),
+            exit_ready: AtomicBool::new(false),
             splash: Mutex::new(None),
         })
         .setup(|app| {
@@ -98,15 +126,52 @@ fn main() {
         {
             app.exit(0)
         }
-        RunEvent::ExitRequested { .. } | RunEvent::Exit => shutdown(app),
+        // Hold the exit open (without blocking this thread) until the backend
+        // has had its chance to stop cleanly, then let it through.
+        RunEvent::ExitRequested { api, .. } => {
+            if !app.state::<Shell>().exit_ready.load(Ordering::SeqCst) {
+                api.prevent_exit();
+                begin_quit(app);
+            }
+        }
+        // Last resort if exit happened some other way: never leave orphans.
+        RunEvent::Exit => hard_kill(app),
         _ => {}
     });
 }
 
-/// Kill everything we spawned. Safe to call more than once.
-fn shutdown(app: &AppHandle) {
+/// Start the quit sequence once: hide windows, ask the supervisor for a
+/// graceful stop, wait for it (bounded), hard-kill whatever is left, exit.
+fn begin_quit(app: &AppHandle) {
     let shell = app.state::<Shell>();
     if shell.shutting_down.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    for w in app.webview_windows().values() {
+        let _ = w.hide();
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let shell = app.state::<Shell>();
+        if shell.backend_owned.load(Ordering::SeqCst) {
+            shell.stop.notify_one();
+            // Request (<=1.2 s) + grace (2.5 s) + margin. Never hangs the quit.
+            let limit = SHUTDOWN_IO_TIMEOUT * 3 + SHUTDOWN_GRACE + Duration::from_millis(800);
+            if timeout(limit, shell.stopped.notified()).await.is_err() {
+                warn("Backend supervisor did not report back in time; force-killing.");
+            }
+        }
+        hard_kill(&app);
+        shell.exit_ready.store(true, Ordering::SeqCst);
+        app.exit(0);
+    });
+}
+
+/// Kill everything we spawned, right now. Runs once.
+fn hard_kill(app: &AppHandle) {
+    let shell = app.state::<Shell>();
+    shell.shutting_down.store(true, Ordering::SeqCst);
+    if shell.killed.swap(true, Ordering::SeqCst) {
         return;
     }
     kill_job(&shell);
@@ -140,6 +205,9 @@ fn kill_job(shell: &Shell) {
 /// desktop-tauri/logs/desktop.log.
 fn warn(msg: &str) {
     eprintln!("[hikari-desktop] {msg}");
+    if cfg!(test) {
+        return; // tests must not write into the real logs folder
+    }
     if let Some(dir) = studio_dir() {
         let path = dir.join("desktop-tauri").join("logs").join("desktop.log");
         let _ = std::fs::create_dir_all(path.parent().unwrap());
@@ -330,6 +398,102 @@ async fn backend_live() -> bool {
     matches!(timeout(Duration::from_millis(1500), probe).await, Ok(Some(true)))
 }
 
+/// Sends one `POST /api/shutdown` to `addr`. Connect, write and read are
+/// each bounded by `limit`, so this never hangs.
+///
+/// Ok: the request was delivered and the server answered 200, or closed /
+/// stayed silent (it may already be exiting). Err: unreachable, timed out
+/// before the request was sent, or answered with a non-200 status.
+fn request_shutdown(addr: SocketAddr, limit: Duration) -> io::Result<()> {
+    let mut s = std::net::TcpStream::connect_timeout(&addr, limit)?;
+    s.set_write_timeout(Some(limit))?;
+    s.set_read_timeout(Some(limit))?;
+    s.write_all(
+        format!("POST /api/shutdown HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )?;
+    let mut buf = [0u8; 12];
+    let mut n = 0;
+    while n < buf.len() {
+        match s.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(r) => n += r,
+            // Silent (timeout) or reset while exiting: the request still arrived.
+            Err(_) => break,
+        }
+    }
+    if n == buf.len() && buf.starts_with(b"HTTP/1.") && &buf[9..12] != b"200" {
+        let status = String::from_utf8_lossy(&buf[9..12]).into_owned();
+        return Err(io::Error::other(format!("/api/shutdown answered HTTP {status}")));
+    }
+    Ok(())
+}
+
+/// Asks the backend to exit by itself, then polls `try_wait` every 50 ms for
+/// up to `grace`. Returns true if it exited; false means the caller must
+/// hard-kill (request failed, or it is still running).
+async fn graceful_stop(child: &mut Child, addr: SocketAddr, grace: Duration) -> bool {
+    if let Ok(Some(_)) = child.try_wait() {
+        return true;
+    }
+    let sent = tokio::task::spawn_blocking(move || request_shutdown(addr, SHUTDOWN_IO_TIMEOUT)).await;
+    match sent {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn(&format!("Graceful shutdown request failed ({e}); force-killing the backend."));
+            return false;
+        }
+        Err(e) => {
+            warn(&format!("Graceful shutdown task failed ({e}); force-killing the backend."));
+            return false;
+        }
+    }
+    let deadline = Instant::now() + grace;
+    loop {
+        if let Ok(Some(_)) = child.try_wait() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            warn(&format!(
+                "server.py did not exit within {} ms of /api/shutdown; force-killing.",
+                grace.as_millis()
+            ));
+            return false;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The backend exited on its own. Clear the flag *before* reading
+/// shutting_down (begin_quit does the reverse), so a waiting quit is never
+/// left hanging, and forget the PID so taskkill can never hit a reused one.
+fn release_backend(app: &AppHandle, pid: Option<u32>) {
+    let shell = app.state::<Shell>();
+    shell.backend_owned.store(false, Ordering::SeqCst);
+    if let Some(pid) = pid {
+        shell.uncontained.lock().unwrap().retain(|p| *p != pid);
+    }
+    if shell.shutting_down.load(Ordering::SeqCst) {
+        shell.stopped.notify_one();
+    }
+}
+
+/// A quit arrived while we hold the backend: stop it gracefully, report back.
+async fn stop_for_quit(app: &AppHandle, child: &mut Child, pid: Option<u32>) {
+    let exited = graceful_stop(child, BACKEND_ADDR, SHUTDOWN_GRACE).await;
+    let shell = app.state::<Shell>();
+    shell.backend_owned.store(false, Ordering::SeqCst);
+    if let (true, Some(pid)) = (exited, pid) {
+        shell.uncontained.lock().unwrap().retain(|p| *p != pid);
+    }
+    shell.stopped.notify_one();
+}
+
+enum Wake {
+    Exited(io::Result<std::process::ExitStatus>),
+    Quit,
+}
+
 async fn supervise(app: AppHandle) {
     if backend_live().await {
         // Someone else already runs the backend; just use it, never kill it.
@@ -343,8 +507,12 @@ async fn supervise(app: AppHandle) {
     let python = python_exe().await;
     let log = dir.join("desktop-tauri").join("logs").join("backend.log");
     let mut restarts = 0u32;
+    let shell = app.state::<Shell>();
 
     loop {
+        if shell.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
         let mut child = match spawn_backend(&app, &python, &dir, &log).await {
             Ok(c) => c,
             Err(e) => {
@@ -352,6 +520,8 @@ async fn supervise(app: AppHandle) {
                 return;
             }
         };
+        // Tokio forgets the PID once the process is reaped, so keep it now.
+        let pid = child.id();
 
         // Wait until /api/state answers, or the process dies first.
         let started = Instant::now();
@@ -368,29 +538,46 @@ async fn supervise(app: AppHandle) {
                 last_shown = secs;
                 status(&app, &format!("Starting Hikari Studio backend… {secs}s"), false);
             }
-            sleep(Duration::from_millis(400)).await;
+            let quit = tokio::select! {
+                _ = sleep(Duration::from_millis(400)) => false,
+                _ = shell.stop.notified() => true,
+            };
+            if quit {
+                stop_for_quit(&app, &mut child, pid).await;
+                return;
+            }
         };
         if ready.is_ok() {
             show_stage(&app);
         }
 
-        // Sleep (zero CPU) until the backend exits.
+        // Sleep (zero CPU) until the backend exits or a quit is requested.
         let code = match ready {
             Err(code) => code,
-            Ok(()) => match child.wait().await {
-                Ok(code) => code,
-                Err(_) => return,
-            },
+            Ok(()) => {
+                let wake = tokio::select! {
+                    r = child.wait() => Wake::Exited(r),
+                    _ = shell.stop.notified() => Wake::Quit,
+                };
+                match wake {
+                    Wake::Exited(Ok(code)) => code,
+                    Wake::Exited(Err(_)) => {
+                        release_backend(&app, pid);
+                        return;
+                    }
+                    Wake::Quit => {
+                        stop_for_quit(&app, &mut child, pid).await;
+                        return;
+                    }
+                }
+            }
         };
-        if app.state::<Shell>().shutting_down.load(Ordering::SeqCst) {
+        release_backend(&app, pid);
+        if shell.shutting_down.load(Ordering::SeqCst) {
             return;
         }
         // Clear out an engine the dead backend may have left behind.
-        let shell = app.state::<Shell>();
         kill_job(&shell);
-        if let Some(pid) = child.id() {
-            shell.uncontained.lock().unwrap().retain(|p| *p != pid);
-        }
 
         restarts += 1;
         if restarts > MAX_RESTARTS {
@@ -432,6 +619,7 @@ async fn spawn_backend(app: &AppHandle, python: &Path, dir: &Path, log: &Path) -
     cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
 
     let child = cmd.spawn()?;
+    app.state::<Shell>().backend_owned.store(true, Ordering::SeqCst);
     // Put it in the job right away: server.py only starts the engine after
     // its imports and model build, so the engine is always born inside it.
     let shell = app.state::<Shell>();
@@ -497,4 +685,113 @@ async fn python_exe() -> PathBuf {
         }
     }
     PathBuf::from("python")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// A localhost port with nothing listening on it.
+    fn closed_port() -> SocketAddr {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    }
+
+    /// One-shot server that answers the first request with `reply` and
+    /// returns what it received.
+    fn answering_server(reply: &'static str) -> (SocketAddr, std::thread::JoinHandle<String>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut buf = [0u8; 512];
+            let n = s.read(&mut buf).unwrap();
+            s.write_all(reply.as_bytes()).unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+        (addr, h)
+    }
+
+    #[cfg(windows)]
+    fn long_child() -> Child {
+        tokio::process::Command::new("cmd")
+            .args(["/c", "ping -n 30 127.0.0.1 >nul"])
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn unreachable_port_is_a_fast_error() {
+        let t = Instant::now();
+        assert!(request_shutdown(closed_port(), SHUTDOWN_IO_TIMEOUT).is_err());
+        assert!(t.elapsed() < Duration::from_secs(2), "took {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn silent_server_times_out_without_hanging() {
+        // Accepts the TCP connection (OS backlog) but never answers.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let t = Instant::now();
+        assert!(request_shutdown(l.local_addr().unwrap(), SHUTDOWN_IO_TIMEOUT).is_ok());
+        assert!(t.elapsed() < Duration::from_secs(2), "took {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn sends_post_and_accepts_200() {
+        let (addr, h) = answering_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        request_shutdown(addr, SHUTDOWN_IO_TIMEOUT).unwrap();
+        let req = h.join().unwrap();
+        assert!(req.starts_with("POST /api/shutdown HTTP/1.1\r\n"), "{req}");
+        assert!(req.contains("Content-Length: 0\r\n") && req.contains("Connection: close\r\n"));
+    }
+
+    #[test]
+    fn non_200_is_an_error() {
+        let (addr, h) = answering_server("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+        let e = request_shutdown(addr, SHUTDOWN_IO_TIMEOUT).unwrap_err();
+        assert!(e.to_string().contains("404"), "{e}");
+        h.join().unwrap();
+    }
+
+    /// Request fails -> give up at once (caller hard-kills), no 2.5 s wait.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn graceful_stop_gives_up_fast_when_unreachable() {
+        let mut child = long_child();
+        let t = Instant::now();
+        assert!(!graceful_stop(&mut child, closed_port(), SHUTDOWN_GRACE).await);
+        assert!(t.elapsed() < Duration::from_secs(2), "took {:?}", t.elapsed());
+        child.kill().await.unwrap();
+    }
+
+    /// Request delivered but the process keeps running -> false after the grace period.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn graceful_stop_times_out_on_a_stuck_backend() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut child = long_child();
+        let grace = Duration::from_millis(300);
+        let t = Instant::now();
+        assert!(!graceful_stop(&mut child, l.local_addr().unwrap(), grace).await);
+        let took = t.elapsed();
+        assert!(took >= grace && took < Duration::from_secs(3), "took {took:?}");
+        child.kill().await.unwrap();
+    }
+
+    /// Request answered 200 and the process exits by itself -> true.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn graceful_stop_sees_a_clean_exit() {
+        let (addr, h) = answering_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        let mut child = tokio::process::Command::new("cmd")
+            .args(["/c", "ping -n 2 127.0.0.1 >nul"]) // exits on its own after ~1 s
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+        assert!(graceful_stop(&mut child, addr, SHUTDOWN_GRACE).await);
+        h.join().unwrap();
+    }
 }

@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict, dataclass, field
 import json
+import math
 import random
 import re
 import time
@@ -86,6 +87,7 @@ DECISION_DEFAULTS: dict[str, Any] = {
     "pplxModel": "pplx-decider-flash-latest",     # | pplx-decider-latest | pplx-decider(-flash)-v1.3
     "jevModel": "typesafe-ai/jev",
     "gatewayEvalModel": "perplexity/pplx-decider-flash-v1.3",   # any Vercel AI Gateway `type: evaluation` model
+    "gatewayModelSource": "gatewayEvalModel",   # which setting the user chose last: gatewayEvalModel | decisionModel
     "deciderRoute": "auto",          # pplx / luna: auto (direct key if set, else Vercel Gateway) | gateway | direct
     "lunaModel": "gpt-6-luna",
     "cloudflareAccountId": "",       # optional; CLOUDFLARE_ACCOUNT_ID server-side (masked in /api/state)
@@ -120,7 +122,7 @@ _RULES: list[tuple[str, float, re.Pattern[str]]] = [
     ("greeting", 3.0, _rx(r"hi+", r"hey+(?:a|o)?", r"hello+", r"hiya", r"heya", r"howdy", r"yo+", r"sup", r"wassup",
                           r"welcome(?: back)?", r"good (?:morning|afternoon|evening)", r"morning", r"i'?m back", r"im back",
                           r"konnichiwa", r"ohayo+", r"greetings", r"what'?s up", r"hai")),
-    ("farewell", 3.2, _rx(r"bye+", r"goodbye", r"bye[- ]bye", r"see (?:ya|you|u)(?: later| soon| tomorrow)?", r"cya", r"later",
+    ("farewell", 3.2, _rx(r"bye+", r"goodbye", r"bye[- ]bye", r"see (?:ya|you|u)(?: later| soon| tomorrow)?", r"cya", r"laters", r"ttyl", r"talk (?:to you )?later",
                           r"good ?night", r"gn", r"nighty? ?night", r"gotta go", r"take care", r"farewell", r"peace out",
                           r"catch you later", r"signing off", r"oyasumi", r"sayonara", r"until next time")),
     ("flustered", 3.6, _rx(r"marry me", r"will you marry", r"kiss(?:es|ing)?", r"date me", r"go out with me", r"be my (?:girlfriend|gf|waifu)",
@@ -132,7 +134,7 @@ _RULES: list[tuple[str, float, re.Pattern[str]]] = [
                           r"best (?:girl|ai|vtuber)", r"proud of you", r"good job", r"great job", r"well done", r"love (?:this|it|that)")),
     ("smug", 2.2, _rx(r"bet you can'?t", r"i bet", r"prove it", r"challenge", r"no way you", r"heh+", r"easy", r"obviously",
                       r"skill issue", r"git gud", r"ez", r"too easy", r"of course", r"genius", r"i'?m the best")),
-    ("pout", 2.5, _rx(r"baka", r"dummy", r"idiot", r"stupid", r"loser", r"noob", r"cringe", r"mean", r"rude", r"hmph+", r"meanie",
+    ("pout", 2.5, _rx(r"baka", r"dummy", r"idiot", r"stupid", r"loser", r"noob", r"cringe", r"(?:so|you'?re|ur|being|very|really|too|that'?s) mean", r"mean to me", r"rude", r"hmph+", r"meanie",
                       r"shut up", r"go away", r"annoying", r"boring", r"you suck", r"bad at", r"worst", r"ugly", r"weird(?:o)?")),
     ("excited", 2.4, _rx(r"yay+", r"let'?s go+", r"lets go+", r"woo+(?:hoo+)?", r"hype", r"hyped", r"pog(?:gers)?", r"awesome",
                          r"amazing", r"congrats?", r"congratulations", r"we did it", r"i won", r"we won", r"victory", r"party",
@@ -166,6 +168,9 @@ class Classification:
     scores: dict[str, float] = field(default_factory=dict)
 
 
+_BARE_LATER_RE = re.compile(r"^\s*(?:ok(?:ay)?|alright|cool|k)?[\s,]*later[\s!.~]*$", re.IGNORECASE)
+
+
 def classify_text(text: str, source: str = "user") -> Classification:
     """Zero-latency local intent + emotion classifier. Pure and deterministic."""
     raw = str(text or "")
@@ -181,6 +186,8 @@ def classify_text(text: str, source: str = "user") -> Classification:
         hits = len(pat.findall(body))
         if hits:
             scores[emo] = scores.get(emo, 0.0) + weight * (1.0 + 0.25 * min(3, hits - 1))
+    if _BARE_LATER_RE.match(body):              # a bare "later!" / "ok later" is a goodbye; "tell you later" is not
+        scores["farewell"] = scores.get("farewell", 0.0) + 3.2
     stutters = len(_STUTTER_RE.findall(body))
     if stutters:
         # A stammer in Hikari's own line ("W-wait, r-really?!") is a strong fluster signal.
@@ -397,7 +404,10 @@ def decider_model(cfg: dict[str, Any], provider: str) -> str:
     if provider == "gateway":
         # decisionModel is shared with the chat-completions `llm` mode, so it only steers the gateway decider
         # when it is a known evaluation model; gatewayEvalModel may be ANY catalog evaluation id.
-        if dm and is_eval_model_id(dm) and dm in vercel_gateway.known_evaluation_models():
+        # gatewayEvalModel (the Evaluation-model dropdown) wins, unless the user's LAST explicit choice was a
+        # custom decisionModel that is a valid evaluation model (a stale custom value never overrides).
+        if (str(cfg.get("gatewayModelSource") or "gatewayEvalModel") == "decisionModel" and dm and is_eval_model_id(dm)
+                and dm in vercel_gateway.known_evaluation_models()):
             return dm
         gm = str(cfg.get("gatewayEvalModel") or "").strip()
         return gm if is_eval_model_id(gm) else spec["model"]
@@ -624,6 +634,56 @@ TRIAGE_QUESTION = ChoiceQuestion(
 )
 
 
+# (valence, arousal) each emotion pulls toward; both in [-1, 1]
+MOOD_TARGETS: dict[str, tuple[float, float]] = {
+    "neutral": (0.0, 0.0), "happy": (0.5, 0.3), "greeting": (0.4, 0.35), "farewell": (0.15, -0.1),
+    "excited": (0.65, 0.8), "amused": (0.55, 0.5), "shy": (0.3, 0.25), "flustered": (0.2, 0.6),
+    "grateful": (0.6, 0.15), "smug": (0.35, 0.3), "pout": (-0.4, 0.4), "surprised": (0.1, 0.7),
+    "awe": (0.5, 0.5), "curious": (0.2, 0.3), "caring": (0.25, -0.2), "gloomy": (-0.6, -0.35),
+    "sleepy": (0.0, -0.75),
+}
+
+
+class MoodMomentum:
+    """One small mood state (pleasantness `valence`, energy `arousal`, both [-1, 1]) nudged by every decision
+    and fading back to baseline exponentially (time constant ~10 minutes)."""
+
+    def __init__(self, tau_sec: float = 600.0, clock: Callable[[], float] = time.monotonic) -> None:
+        self.tau = float(tau_sec)
+        self._clock = clock
+        self.valence = 0.0
+        self.arousal = 0.0
+        self._t = clock()
+
+    def _decay(self) -> None:
+        now = self._clock()
+        dt = max(0.0, now - self._t)
+        self._t = now
+        if dt > 0:
+            k = math.exp(-dt / self.tau)
+            self.valence *= k
+            self.arousal *= k
+
+    def nudge(self, emotion: str, weight: float = 1.0) -> None:
+        self._decay()
+        tv, ta = MOOD_TARGETS.get(str(emotion or ""), (0.0, 0.0))
+        step = max(0.0, min(1.0, 0.25 * float(weight)))
+        self.valence = max(-1.0, min(1.0, self.valence + (tv - self.valence) * step))
+        self.arousal = max(-1.0, min(1.0, self.arousal + (ta - self.arousal) * step))
+
+    def state(self) -> dict[str, Any]:
+        self._decay()
+        v, a = self.valence, self.arousal
+        off = abs(v) > 0.22 or abs(a) > 0.28
+        if not off:
+            label = "calm, at baseline"
+        else:
+            pleasant = "upbeat" if v > 0.22 else ("a bit down" if v < -0.22 else "steady")
+            energy = "energetic" if a > 0.28 else ("low-energy, sleepy" if a < -0.28 else "relaxed")
+            label = f"{pleasant} and {energy}"
+        return {"valence": round(v, 3), "arousal": round(a, 3), "label": label, "offBaseline": off}
+
+
 class DecisionEngine:
     """Lightweight, non-blocking decision engine. All public coroutines return quickly:
     the heuristic path is synchronous; the LLM path is bounded by decisionTimeoutMs and
@@ -640,6 +700,8 @@ class DecisionEngine:
         self._model_failed_at: dict[str, float] = {}
         self.last_error = ""
         self.last_route: dict[str, Any] = {}
+        self.mood = MoodMomentum(clock=clock)
+        self.on_mood: Callable[[float, float], None] | None = None     # e.g. rig.set_mood_state
         self._last_emote_at = -1e9
         self._last_wave_at = -1e9
         self._last_emote_id = ""
@@ -725,7 +787,7 @@ class DecisionEngine:
         """Latency-critical paths (live call transcripts) use a model only when it was chosen explicitly
         or auto resolves to Clef; otherwise the zero-latency heuristic."""
         backend = self.resolve_decider()
-        return backend != "heuristic" and (self.mode != "auto" or backend == "clef")
+        return backend != "heuristic" and (self.mode != "auto" or backend in ("clef", "gateway"))
 
     def status(self) -> dict[str, Any]:
         now = self._clock()
@@ -740,6 +802,7 @@ class DecisionEngine:
             "gatewayFallbackModel": GATEWAY_FALLBACK_MODEL,
             "activeModel": self.route_model(self.resolve_decider()),
             "lastRoute": dict(self.last_route),
+            "mood": self.mood.state(),
             "lastError": self.last_error,
             "llmAvailable": self.llm_available(),
             "llmBusy": self._llm_busy,
@@ -880,8 +943,19 @@ class DecisionEngine:
         self._last_emote_at = now
         self._last_emote_id = pick
 
+    def get_mood_state(self) -> dict[str, Any]:
+        return self.mood.state()
+
     def _record(self, d: Decision) -> None:
         self.last_decision = d
+        try:
+            weight = 0.35 if d.source == "idle" else (0.6 if d.source in ("user", "fish_user") else 1.0)
+            self.mood.nudge(d.emotion, weight)
+            if self.on_mood is not None:
+                st = self.mood.state()
+                self.on_mood(st["valence"], st["arousal"])
+        except Exception:
+            pass
         self.stats["decisions"] += 1
         if d.emote:
             self.stats["emotes"] += 1
@@ -900,6 +974,10 @@ class DecisionEngine:
         endpoint = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
         headers = {"Content-Type": "application/json"}
         key = str(self.cfg.get("apiKey") or "").strip()
+        if not key and provider == "openai":
+            key = server_keys.key_for_url(endpoint, "openai", server_keys.get("OPENAI_API_KEY"))
+        elif not key and provider == "openrouter":
+            key = server_keys.key_for_url(endpoint, "openrouter", server_keys.get("OPENROUTER_API_KEY"))
         if key and not override:            # never send the chat key to a different decision host
             headers["Authorization"] = f"Bearer {key}"
         model = str(self.cfg.get("decisionModel") or "").strip() or str(self.cfg.get("model") or "gpt-4o-mini")
@@ -973,10 +1051,17 @@ class DecisionEngine:
                 "situation": who, "context": str(text or "").strip()[-_MAX_CONTEXT:]}
 
     async def _typed_choose(self, provider: str, text: str, source: str) -> tuple[str | None, str | None, bool] | None:
-        """Typed decision model (clef / pplx / jev / luna). One in flight; skipped, not queued, when busy."""
+        """Typed decision model (gateway / clef / pplx / jev / luna). One in flight; skipped, not queued, when busy.
+        The busy flag is set inside try/finally, so no exception can ever wedge model decisions."""
         if self._llm_busy:
             return None
-        self._llm_busy = True
+        try:
+            self._llm_busy = True
+            return await self._typed_choose_inner(provider, text, source)
+        finally:
+            self._llm_busy = False
+
+    async def _typed_choose_inner(self, provider: str, text: str, source: str) -> tuple[str | None, str | None, bool] | None:
         counts = self.stats["model"]
         counts[provider] = counts.get(provider, 0) + 1
         timeout = max(0.2, min(10.0, self._f("decisionTimeoutMs") / 1000.0))
@@ -991,7 +1076,7 @@ class DecisionEngine:
                     model = GATEWAY_FALLBACK_MODEL          # chosen model failed recently: go straight to Jev
             try:
                 ans = await run_typed_decision(self.cfg, provider, state, questions, timeout=timeout,
-                                               response_limit=TRIAGE_RESPONSE_LIMIT, model=model, route_out=route)
+                                               response_limit=DECISION_RESPONSE_LIMIT, model=model, route_out=route)
             except DecisionModelError:
                 chosen = route.get("model") or ""
                 remaining = timeout - (time.perf_counter() - t_start)
@@ -1001,7 +1086,7 @@ class DecisionEngine:
                 self._model_failed_at[chosen] = self._clock()
                 route = {"fallbackFrom": chosen}
                 ans = await run_typed_decision(self.cfg, provider, state, questions, timeout=remaining,
-                                               response_limit=TRIAGE_RESPONSE_LIMIT, model=GATEWAY_FALLBACK_MODEL,
+                                               response_limit=DECISION_RESPONSE_LIMIT, model=GATEWAY_FALLBACK_MODEL,
                                                route_out=route)
             self.last_route = dict(route)
         except DecisionModelError as exc:
@@ -1025,7 +1110,13 @@ class DecisionEngine:
     async def _llm_choose(self, text: str, source: str) -> tuple[str, str | None, bool] | None:
         if self._llm_busy:
             return None          # one in flight; skip instead of queueing (Waifu Studio rule)
-        self._llm_busy = True
+        try:
+            self._llm_busy = True
+            return await self._llm_choose_inner(text, source)
+        finally:
+            self._llm_busy = False
+
+    async def _llm_choose_inner(self, text: str, source: str) -> tuple[str, str | None, bool] | None:
         self.stats["llm"] += 1
         req = self.build_llm_request(text, source)
         timeout = max(0.2, min(10.0, self._f("decisionTimeoutMs") / 1000.0))

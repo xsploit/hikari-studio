@@ -430,9 +430,18 @@ class LiveLipSyncEngine:
         self.live_scores: dict[str, float] = {}
         self.live_onset: float = 0.0
         self.frame_ms: float = 0.0
+        # Prosody: per-frame F0 / brightness from analyze_frame, smoothed in step() (rig: head beats, brows, chin)
+        self._frame_pitch: float | None = None       # normalized F0 of the current frame, None when unvoiced
+        self._frame_bright: float | None = None
+        self._pitch_s: float = 0.42
+        self._bright_s: float = 0.5
+        self._voiced_s: float = 0.0
+        self._unvoiced_for: float = 1.0
+        self.live_f0_hz: float = 0.0
         self.live_axes: dict[str, float] = {
             "open": 0.0, "form": 0.08, "funnel": 0.0, "x": 0.0, "shrug": 0.0, "tongue": 0.0,
             "press": 0.0, "energy": 0.0, "stress": 0.0, "onset": 0.0,
+            "pitch": 0.42, "voiced": 0.0, "brightness": 0.5,
         }
 
     # ------------------------------------------------------------------ config
@@ -763,6 +772,39 @@ class LiveLipSyncEngine:
             return dict(probs)
         return {k: v / tot for k, v in ex.items()}
 
+    # Pitch range used for normalization: 120 Hz -> 0.0, 560 Hz -> 1.0 (bright young female voice sits ~0.35-0.7).
+    _F0_LO, _F0_HI = 120.0, 560.0
+
+    def _estimate_pitch(self, win: np.ndarray, sr: int) -> tuple[float | None, float]:
+        """Autocorrelation F0 of a Hann-windowed frame -> (normalized pitch or None if unvoiced, f0 Hz).
+        Picks the FIRST strong peak (>= 93 % of the best) so octave-down errors are avoided."""
+        n = len(win)
+        if n < 256 or sr < 8000:
+            return None, 0.0
+        f = np.fft.rfft(win, 2 * n)
+        ac = np.fft.irfft(f.real * f.real + f.imag * f.imag)[: n // 2 + 1]
+        if ac[0] <= 1e-9:
+            return None, 0.0
+        ac = ac / ac[0]
+        lo = max(2, int(sr / 700.0))
+        hi = min(len(ac) - 2, int(sr / 95.0))
+        if hi <= lo + 2:
+            return None, 0.0
+        seg = ac[lo:hi]
+        best = float(seg.max())
+        if best < 0.32:
+            return None, 0.0
+        # local maxima above 93 % of the best peak; take the shortest lag
+        mid = seg[1:-1]
+        peaks = np.nonzero((mid >= seg[:-2]) & (mid >= seg[2:]) & (mid >= 0.93 * best))[0]
+        k = int(peaks[0] + 1 + lo) if len(peaks) else int(np.argmax(seg) + lo)
+        a, b, c = ac[k - 1], ac[k], ac[k + 1]
+        den = a - 2.0 * b + c
+        lag = k + (0.5 * (a - c) / den if abs(den) > 1e-9 else 0.0)
+        f0 = sr / max(1.0, lag)
+        pn = math.log2(max(1.0, f0) / self._F0_LO) / math.log2(self._F0_HI / self._F0_LO)
+        return max(0.0, min(1.0, pn)), f0
+
     def analyze_frame(self, chunk: np.ndarray, sr: int, long_chunk: np.ndarray | None = None,
                       engine: str | None = None) -> tuple[str, float, list[float], dict[str, float], dict[str, float]]:
         """One analysis frame -> (viseme code, rms, 12 HUD bands, target axes, viseme probabilities)."""
@@ -802,6 +844,16 @@ class LiveLipSyncEngine:
             return "X", rms, bands, dict(self.visemes["X"]), {"X": 1.0}
 
         power = spec * spec
+        # Prosody features for the rig (cheap: one 2n FFT): F0 + spectral brightness (centroid 300 Hz..6 kHz)
+        try:
+            self._frame_pitch, self.live_f0_hz = self._estimate_pitch(win, sr)
+            bm = (freqs >= 300.0) & (freqs < 6000.0)
+            ps = float(np.sum(power[bm]))
+            if ps > 1e-10:
+                cen = float(np.sum(freqs[bm] * power[bm]) / ps)
+                self._frame_bright = max(0.0, min(1.0, (cen - 700.0) / 2600.0))
+        except Exception:                      # never let prosody break lip-sync
+            self._frame_pitch = None
 
         def band_e(f0: float, f1: float) -> float:
             m = (freqs >= f0) & (freqs < f1)
@@ -980,6 +1032,8 @@ class LiveLipSyncEngine:
         energy_raw = 0.0
         source = "idle"
         self.live_onset = 0.0
+        self._frame_pitch = None
+        self._frame_bright = None
 
         if hold and hold in visemes:
             code = hold
@@ -1089,6 +1143,25 @@ class LiveLipSyncEngine:
         en = max(0.0, min(1.0, self.sp_energy.step(energy_raw, dt, 14.0, 0.85)))
         st = max(0.0, min(1.0, self.sp_stress.step(max(0.0, energy_raw - en) * 2.5, dt, 18.0, 0.75)))
 
+        # Smoothed prosody: pitch glides (~60 ms) while voiced, holds through short consonant gaps and eases back to
+        # a neutral 0.42 after ~0.4 s of silence; brightness likewise.
+        dtc = max(1e-4, min(0.1, dt))
+        fp = self._frame_pitch
+        if fp is not None and energy_raw > 0.02:
+            self._unvoiced_for = 0.0
+            self._pitch_s += (fp - self._pitch_s) * (1.0 - math.exp(-dtc / 0.06))
+            self._voiced_s += (1.0 - self._voiced_s) * (1.0 - math.exp(-dtc / 0.05))
+        else:
+            self._unvoiced_for += dtc
+            self._voiced_s += (0.0 - self._voiced_s) * (1.0 - math.exp(-dtc / 0.12))
+            if self._unvoiced_for > 0.4:
+                self._pitch_s += (0.42 - self._pitch_s) * (1.0 - math.exp(-dtc / 0.6))
+        fb = self._frame_bright
+        if fb is not None:
+            self._bright_s += (fb - self._bright_s) * (1.0 - math.exp(-dtc / 0.08))
+        elif self._unvoiced_for > 0.4:
+            self._bright_s += (0.5 - self._bright_s) * (1.0 - math.exp(-dtc / 0.6))
+
         self.active_viseme = code
         self.active_source = source
         self.live_rms = rms
@@ -1097,6 +1170,8 @@ class LiveLipSyncEngine:
         self.live_axes = {
             "open": o, "form": f, "funnel": fn, "x": mx, "shrug": sh, "tongue": tg,
             "press": pr, "energy": en, "stress": st, "onset": self.live_onset,
+            "pitch": max(0.0, min(1.0, self._pitch_s)), "voiced": max(0.0, min(1.0, self._voiced_s)),
+            "brightness": max(0.0, min(1.0, self._bright_s)),
         }
         ms = (time.perf_counter() - t_start) * 1000.0
         self.frame_ms = ms if self.frame_ms == 0.0 else self.frame_ms * 0.9 + ms * 0.1
@@ -1113,6 +1188,7 @@ class LiveLipSyncEngine:
             "activeLabel": self.visemes.get(self.active_viseme, {}).get("label", ""),
             "source": self.active_source,
             "rms": round(self.live_rms, 5),
+            "f0Hz": round(self.live_f0_hz, 1),
             "scores": dict(self.live_scores),
             "onset": round(self.live_onset, 3),
             "axes": {k: round(v, 4) for k, v in self.live_axes.items()},

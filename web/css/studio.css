@@ -574,3 +574,28 @@ kbd {
   .s-row:has(.pill-select.wide) .s-ctrl { max-width: none; }
   .pill-select.wide { width: 100%; }
 }
+
+/* ───────────── Memory pins / dreams / recap, active decider ───────────── */
+.stat-grid { grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); }
+.dream-list { display: flex; flex-direction: column; gap: 8px; }
+.dream-quote.offered { opacity: .72; }
+.dream-quote .badge { margin-left: 8px; font-style: normal; vertical-align: 1px; }
+.recap-text { margin: 0; padding: 10px 12px; border-radius: 10px; background: var(--field); border: 1px solid var(--line); color: var(--text-2); font-size: 13px; line-height: 1.55; white-space: pre-wrap; }
+.icon-pin {
+  width: 28px; height: 28px; border-radius: 8px; border: 0; background: none; color: var(--faint); cursor: pointer;
+  display: grid; place-items: center;
+}
+.icon-pin svg { width: 15px; height: 15px; }
+.icon-pin:hover { background: var(--accent-soft); color: var(--accent); }
+.icon-pin.on { color: var(--accent); }
+.icon-pin:disabled { opacity: .4; cursor: default; }
+.badge.pin { color: var(--accent); border-color: rgba(255, 106, 158, 0.35); background: var(--accent-soft); }
+.fact-row.pinned { box-shadow: inset 2px 0 0 var(--accent); }
+.fact-row.pinned .s-title { color: var(--text); }
+.model-chip {
+  display: inline-block; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: 4px 10px; border-radius: 999px; background: var(--field); border: 1px solid var(--line);
+  font: 12px ui-monospace, "Cascadia Code", Consolas, monospace; color: var(--accent-2);
+}
+.s-row.warn-row { background: rgba(243, 191, 90, 0.06); box-shadow: inset 2px 0 0 var(--warn); }
+.s-row.warn-row .s-title { color: var(--warn); }

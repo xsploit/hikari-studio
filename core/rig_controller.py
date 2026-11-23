@@ -1,17 +1,23 @@
 """60 FPS VTuber Rig State Compositor.
 Combines cleanly in strict layered priority:
-  1. Base idle animation (auto-breathing, randomized natural blinks, gentle figure-8 head/body sway)
-  2. Mouse cursor look-at (eyes + head + subtle torso)
-  3. Spring-smoothed Expression Preset (Neutral, Happy, Excited, Shy, Smug, Pout, Surprised, Sleepy)
-  4. 3-Bone Rigid Toggle Arms (Rest / Right Wave / Left Gesture / Both Cheer + speech-driven gestures)
-  5. Live 6-Axis VBridger Lip-Sync + speech head-nod & brow lift
-  6. Motion Lab Video-Clip retargeting blend (0-100% mix)
-  7. Raw user parameter overrides
-  8. Plugin hooks (on_lipsync_frame, on_frame_params, on_shader_uniforms)
+  1. Living idle: uneven mood-coupled breathing (occasional sigh), held weight-shift postures eased by critically
+     damped springs + subtle micro-drift, Neuro-style idle acts, normal / double / half / slow blinks
+  2. Interaction state layer (idle | listening | thinking | speaking) + mood momentum (valence, arousal)
+  3. Autonomous gaze + mouse look-at (eyes lead, head follows)
+  4. Spring-smoothed Expression Preset + asymmetric brow micro-life + cheek blush
+  5. Arms: 3-bone resting arms (relaxed bend, breath drift, Prepare -> Stroke -> Hold -> Relax talking gestures)
+     and the raised wave arms (Rest / Right Wave / Left Gesture / Both Cheer)
+  6. Live 6-axis VBridger lip-sync + syllable-onset head beats + pitch-coupled brows / chin
+  7. Motion Lab video-clip retargeting blend (0-100% mix)
+  8. Raw user parameter overrides (finite-checked)
+  9. Plugin hooks (on_lipsync_frame, on_frame_params, on_shader_uniforms)
+Physics-owned parameters (Chest X/Y, Eye Jelly, Mouth Spring, Arm Swing, hair) are left to Inochi2D's SimplePhysics
+while engine physics is on: the controller feeds them real body / head / breath / arm-root motion instead.
 """
 from __future__ import annotations
 
 import json
+import logging
 import math
 from pathlib import Path
 import random
@@ -22,6 +28,8 @@ from typing import Any
 from core.config import EXPRESSION_PRESETS, ROOM_AMBIENT_MAP
 from core.events import HookRegistry
 from modules.lipsync import DEFAULT_PARAM_MAP, LiveLipSyncEngine, Spring2nd
+
+log = logging.getLogger("hikari.rig")
 
 
 # Tweened emote catalog (smooth cubic envelope + spring impulse coupling). Exposed via GET /api/emotes.
@@ -145,14 +153,71 @@ def validate_motion_clip(data: Any) -> dict[str, Any]:
     return data
 
 
+INTERACTION_STATES = ("idle", "listening", "thinking", "speaking")
+
+# Physics-owned parameters (SimplePhysics outputs): Inochi2D 0.8.7 ignores script values for these while drivers run.
+PHYSICS_OWNED = ("Chest Y", "Chest X", "Eye Jelly", "Mouth Spring")
+
+# Legacy parameter names some plugins still write -> real rig names.
+LEGACY_PARAM_ALIASES = {"Brow L Y": "Left Brow Y", "Brow R Y": "Right Brow Y"}
+
+# Rest-arm pose layered in by emotes that keep the arms down: (shoulder, elbow, wrist) per side, -1..+1 params
+# (+shoulder = away from body, +elbow = bend inward, +wrist = flex inward).
+EMOTE_REST_ARMS: dict[str, tuple[tuple[float, float, float], tuple[float, float, float]]] = {
+    "shy_blush":     ((-0.04, 0.62, 0.40), (-0.04, 0.58, 0.42)),    # hands drawn together in front
+    "gloom_shake":   ((-0.10, 0.05, 0.30), (-0.10, 0.05, 0.30)),    # limp, drooping
+    "curious_lean":  ((0.02, 0.30, 0.10), (0.06, 0.48, 0.30)),
+    "pout_puff":     ((0.10, 0.80, 0.45), (0.10, 0.78, 0.45)),      # arms folded in, sulky
+    "heart_sparkle": ((-0.02, 0.66, 0.48), (-0.02, 0.66, 0.48)),    # hands together, happy sway
+    "smug_tease":    ((0.38, 0.95, 0.55), (0.02, 0.22, 0.10)),      # one hand on the hip
+    "starry_awe":    ((0.16, 0.42, -0.35), (0.16, 0.42, -0.35)),    # open hands
+    "gentle_nod":    ((0.00, 0.36, 0.20), (0.00, 0.30, 0.20)),
+    "chibi_pop":     ((0.10, 0.40, -0.20), (0.10, 0.40, -0.20)),
+}
+
+
+def _ff(v: Any, default: float) -> float:
+    """Finite float or default (a bad setting must never break the 60 FPS step)."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return f if math.isfinite(f) else default
+
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return lo if v < lo else hi if v > hi else v
+
+
+class _Hold:
+    """Held posture target: keeps a comfortable pose for a while, then picks a new one; a critically damped
+    spring eases between holds so weight shifts read as decisions, not a screensaver loop."""
+    __slots__ = ("spring", "target")
+
+    def __init__(self) -> None:
+        self.spring = Spring2nd(0.0)
+        self.target = 0.0
+
+
 class RigController:
     def __init__(self, param_defaults: dict[str, tuple[float, float]], lipsync: LiveLipSyncEngine, hooks: HookRegistry) -> None:
         self.defaults = dict(param_defaults)
+        self._known = frozenset(self.defaults)
+        self._warned_unknown: set[str] = set()
         self.lipsync = lipsync
         self.hooks = hooks
         self.lock = threading.Lock()
+        now = time.perf_counter()
+        rnd = random.Random()
+        self._rnd = rnd
 
-        # Pointer look-at normalized [-1..1] + smooth low-pass filter & blend (zero jerky snapping!)
+        # Optional rig features (feature-detected from the loaded .inp; older models just skip them)
+        self._has_rest_arms = all(f"Rest Arm {s} {j}" in self._known for s in "RL" for j in ("Shoulder", "Elbow", "Wrist"))
+        self._has_raised_joints = all(f"Arm {s} {j}" in self._known for s in "RL" for j in ("Elbow", "Wrist"))
+        self._has_brow_angle = "Brow L Angle" in self._known and "Brow R Angle" in self._known
+        self._has_cheek = "Cheek" in self._known
+
+        # Pointer look-at normalized [-1..1] + smooth low-pass filter & blend
         self.mouse_x = 0.0
         self.mouse_y = 0.0
         self._mx_filt = 0.0
@@ -160,64 +225,141 @@ class RigController:
         self._mouse_blend = 0.0
         self._mouse_last_move = 0.0
 
-        # Autonomous Natural VTuber Gaze & Eye-Leads-Head Springs
+        # Autonomous gaze & eye-leads-head springs
         self._gaze_tx = 0.0
         self._gaze_ty = 0.0
         self._gaze_head_tilt = 0.0
-        self._next_gaze_shift = time.perf_counter() + 1.8
-        self._next_micro_saccade = time.perf_counter() + 0.5
+        self._next_gaze_shift = now + 1.8
+        self._next_micro_saccade = now + 0.5
         self._micro_x = 0.0
         self._micro_y = 0.0
-
-        self.sp_eye_x = Spring2nd(0.0)   # Fast saccade spring (eyes move first!)
+        self.sp_eye_x = Spring2nd(0.0)
         self.sp_eye_y = Spring2nd(0.0)
-        self.sp_head_gx = Spring2nd(0.0) # Organic slower head follow behind eyes!
+        self.sp_head_gx = Spring2nd(0.0)
         self.sp_head_gy = Spring2nd(0.0)
         self.sp_head_gt = Spring2nd(0.0)
 
-        # Blink scheduler
-        self._next_blink = time.perf_counter() + 2.4
+        # Blinks: normal, double, half (~12 %) and slow relaxed (~10 %)
+        self._next_blink = now + 2.4
         self._blink_phase = 0.0
         self._blink_active = False
+        self._blink_kind = "normal"
+        self._blink_queue_double = False
 
-        # Expression springs
+        # Expression springs (+ cheek tint)
         self.expr_springs = {k: Spring2nd(0.0) for k in ("eyeSmile", "squint", "browY", "browForm", "mouthForm", "cheekPuff", "sparkle", "blush")}
-        # Arm springs
+        self.sp_cheek = Spring2nd(0.0)
+        self.sp_sparkle = Spring2nd(0.0)         # AI / temp sparkle & blush fade in instead of popping
+        self.sp_blush = Spring2nd(0.0)
+        self._mouth_busy = 0.0                    # eased "is talking" for emote mouth shapes
+        self.sp_brow_angle_l = Spring2nd(0.0)
+        self.sp_brow_angle_r = Spring2nd(0.0)
+
+        # Raised wave-arm springs
         self.sp_arm_r_pose = Spring2nd(0.0)
         self.sp_arm_l_pose = Spring2nd(0.0)
         self.sp_arm_r_gest = Spring2nd(0.0)
         self.sp_arm_l_gest = Spring2nd(0.0)
         self.sp_arm_r_lift = Spring2nd(0.0)
         self.sp_arm_l_lift = Spring2nd(0.0)
+        self.sp_arm_r_wlag = Spring2nd(0.0)       # raised-wrist follow-through (lags the gesture)
+        self.sp_arm_l_wlag = Spring2nd(0.0)
 
-        # Secondary Live2D Elastic Bounce Springs (Bust XY, Eye Jelly & Velocity Trackers)
-        self.sp_chest_y = Spring2nd(0.0)
-        self.sp_chest_x = Spring2nd(0.0)
-        self.sp_eye_jelly = Spring2nd(0.0)
+        # 3-bone resting arm joint springs: [shoulder, elbow, wrist] per side, start in the relaxed bend
+        self._rest_base = {"R": (0.0, 0.225, 0.12), "L": (0.0, 0.195, 0.14)}
+        self.sp_rest = {s: [Spring2nd(v) for v in self._rest_base[s]] for s in ("R", "L")}
+        # Talking-gesture state machine (Prepare -> Stroke -> Hold -> Relax)
+        self._gest_phase = "rest"
+        self._gest_t0 = 0.0
+        self._gest_dur = 0.0
+        self._gest_side = "R" if rnd.random() < 0.5 else "L"
+        self._gest_both = False
+        self._gest_open = False
+        self._gest_peak: dict[str, tuple[float, float, float]] = {}
+        self._gest_next = now + 0.4
+        self._gest_beat = Spring2nd(0.0)
+        self._speech_on_since = 0.0
+        self._speech_off_since = now
+        self._was_speaking = False
+
+        # "Body bounce" springs. Historic names kept (plugins kick them): they now drive REAL body motion, which
+        # moves the chest / arm / hair physics anchors so Inochi2D's pendulums respond naturally.
+        self.sp_chest_y = Spring2nd(0.0)      # -> Body Angle Y bounce
+        self.sp_chest_x = Spring2nd(0.0)      # -> Body Angle X sway
+        self.sp_eye_jelly = Spring2nd(0.0)    # -> quick eye squash (squint pulse)
+        # Script-side fallback springs, only used while engine physics is OFF
+        self.sp_fb_chest_y = Spring2nd(0.0)
+        self.sp_fb_chest_x = Spring2nd(0.0)
         self._prev_body_x = 0.0
         self._prev_body_y = 0.0
         self._prev_breath = 0.0
-        self._prev_eye_open = 1.0
-        self._prev_eye_x = 0.0
-        self._prev_eye_y = 0.0
-        self._prev_arm_sum = 0.0
 
-        # Temporary AI / action emote hold (auto-relaxes smoothly after speech!)
+        # Temporary AI / action emote hold
         self._temp_action: dict[str, Any] | None = None
         self._temp_until: float = 0.0
 
-        # Active Tweened Emote Clip (smooth cubic/spring animated actions!)
+        # Active tweened emote clip
         self._emote_id: str = ""
         self._emote_start: float = 0.0
         self._emote_dur: float = 0.0
 
-        # Neuro-style Procedural Idle Choreographer (scheduled living micro-behaviors every 4.5..8.5s)
+        # Neuro-style idle acts (now sparser: the held postures carry most of the life)
         self._idle_act: str = ""
         self._idle_start: float = 0.0
         self._idle_dur: float = 0.0
         self._idle_side: float = 1.0
-        self._next_idle_act: float = time.perf_counter() + random.uniform(2.5, 4.5)
-        # VTS-style mouth parameter mapper + Mouth Spring (plosive / syllable-onset anime bounce)
+        self._next_idle_act: float = now + rnd.uniform(5.0, 8.0)
+        self._idle_gate = 1.0                     # fades a running idle act out (emote / clip) instead of cutting it
+
+        # Held posture targets (body x / z / lean, head x / y / z) + micro drift
+        self._hold = {k: _Hold() for k in ("bx", "bz", "lean", "hx", "hy", "hz")}
+        self._next_hold = now + rnd.uniform(1.2, 2.5)
+        self._drift = {k: _Hold() for k in ("bx", "bz", "lean", "hx", "hy", "hz")}
+        self._next_drift = now
+
+        # Uneven breathing
+        self._breath_phase = 0.0
+        self._breath_period = 3.4
+        self._breath_depth = 0.72
+        self._breath_count = 0
+        self._next_sigh = rnd.randint(6, 10)
+        self._breath_is_sigh = False
+
+        # Mood momentum (set by the backend) + interaction state
+        self._mood_tv = 0.0
+        self._mood_ta = 0.0
+        self._mood_v = 0.0
+        self._mood_a = 0.0
+        self._istate = "idle"
+        self._istate_since = now
+        self._w_listen = 0.0
+        self._w_think = 0.0
+        self._w_speak = 0.0
+        self._think_side = 1.0
+        self._think_side_s = 1.0                 # eased copies: a side flip never pops the pose
+        self._listen_side = 1.0
+        self._listen_side_s = 1.0
+        self._next_listen_nod = now + 1.5
+        self.sp_nod = Spring2nd(0.0)
+
+        # Prosody: onset head beats + pitch
+        self.sp_beat_y = Spring2nd(0.0)
+        self.sp_beat_z = Spring2nd(0.0)
+        self._last_beat = 0.0
+        self._beat_sign = 1.0
+        self._pitch_base = 0.5
+        self._pitch_rel = 0.0
+        self._energy_face = 0.0                  # lightly smoothed energy / stress for brows & squint
+        self._stress_face = 0.0
+
+        # Asymmetric brow micro-life
+        self._brow_ev_side = 1.0
+        self._brow_ev_start = 0.0
+        self._brow_ev_dur = 0.0
+        self._brow_ev_amp = 0.0
+        self._next_brow_ev = now + rnd.uniform(2.0, 4.0)
+
+        # VTS-style mouth parameter mapper + Mouth Spring (telemetry / physics-off fallback)
         self.mouth_mapper = MouthParamMapper()
         self.sp_mouth_spring = Spring2nd(0.0)
         self._prev_lip_open = 0.0
@@ -237,33 +379,58 @@ class RigController:
         self.last_params: dict[str, tuple[float, float]] = dict(self.defaults)
         self.last_shader: dict[str, Any] = {}
         self.last_camera: dict[str, Any] = {}
+        self.last_state: dict[str, Any] = {}
         self.frame_count = 0
 
+    # ------------------------------------------------------------------ public API
     def set_pointer(self, nx: float, ny: float) -> None:
         with self.lock:
-            nx_c = max(-1.0, min(1.0, float(nx)))
-            ny_c = max(-1.0, min(1.0, float(ny)))
+            nx_c = _clamp(_ff(nx, 0.0), -1.0, 1.0)
+            ny_c = _clamp(_ff(ny, 0.0), -1.0, 1.0)
             if abs(nx_c - self.mouse_x) > 0.008 or abs(ny_c - self.mouse_y) > 0.008:
                 self._mouse_last_move = time.perf_counter()
             self.mouse_x = nx_c
             self.mouse_y = ny_c
 
+    def set_mood_state(self, valence: float, arousal: float) -> None:
+        """Mood momentum from the backend, clamped to [-1, 1]. Shifts resting smile warmth, brow lift, cheek blush,
+        breath rate / depth and sway energy (smoothed over a few seconds, so updates never pop)."""
+        with self.lock:
+            self._mood_tv = _clamp(_ff(valence, 0.0), -1.0, 1.0)
+            self._mood_ta = _clamp(_ff(arousal, 0.0), -1.0, 1.0)
+
+    def set_interaction_state(self, state: str) -> None:
+        """'idle' | 'listening' (leans in, attentive nods) | 'thinking' (glance up-side, tilt, asymmetric brow)
+        | 'speaking'. Unknown values fall back to 'idle'."""
+        s = str(state or "idle").strip().lower()
+        if s not in INTERACTION_STATES:
+            s = "idle"
+        with self.lock:
+            if s != self._istate:
+                self._istate = s
+                self._istate_since = time.perf_counter()
+                if s == "thinking":
+                    self._think_side = -1.0 if self._rnd.random() < 0.5 else 1.0
+                elif s == "listening":
+                    self._listen_side = -1.0 if self._rnd.random() < 0.5 else 1.0
+
     def trigger_temp_action(self, action: dict[str, Any], duration: float = 4.5) -> None:
         with self.lock:
             self._temp_action = dict(action)
-            self._temp_until = time.perf_counter() + max(1.0, float(duration))
+            self._temp_until = time.perf_counter() + _clamp(_ff(duration, 4.5), 1.0, 60.0)
 
     def trigger_emote(self, emote_id: str, duration: float = 2.6) -> dict[str, Any]:
-        """Trigger a smooth cubic/spring tweened Live2D emote clip with coupled bounce."""
+        """Trigger a smooth cubic/spring tweened emote clip with a coupled body bounce."""
         eid = str(emote_id or "").strip().lower()
         meta = EMOTE_CATALOG.get(eid)
         if meta is None:
             return {"ok": False, "error": f"Unknown emote: {eid}", "available": sorted(EMOTE_CATALOG.keys())}
+        dur = _ff(duration, 2.6)
         with self.lock:
             self._emote_id = eid
             self._emote_start = time.perf_counter()
-            self._emote_dur = float(duration) if duration and duration != 2.6 else float(meta["duration"])
-            # Instant spring kick on start for juicy Live2D punch (chest Y, chest X, eye jelly)!
+            self._emote_dur = _clamp(dur, 0.3, 30.0) if dur and dur != 2.6 else float(meta["duration"])
+            # Instant kick on start: real body bounce / sway the physics pendulums react to.
             ky, kx, ke = meta.get("kick", (0.0, 0.0, 0.0))
             self.sp_chest_y.v += ky
             self.sp_chest_x.v += kx
@@ -283,7 +450,7 @@ class RigController:
             self._motion_clip = data
             self._motion_start = time.perf_counter()
             self._motion_loop = bool(loop)
-            self._motion_mix = max(0.0, min(1.0, float(mix)))
+            self._motion_mix = _clamp(_ff(mix, 0.85), 0.0, 1.0)
             self._motion_playing = True
         return {"id": data["id"], "name": data["name"], "duration": data["duration"], "hasAudio": data.get("hasAudio", False)}
 
@@ -296,7 +463,7 @@ class RigController:
             if loop is not None:
                 self._motion_loop = bool(loop)
             if mix is not None:
-                self._motion_mix = max(0.0, min(1.0, float(mix)))
+                self._motion_mix = _clamp(_ff(mix, self._motion_mix), 0.0, 1.0)
 
     def stop_motion(self) -> None:
         with self.lock:
@@ -315,9 +482,170 @@ class RigController:
                 "loop": self._motion_loop,
             }
 
+    # ------------------------------------------------------------------ living layers
+    def _breath_step(self, dt: float, rate_mul: float, depth_mul: float, speaking: bool, mood_v: float) -> float:
+        """Uneven breathing: each breath gets its own period / depth, an occasional deeper sigh every 6-10 breaths.
+        Inhale (~40 %) is quicker than the exhale. Returns Breath in [0, 1]."""
+        rnd = self._rnd
+        self._breath_phase += dt / max(0.8, self._breath_period)
+        if self._breath_phase >= 1.0:
+            self._breath_phase -= 1.0
+            self._breath_count += 1
+            sigh = self._breath_count >= self._next_sigh and not speaking
+            self._breath_is_sigh = sigh
+            if sigh:
+                self._breath_count = 0
+                lo, hi = (4, 7) if mood_v < -0.3 else (6, 10)       # low mood sighs more often
+                self._next_sigh = rnd.randint(lo, hi)
+            base = 3.4 / max(0.55, rate_mul)
+            if speaking:                                            # speech breathing: shallow, irregular
+                self._breath_period = base * rnd.uniform(0.75, 1.35)
+                self._breath_depth = rnd.uniform(0.38, 0.62) * depth_mul
+            elif sigh:
+                self._breath_period = base * rnd.uniform(1.45, 1.75)
+                self._breath_depth = 1.0
+            else:
+                self._breath_period = base * rnd.uniform(0.86, 1.16)
+                self._breath_depth = _clamp(rnd.uniform(0.62, 0.80) * depth_mul, 0.3, 0.92)
+        ph = self._breath_phase
+        if ph < 0.4:                                                # inhale
+            u = ph / 0.4
+            s = u * u * (3.0 - 2.0 * u)
+        else:                                                       # slower exhale with a soft tail
+            u = (ph - 0.4) / 0.6
+            s = 1.0 - u * u * (3.0 - 2.0 * u)
+        return _clamp(s * self._breath_depth, 0.0, 1.0)
+
+    def _posture_step(self, dt: float, t_now: float, energy_mul: float, still: float) -> dict[str, float]:
+        """Held weight shifts (3.5-9 s holds, eased) + tiny micro-drift. `still` (0..1) damps the amplitude
+        (e.g. while speaking or listening she holds steadier)."""
+        rnd = self._rnd
+        amp = energy_mul * (1.0 - 0.45 * still)
+        if t_now >= self._next_hold:
+            side = rnd.choice((-1.0, -1.0, 0.0, 1.0, 1.0))
+            h = self._hold
+            h["bx"].target = side * rnd.uniform(1.4, 3.8) + rnd.uniform(-0.6, 0.6)
+            h["bz"].target = side * rnd.uniform(1.0, 3.2)
+            h["lean"].target = rnd.uniform(-1.2, 2.6)
+            h["hz"].target = (-side if rnd.random() < 0.65 else side) * rnd.uniform(0.5, 4.5)   # usually counter-tilt
+            h["hx"].target = rnd.uniform(-4.5, 4.5)
+            h["hy"].target = rnd.uniform(-2.5, 2.8)
+            self._next_hold = t_now + rnd.uniform(3.5, 9.0) / max(0.6, min(1.6, energy_mul))
+        if t_now >= self._next_drift:
+            for d in self._drift.values():
+                d.target = rnd.uniform(-1.0, 1.0)
+            self._next_drift = t_now + rnd.uniform(0.9, 2.2)
+        out: dict[str, float] = {}
+        drift_amp = {"bx": 0.45, "bz": 0.4, "lean": 0.35, "hx": 0.9, "hy": 0.7, "hz": 0.75}
+        for k, hd in self._hold.items():
+            v = hd.spring.step(hd.target * amp, dt, 1.75, 1.0)
+            dv = self._drift[k].spring.step(self._drift[k].target, dt, 1.1, 1.0)
+            out[k] = v + dv * drift_amp[k] * energy_mul
+        return out
+
+    def _blink_shape(self) -> float:
+        """Eyelid closure 0..1 for the active blink."""
+        ph = self._blink_phase
+        kind = self._blink_kind
+        if kind == "slow":                       # close 35 %, hold 20 %, slow open 45 %
+            if ph < 0.35:
+                u = ph / 0.35
+                return u * u * (3.0 - 2.0 * u)
+            if ph < 0.55:
+                return 1.0
+            u = (ph - 0.55) / 0.45
+            return 1.0 - u * u * (3.0 - 2.0 * u)
+        b = math.sin(ph * math.pi) ** 1.6
+        return b * (0.5 if kind == "half" else 1.0)
+
+    def _start_blink(self, t_now: float) -> None:
+        r = self._rnd.random()
+        if r < 0.12:
+            self._blink_kind = "half"
+        elif r < 0.22:
+            self._blink_kind = "slow"
+        else:
+            self._blink_kind = "normal"
+            self._blink_queue_double = r > 0.84      # ~16 % double blink
+        self._blink_active = True
+        self._blink_phase = 0.0
+
+    def _gesture_step(self, t_now: float, dt: float, speaking: bool, energy: float, stress: float, onset: float,
+                      excited: bool, gain: float, allowed: bool) -> dict[str, tuple[float, float, float]]:
+        """Talking-arm gesture state machine on the 3-bone resting arms.
+        Returns per-side (shoulder, elbow, wrist) offsets added to the relaxed base pose."""
+        rnd = self._rnd
+        silent_for = (t_now - self._speech_off_since) if not speaking else 0.0
+
+        def go(phase: str, dur: float) -> None:
+            self._gest_phase, self._gest_t0, self._gest_dur = phase, t_now, dur
+
+        if self._gest_phase in ("prepare", "stroke", "hold") and (not allowed or silent_for > 0.35):
+            go("relax", 0.6 if allowed else 0.45)
+        el = t_now - self._gest_t0
+        ph = self._gest_phase
+        if ph == "rest":
+            phrase_start = speaking and (t_now - self._speech_on_since) < 0.45
+            trigger = onset > 0.28 or stress > 0.32 or phrase_start
+            if allowed and speaking and t_now >= self._gest_next and trigger:
+                side = self._gest_side
+                if rnd.random() < 0.72:                      # mostly alternate the dominant hand
+                    side = "L" if side == "R" else "R"
+                self._gest_side = side
+                big = excited or stress > 0.72
+                self._gest_open = big and rnd.random() < 0.65
+                self._gest_both = rnd.random() < (0.45 if big else 0.22)
+                amp = _clamp(gain, 0.0, 1.6)
+                peaks: dict[str, tuple[float, float, float]] = {}
+                for s in ("R", "L"):
+                    k = 1.0 if s == side else (rnd.uniform(0.35, 0.55) if self._gest_both else 0.0)
+                    if k <= 0.0:
+                        continue
+                    # Elbow peak = TOTAL bend 25-55 deg (stressed peaks reach the top), expressed relative to the base.
+                    elbow_deg = (rnd.uniform(40.0, 55.0) if self._gest_open else rnd.uniform(25.0, 47.0)) + 8.0 * stress
+                    d_elbow = max(0.05, min(52.0, elbow_deg) / 75.0 - self._rest_base[s][1])   # + stroke overshoot ~= 55
+                    if self._gest_open:                      # expressive open hand: arm out, palm turned out
+                        peaks[s] = (k * amp * rnd.uniform(0.16, 0.32), k * amp * d_elbow, k * amp * rnd.uniform(-0.55, -0.25))
+                    else:                                    # beat / point: forearm up and in, wrist follows
+                        peaks[s] = (k * amp * rnd.uniform(-0.02, 0.10), k * amp * d_elbow, k * amp * rnd.uniform(0.05, 0.35))
+                self._gest_peak = peaks
+                go("prepare", rnd.uniform(0.16, 0.28))
+        elif ph == "prepare" and el >= self._gest_dur:
+            go("stroke", rnd.uniform(0.14, 0.24))
+            self._gest_beat.v += 1.6
+        elif ph == "stroke" and el >= self._gest_dur:
+            go("hold", rnd.uniform(0.25, 0.9) + (0.5 if excited else 0.0))
+        elif ph == "hold":
+            if onset > 0.3:                                 # beat accents ride on stressed syllables
+                self._gest_beat.v += 0.9 * onset
+            if el >= self._gest_dur:
+                go("relax", rnd.uniform(0.5, 0.9))
+        elif ph == "relax" and el >= self._gest_dur:
+            go("rest", 0.0)
+            self._gest_next = t_now + rnd.uniform(0.25, 0.7 if excited else 1.2)
+            self._gest_peak = {}
+        ph = self._gest_phase
+
+        # Envelope: prepare lifts a little (anticipation), stroke snaps to the peak, hold keeps it, relax lets go.
+        u = _clamp((t_now - self._gest_t0) / max(0.05, self._gest_dur), 0.0, 1.0)
+        su = u * u * (3.0 - 2.0 * u)
+        env = {"rest": 0.0, "prepare": 0.32 * su, "stroke": 0.32 + 0.68 * su, "hold": 1.0, "relax": 1.0 - su}[ph]
+        beat = self._gest_beat.step(0.0, dt, 16.0, 0.45)
+        out: dict[str, tuple[float, float, float]] = {}
+        for s, (sh, elb, wr) in self._gest_peak.items():
+            lead = 1.0 if s == self._gest_side else 0.85      # the minor hand trails a touch
+            e = env * lead
+            # Wrist anticipates against the stroke during prepare, then follows through (springs add the lag).
+            wr_t = wr * e - (0.18 * su if ph == "prepare" else 0.0)
+            out[s] = (sh * e, elb * e + 0.05 * beat * (1.0 if s == self._gest_side else 0.5), wr_t + 0.04 * beat)
+        return out
+
+    # ------------------------------------------------------------------ frame
     def step(self, dt: float, cfg: dict[str, Any], ctx: Any) -> tuple[dict[str, tuple[float, float]], dict[str, Any], dict[str, Any]]:
         t_now = time.perf_counter()
         self.frame_count += 1
+        dt = _clamp(_ff(dt, 1.0 / 60.0), 1e-4, 0.1)
+        rnd = self._rnd
 
         rig_cfg = cfg["rig"]
         cam_cfg = dict(cfg["camera"])
@@ -325,23 +653,29 @@ class RigController:
         stage_cfg = cfg["stage"]
         lip_cfg = cfg["lipsync"]
 
-        # Auto-match room lighting if enabled
         if stage_cfg.get("autoMatchLighting", True):
             rm = ROOM_AMBIENT_MAP.get(stage_cfg.get("room", ""), None)
             if rm:
                 shader_cfg["ambientColor"] = rm["ambientColor"]
 
-        # 1. Step Live 6-Axis Lip-Sync & fire hook
+        # 1. Live lip-sync & hook
         lip = self.lipsync.step(dt, t_now)
         self.hooks.emit_sync("on_lipsync_frame", ctx, lip)
-        energy = lip["energy"]
-        stress = lip["stress"]
+        energy = _clamp(_ff(lip.get("energy", 0.0), 0.0), 0.0, 1.0)
+        stress = _clamp(_ff(lip.get("stress", 0.0), 0.0), 0.0, 1.0)
+        onset = _clamp(_ff(lip.get("onset", 0.0), 0.0), 0.0, 1.0)
+        pitch = _clamp(_ff(lip.get("pitch", 0.5), 0.5), 0.0, 1.0)
+        voiced = _clamp(_ff(lip.get("voiced", 1.0 if energy > 0.06 else 0.0), 0.0), 0.0, 1.0)
         speaking = energy > 0.06 or bool(lip_cfg.get("holdViseme"))
+        if speaking and not self._was_speaking:
+            self._speech_on_since = t_now
+        if not speaking and self._was_speaking:
+            self._speech_off_since = t_now
+        self._was_speaking = speaking
 
-        # Start from clean neutral defaults
         p: dict[str, tuple[float, float]] = dict(self.defaults)
 
-        # 2. Check active temporary AI/emote action & tweened emote clip
+        # 2. Snapshot shared state
         with self.lock:
             temp = self._temp_action if t_now < self._temp_until else None
             if temp is None:
@@ -357,48 +691,81 @@ class RigController:
             m_start = self._motion_start
             m_loop = self._motion_loop
             m_mix = self._motion_mix
+            mood_tv, mood_ta = self._mood_tv, self._mood_ta
+            istate = self._istate
+            think_side_t = self._think_side
+            listen_side_t = self._listen_side
 
-        # 3. Auto-Breathing & Natural Idle Sway
+        # 2.5 Mood momentum + interaction-state blend weights (eased, never pop)
+        k_mood = 1.0 - math.exp(-dt / 2.4)
+        self._mood_v += (mood_tv - self._mood_v) * k_mood
+        self._mood_a += (mood_ta - self._mood_a) * k_mood
+        mv, ma = self._mood_v, self._mood_a
+        k_st = 1.0 - math.exp(-dt * 2.6)
+        self._w_listen += ((1.0 if istate == "listening" else 0.0) - self._w_listen) * k_st
+        self._w_think += ((1.0 if istate == "thinking" else 0.0) - self._w_think) * k_st
+        self._w_speak += ((1.0 if (istate == "speaking" or speaking) else 0.0) - self._w_speak) * k_st
+        w_l, w_t, w_s = self._w_listen, self._w_think, self._w_speak
+        k_side = 1.0 - math.exp(-dt * 3.0)
+        self._think_side_s += (think_side_t - self._think_side_s) * k_side
+        self._listen_side_s += (listen_side_t - self._listen_side_s) * k_side
+        think_side = self._think_side_s
+        listen_side = self._listen_side_s
+        arousal_n = 0.5 * (ma + 1.0)                                  # 0..1
+
+        # 3. Uneven mood-coupled breathing
         breath_val = 0.0
         if rig_cfg.get("autoBreath", True):
-            b_amp = float(rig_cfg.get("breathAmp", 1.0))
-            breath_val = (0.5 + 0.5 * math.sin(t_now * 1.85)) * b_amp
-        p["Breath"] = (max(0.0, min(1.0, breath_val)), 0.0)
+            b_amp = _clamp(_ff(rig_cfg.get("breathAmp", 1.0), 1.0), 0.0, 3.0)
+            rate_mul = 1.0 + 0.24 * ma + 0.10 * w_s
+            depth_mul = 1.0 + 0.12 * ma - 0.08 * mv * (1.0 if mv < 0.0 else 0.0)
+            breath_val = self._breath_step(dt, rate_mul, depth_mul, speaking, mv) * b_amp
+        p["Breath"] = (_clamp(breath_val, 0.0, 1.0), 0.0)
 
-        sway = float(rig_cfg.get("idleSway", 1.0))
-        head_x = sway * (4.6 * math.sin(t_now * 0.58) + 2.1 * math.sin(t_now * 1.23))
-        head_y = sway * (3.2 * math.sin(t_now * 0.74 + 0.6))
-        head_z = sway * (3.8 * math.sin(t_now * 0.51 + 1.1))
-        body_x = sway * (3.1 * math.sin(t_now * 0.45 + 0.3))
-        body_y = sway * (2.3 * math.sin(t_now * 1.85 - 0.35))
-        body_z = sway * (2.8 * math.sin(t_now * 0.42 + 0.9))
-        body_lean = sway * (2.0 * math.sin(t_now * 0.61))
+        # 3.2 Held weight-shift postures + micro drift (replaces the fixed sine "screensaver" sway)
+        sway = _clamp(_ff(rig_cfg.get("idleSway", 1.0), 1.0), 0.0, 3.0)
+        energy_mul = sway * (0.8 + 0.5 * arousal_n)
+        pose = self._posture_step(dt, t_now, energy_mul, max(w_s * 0.6, w_l * 0.5, w_t * 0.7))
+        head_x = pose["hx"]
+        head_y = pose["hy"]
+        head_z = pose["hz"]
+        body_x = pose["bx"]
+        body_z = pose["bz"]
+        body_lean = pose["lean"]
+        body_y = sway * 1.5 * (breath_val - 0.4)                    # chest rises with the breath
+        # Low mood droops the head a little; high arousal lifts it.
+        head_y += -2.2 * max(0.0, -mv) + 1.2 * max(0.0, ma)
 
-        # 3.5 Neuro-style Scheduled Live Idle Choreographer (periodic organic VTuber micro-behaviors!)
+        # 3.5 Neuro-style idle acts (sparser now; blocked while speaking / thinking)
         idle_brow_boost = 0.0
         idle_smile_boost = 0.0
-        if sway > 0.05 and not em_id and m_clip is None:
-            if not self._idle_act and not speaking and t_now >= self._next_idle_act:
+        idle_block = bool(em_id) or m_clip is not None
+        self._idle_gate += ((0.0 if idle_block else 1.0) - self._idle_gate) * (1.0 - math.exp(-dt / 0.15))
+        if self._idle_act and idle_block and self._idle_gate < 0.02:
+            self._idle_act = ""
+            self._next_idle_act = t_now + rnd.uniform(4.0, 8.0)
+        if sway > 0.05:
+            if (not self._idle_act and not idle_block and not speaking and w_t < 0.3 and w_l < 0.3
+                    and t_now >= self._next_idle_act):
                 choices = ("curious_tilt", "vibe_sway", "happy_bounce", "chat_read", "daydream_sigh", "cheeky_lean")
-                self._idle_act = random.choice(choices)
+                self._idle_act = rnd.choice(choices)
                 self._idle_start = t_now
-                self._idle_side = -1.0 if random.random() < 0.5 else 1.0
+                self._idle_side = -1.0 if rnd.random() < 0.5 else 1.0
                 self._idle_dur = {
-                    "curious_tilt": random.uniform(2.4, 3.4),
-                    "vibe_sway":    random.uniform(3.2, 4.4),
-                    "happy_bounce": random.uniform(1.8, 2.5),
-                    "chat_read":    random.uniform(2.6, 3.6),
-                    "daydream_sigh":random.uniform(3.0, 4.0),
-                    "cheeky_lean":  random.uniform(2.2, 3.1),
+                    "curious_tilt": rnd.uniform(2.4, 3.4),
+                    "vibe_sway":    rnd.uniform(3.2, 4.4),
+                    "happy_bounce": rnd.uniform(1.8, 2.5),
+                    "chat_read":    rnd.uniform(2.6, 3.6),
+                    "daydream_sigh": rnd.uniform(3.0, 4.0),
+                    "cheeky_lean":  rnd.uniform(2.2, 3.1),
                 }[self._idle_act]
             if self._idle_act:
                 iu = (t_now - self._idle_start) / max(0.1, self._idle_dur)
                 if iu >= 1.0:
                     self._idle_act = ""
-                    self._next_idle_act = t_now + random.uniform(3.8, 7.5) / max(0.35, min(2.0, sway))
+                    self._next_idle_act = t_now + rnd.uniform(6.0, 12.0) / max(0.35, min(2.0, sway))
                 else:
-                    # Silky smoothstep fade-in / hold / fade-out envelope
-                    env = math.sin(iu * math.pi) ** 1.25
+                    env = (math.sin(iu * math.pi) ** 1.25) * self._idle_gate
                     s_dir = self._idle_side
                     ia = self._idle_act
                     amt = min(1.5, sway)
@@ -442,87 +809,97 @@ class RigController:
                         idle_brow_boost += 0.18 * env
                         idle_smile_boost += 0.16 * env
 
-        # 4. Autonomous Natural VTuber Gaze + Smart Hybrid Mouse Follow (Eye-Leads-Head!)
+        # 3.7 Interaction-state layers
+        # Listening: lean in, small attentive nods on a loose rhythm.
+        if w_l > 0.02:
+            body_lean += 2.8 * w_l
+            head_y -= 1.2 * w_l
+            head_z += 2.5 * w_l * listen_side
+            if istate == "listening" and t_now >= self._next_listen_nod:
+                self.sp_nod.v -= rnd.uniform(26.0, 42.0)
+                self._next_listen_nod = t_now + rnd.uniform(1.8, 4.2)
+        head_y += self.sp_nod.step(0.0, dt, 7.5, 0.55)
+        # Thinking: glance up to one side, thoughtful tilt, chin a touch up.
+        if w_t > 0.02:
+            head_z += think_side * 5.5 * w_t
+            head_x += think_side * 4.0 * w_t
+            head_y += 3.0 * w_t
+            body_z += think_side * 1.2 * w_t
+
+        # 4. Autonomous gaze + mouse follow (eye leads head)
         auto_gaze = bool(rig_cfg.get("autoGaze", True))
-        liveliness = max(0.0, float(rig_cfg.get("autoGazeLiveliness", 1.0)))
+        liveliness = _clamp(_ff(rig_cfg.get("autoGazeLiveliness", 1.0), 1.0), 0.0, 3.0)
         mouse_on = bool(rig_cfg.get("mouseLookAt", True))
         mouse_recent = mouse_on and ((t_now - self._mouse_last_move) < 2.2)
+        contact = max(w_l, w_s)                                      # attentive: more eye contact
 
         if auto_gaze:
-            # Tiny realistic eye micro-saccades every 0.35..0.95s
             if t_now >= self._next_micro_saccade:
-                self._next_micro_saccade = t_now + random.uniform(0.35, 0.95)
-                self._micro_x = random.uniform(-0.07, 0.07) * liveliness
-                self._micro_y = random.uniform(-0.05, 0.05) * liveliness
-
-            # Organic focal shifts: 62% warm eye contact, 22% thinking glance up-side, 16% curious room glance
+                self._next_micro_saccade = t_now + rnd.uniform(0.35, 0.95)
+                self._micro_x = rnd.uniform(-0.07, 0.07) * liveliness
+                self._micro_y = rnd.uniform(-0.05, 0.05) * liveliness
             if t_now >= self._next_gaze_shift:
-                r_pick = random.random()
+                r_pick = rnd.random()
                 old_tx = self._gaze_tx
-                if r_pick < 0.62:
-                    # Warm eye contact with viewer (slight natural offset, holds 2.0..4.5s)
-                    self._gaze_tx = random.uniform(-0.14, 0.14) * liveliness
-                    self._gaze_ty = random.uniform(-0.10, 0.08) * liveliness
-                    self._gaze_head_tilt = random.uniform(-0.22, 0.22) * liveliness
-                    self._next_gaze_shift = t_now + random.uniform(2.0, 4.4)
-                elif r_pick < 0.84:
-                    # Thinking / daydreaming glance slightly up-left or up-right (holds 1.1..2.3s)
-                    side = -1.0 if random.random() < 0.5 else 1.0
-                    self._gaze_tx = side * random.uniform(0.38, 0.68) * liveliness
-                    self._gaze_ty = random.uniform(-0.48, -0.20) * liveliness
-                    self._gaze_head_tilt = side * random.uniform(0.25, 0.55) * liveliness
-                    self._next_gaze_shift = t_now + random.uniform(1.1, 2.3)
+                contact_p = 0.62 + 0.24 * contact
+                if r_pick < contact_p:
+                    self._gaze_tx = rnd.uniform(-0.14, 0.14) * liveliness
+                    self._gaze_ty = rnd.uniform(-0.10, 0.08) * liveliness
+                    self._gaze_head_tilt = rnd.uniform(-0.22, 0.22) * liveliness
+                    self._next_gaze_shift = t_now + rnd.uniform(2.0, 4.4)
+                elif r_pick < contact_p + (1.0 - contact_p) * 0.58:
+                    side = -1.0 if rnd.random() < 0.5 else 1.0
+                    self._gaze_tx = side * rnd.uniform(0.38, 0.68) * liveliness
+                    self._gaze_ty = rnd.uniform(-0.48, -0.20) * liveliness
+                    self._gaze_head_tilt = side * rnd.uniform(0.25, 0.55) * liveliness
+                    self._next_gaze_shift = t_now + rnd.uniform(1.1, 2.3)
                 else:
-                    # Curious room glance left/right (holds 1.2..2.5s)
-                    side = -1.0 if random.random() < 0.5 else 1.0
-                    self._gaze_tx = side * random.uniform(0.42, 0.78) * liveliness
-                    self._gaze_ty = random.uniform(-0.08, 0.22) * liveliness
-                    self._gaze_head_tilt = -side * random.uniform(0.15, 0.40) * liveliness
-                    self._next_gaze_shift = t_now + random.uniform(1.2, 2.4)
+                    side = -1.0 if rnd.random() < 0.5 else 1.0
+                    self._gaze_tx = side * rnd.uniform(0.42, 0.78) * liveliness
+                    self._gaze_ty = rnd.uniform(-0.08, 0.22) * liveliness
+                    self._gaze_head_tilt = -side * rnd.uniform(0.15, 0.40) * liveliness
+                    self._next_gaze_shift = t_now + rnd.uniform(1.2, 2.4)
+                if rig_cfg.get("autoBlink", True) and not self._blink_active and abs(self._gaze_tx - old_tx) > 0.42 and rnd.random() < 0.65:
+                    self._start_blink(t_now)
 
-                # Natural blink synced to larger gaze shifts (real human vestibulo-ocular behavior!)
-                if rig_cfg.get("autoBlink", True) and not self._blink_active and abs(self._gaze_tx - old_tx) > 0.42 and random.random() < 0.65:
-                    self._blink_active = True
-                    self._blink_phase = 0.0
-
-        # Silky-smooth low-pass mouse filter + gradual blend (eliminates ALL jerky snap/twitch!)
         lp = 1.0 - math.exp(-8.5 * max(0.001, dt))
         self._mx_filt += (mx_t - self._mx_filt) * lp
         self._my_filt += (my_t - self._my_filt) * lp
-
         if mouse_recent:
             self._mouse_blend = min(1.0, self._mouse_blend + dt * 2.6)
         else:
             self._mouse_blend = max(0.0, self._mouse_blend - dt * 1.05)
 
-        ml = float(rig_cfg.get("mouseLookStrength", 0.55))
+        ml = _clamp(_ff(rig_cfg.get("mouseLookStrength", 0.55), 0.55), 0.0, 2.0)
         m_gx = self._mx_filt * ml
         m_gy = self._my_filt * ml
         m_tilt = self._mx_filt * 0.22 * ml
 
         if auto_gaze:
-            a_gx = max(-0.95, min(0.95, self._gaze_tx + self._micro_x))
-            a_gy = max(-0.85, min(0.85, self._gaze_ty + self._micro_y))
+            a_gx = _clamp(self._gaze_tx + self._micro_x, -0.95, 0.95) * (1.0 - 0.35 * contact)
+            a_gy = _clamp(self._gaze_ty + self._micro_y, -0.85, 0.85) * (1.0 - 0.35 * contact)
             a_tilt = self._gaze_head_tilt
         else:
             a_gx, a_gy, a_tilt = 0.0, 0.0, 0.0
+        if w_t > 0.01:                                               # thinking glance (up + to one side)
+            a_gx = a_gx * (1.0 - w_t) + think_side * 0.52 * w_t + self._micro_x * w_t
+            a_gy = a_gy * (1.0 - w_t) + (-0.46) * w_t + self._micro_y * w_t
+            a_tilt = a_tilt * (1.0 - w_t) + think_side * 0.25 * w_t
 
-        # Scale mouse dominance by mouseLookStrength so weak mouse follow never freezes autonomous gaze!
         mb_raw = self._mouse_blend * self._mouse_blend * (3.0 - 2.0 * self._mouse_blend)
         mb = mb_raw * min(1.0, max(0.0, ml) * 2.2)
         tgt_gx = a_gx * (1.0 - mb) + m_gx * mb
         tgt_gy = a_gy * (1.0 - mb) + m_gy * mb
         tgt_tilt = a_tilt * (1.0 - mb) + m_tilt * mb
 
-        # Critically-damped silky springs when tracking mouse (fast saccades only for autonomous gaze!)
         eye_om = 17.0 * (1.0 - mb) + 8.5 * mb
-        eye_z = 0.90 * (1.0 - mb) + 0.98 * mb
+        eye_zeta = 0.90 * (1.0 - mb) + 0.98 * mb
         head_om = 5.6 * (1.0 - mb) + 3.8 * mb
-        head_z = 0.90 * (1.0 - mb) + 0.98 * mb
-        ex_s = self.sp_eye_x.step(tgt_gx, dt, eye_om, eye_z)
-        ey_s = self.sp_eye_y.step(tgt_gy, dt, eye_om, eye_z)
-        hx_s = self.sp_head_gx.step(tgt_gx, dt, head_om, head_z)
-        hy_s = self.sp_head_gy.step(tgt_gy, dt, head_om, head_z)
+        head_zeta = 0.90 * (1.0 - mb) + 0.98 * mb                  # (was `head_z`: it erased the head roll!)
+        ex_s = self.sp_eye_x.step(tgt_gx, dt, eye_om, eye_zeta)
+        ey_s = self.sp_eye_y.step(tgt_gy, dt, eye_om, eye_zeta)
+        hx_s = self.sp_head_gx.step(tgt_gx, dt, head_om, head_zeta)
+        hy_s = self.sp_head_gy.step(tgt_gy, dt, head_om, head_zeta)
         ht_s = self.sp_head_gt.step(tgt_tilt, dt, 3.6, 0.96)
 
         head_x += hx_s * 15.5
@@ -530,86 +907,211 @@ class RigController:
         head_z += ht_s * 9.5 + hx_s * 3.2
         body_x += hx_s * 4.8
         body_z += ht_s * 2.8
-        eye_x = max(-1.0, min(1.0, ex_s * 0.88))
-        eye_y = max(-1.0, min(1.0, -ey_s * 0.74))
+        eye_x = _clamp(ex_s * 0.88, -1.0, 1.0)
+        eye_y = _clamp(-ey_s * 0.74, -1.0, 1.0)
 
-        # Speech cadence head-nod, subtle reactive eye-smile & brow emphasis (Reactive V2)
-        nod_gain = float(lip_cfg.get("speechToHeadNod", 0.80))
+        # 4.5 Prosody: syllable-onset head beats (spring impulses, not a metronome) + pitch-coupled chin / brows
+        nod_gain = _clamp(_ff(lip_cfg.get("speechToHeadNod", 0.80), 0.80), 0.0, 3.0)
+        jiggle = _clamp(_ff(rig_cfg.get("jiggleScale", 1.25), 1.25), 0.0, 2.5)
+        beat_strength = 0.0
+        if speaking and onset > 0.22 and (t_now - self._last_beat) > 0.17 and nod_gain > 0.0:
+            beat_strength = _clamp(0.35 + 0.9 * stress + 0.5 * onset, 0.0, 1.5)
+            self._last_beat = t_now
+            if rnd.random() < 0.35:
+                self._beat_sign = -self._beat_sign
+            self.sp_beat_y.v -= 30.0 * beat_strength * nod_gain
+            self.sp_beat_z.v += self._beat_sign * 10.0 * beat_strength * nod_gain
+            self.sp_chest_y.v += 1.8 * beat_strength * min(1.5, jiggle)      # tiny body bounce -> chest physics
+            if beat_strength > 0.95 and rnd.random() < 0.35 and t_now - self._brow_ev_start > self._brow_ev_dur:
+                self._brow_ev_side = -1.0 if rnd.random() < 0.5 else 1.0     # asymmetric emphasis brow
+                self._brow_ev_start, self._brow_ev_dur, self._brow_ev_amp = t_now, rnd.uniform(0.45, 0.8), rnd.uniform(0.18, 0.3)
+        head_y += self.sp_beat_y.step(0.0, dt, 11.0, 0.42)
+        head_z += self.sp_beat_z.step(0.0, dt, 7.0, 0.5)
         if energy > 0.04 and nod_gain > 0.0:
-            head_y += nod_gain * (3.8 * energy * math.sin(t_now * 5.2) + 5.2 * stress)
-            head_z += nod_gain * (3.4 * energy * math.sin(t_now * 2.5 + 0.5) + 2.6 * stress * math.cos(t_now * 1.9))
-            body_y += nod_gain * (2.0 * stress)
-            body_z += nod_gain * (1.4 * energy * math.sin(t_now * 2.2))
+            head_y += nod_gain * 1.6 * stress
+        body_z += 0.3 * self.sp_beat_z.y                            # the torso follows the beat tilt a little
 
-        # 5. Auto-Blink scheduler
+        if speaking and voiced > 0.3:
+            self._pitch_base += (pitch - self._pitch_base) * (1.0 - math.exp(-dt / 2.5))
+            rel_t = _clamp((pitch - self._pitch_base) * 2.6, -1.0, 1.0)
+        else:
+            rel_t = 0.0
+        self._pitch_rel += (rel_t - self._pitch_rel) * (1.0 - math.exp(-dt / 0.12))
+        pr = self._pitch_rel
+        head_y += 3.2 * pr * w_s                                     # chin lifts on rising / excited inflection
+        brow_pitch = (0.30 * max(0.0, pr) - 0.10 * max(0.0, -pr)) * w_s
+        eye_widen = 0.07 * max(0.0, pr) * w_s
+
+        # 4.7 Body bounce springs (emote kicks, onset beats, plugins): real motion -> physics anchors respond
+        bounce_y = self.sp_chest_y.step(0.0, dt, 9.0, 0.30)
+        bounce_x = self.sp_chest_x.step(0.0, dt, 8.0, 0.32)
+        squash = self.sp_eye_jelly.step(0.0, dt, 18.0, 0.5)
+        body_y += 2.4 * bounce_y
+        head_y += 1.1 * bounce_y
+        body_x += 1.8 * bounce_x
+
+        # 5. Blinks: normal / double / half / slow relaxed
         eye_open_l = 1.0
         eye_open_r = 1.0
         if rig_cfg.get("autoBlink", True):
-            rate = max(0.2, float(rig_cfg.get("blinkRate", 1.0)))
+            rate = _clamp(_ff(rig_cfg.get("blinkRate", 1.0), 1.0), 0.2, 6.0)
             if not self._blink_active and t_now >= self._next_blink:
-                self._blink_active = True
-                self._blink_phase = 0.0
+                self._start_blink(t_now)
             if self._blink_active:
-                self._blink_phase += dt / 0.165
+                dur = {"normal": 0.165, "half": 0.15, "slow": 0.42}[self._blink_kind]
+                self._blink_phase += dt / dur
                 if self._blink_phase >= 1.0:
                     self._blink_active = False
-                    # 18% chance of cute natural double-blink
-                    gap = 0.24 if random.random() < 0.18 else random.uniform(2.1, 4.8) / rate
-                    self._next_blink = t_now + gap
+                    if self._blink_queue_double:
+                        self._blink_queue_double = False
+                        self._next_blink = t_now + 0.22
+                    else:
+                        gap = rnd.uniform(2.1, 4.8) / rate
+                        gap *= 1.25 if istate == "thinking" else 1.0     # concentration: fewer blinks
+                        self._next_blink = t_now + gap
                 else:
-                    # Smooth close-open curve
-                    b = math.sin(self._blink_phase * math.pi) ** 1.6
+                    b = self._blink_shape()
                     eye_open_l = eye_open_r = max(0.0, 1.0 - b)
+        if eye_open_l > 0.95:
+            eye_open_l = eye_open_r = eye_open_l + eye_widen
 
-        # 6. Expression Preset Springs + manual sliders
+        # 6. Expression + mood + state
         expr_name = (temp.get("expression") if temp else None) or str(rig_cfg.get("expression", "happy"))
         expr_tgt = EXPRESSION_PRESETS.get(expr_name, EXPRESSION_PRESETS["neutral"])
-        ev = {k: self.expr_springs[k].step(expr_tgt[k], dt, 11.0, 0.86) for k in self.expr_springs}
+        mood_tgt = {
+            "eyeSmile": 0.16 * max(0.0, mv) + 0.05 * w_l,
+            "squint": 0.10 * w_t,
+            "browY": 0.12 * mv + 0.08 * ma + 0.08 * w_l,
+            "browForm": 0.14 * mv,
+            "mouthForm": 0.22 * mv - 0.10 * w_t,
+            "cheekPuff": 0.0, "sparkle": 0.12 * max(0.0, ma) * max(0.0, mv), "blush": 0.0,
+        }
+        ev = {k: self.expr_springs[k].step(expr_tgt[k] + mood_tgt[k], dt, 11.0, 0.86) for k in self.expr_springs}
 
-        # Combine expression + manual FX sliders + temp AI boost
-        sparkle = max(0.0, min(1.0, max(ev["sparkle"], float(rig_cfg.get("sparkleEyes", 0.0)), float(temp["sparkle"]) if temp and "sparkle" in temp else 0.0)))
-        blush = max(0.0, min(1.0, max(ev["blush"], float(rig_cfg.get("blushLines", 0.0)), float(temp["blush"]) if temp and "blush" in temp else 0.0)))
-        cheek_puff = max(0.0, min(1.0, max(ev["cheekPuff"], float(rig_cfg.get("cheekPuff", 0.0)))))
-        squint = max(0.0, min(1.0, max(ev["squint"], float(rig_cfg.get("eyeSquint", 0.0))) + 0.14 * energy))
-        brow_speech = float(lip_cfg.get("speechToBrows", 0.72)) * (0.35 * energy + 0.50 * stress)
+        sparkle_t = max(ev["sparkle"], _ff(rig_cfg.get("sparkleEyes", 0.0), 0.0), _ff(temp["sparkle"], 0.0) if temp and "sparkle" in temp else 0.0)
+        blush_t = max(ev["blush"], _ff(rig_cfg.get("blushLines", 0.0), 0.0), _ff(temp["blush"], 0.0) if temp and "blush" in temp else 0.0)
+        sparkle = _clamp(self.sp_sparkle.step(_clamp(sparkle_t, 0.0, 1.0), dt, 12.0, 1.0), 0.0, 1.0)
+        blush = _clamp(self.sp_blush.step(_clamp(blush_t, 0.0, 1.0), dt, 9.0, 1.0), 0.0, 1.0)
+        self._mouth_busy += ((1.0 if speaking else 0.0) - self._mouth_busy) * (1.0 - math.exp(-dt / 0.12))
+        quiet = 1.0 - self._mouth_busy
+        cheek_puff = _clamp(max(ev["cheekPuff"], _ff(rig_cfg.get("cheekPuff", 0.0), 0.0)), 0.0, 1.0)
+        k_face = 1.0 - math.exp(-dt / 0.06)
+        self._energy_face += (energy - self._energy_face) * k_face
+        self._stress_face += (stress - self._stress_face) * k_face
+        e_f, s_f = self._energy_face, self._stress_face
+        squint = _clamp(max(ev["squint"], _ff(rig_cfg.get("eyeSquint", 0.0), 0.0)) + 0.14 * e_f + 0.25 * max(0.0, squash), 0.0, 1.0)
+        brow_speech = _clamp(_ff(lip_cfg.get("speechToBrows", 0.72), 0.72), 0.0, 3.0) * (0.25 * e_f + 0.35 * s_f) + brow_pitch
+        cheek_tgt = 0.55 * blush + 0.18 * max(0.0, mv) + 0.10 * max(0.0, ma) + 0.10 * energy * max(0.0, mv)
+        cheek = _clamp(self.sp_cheek.step(cheek_tgt, dt, 4.0, 1.0), 0.0, 1.0)
 
-        # 7. 3-Bone Rigid Toggle Arms + Speech Auto-Gesture
-        t_arm_r = float(temp["armR"]) if temp and "armR" in temp else float(rig_cfg.get("armRPose", 0.0))
-        t_arm_l = float(temp["armL"]) if temp and "armL" in temp else float(rig_cfg.get("armLPose", 0.0))
-        arm_r_pose = max(0.0, min(1.0, self.sp_arm_r_pose.step(t_arm_r, dt, 22.0, 0.92)))
-        arm_l_pose = max(0.0, min(1.0, self.sp_arm_l_pose.step(t_arm_l, dt, 22.0, 0.92)))
+        # 6.5 Asymmetric brow micro-life (curious / smug / thinking / emphasis)
+        if t_now >= self._next_brow_ev and t_now - self._brow_ev_start > self._brow_ev_dur:
+            self._brow_ev_side = (think_side_t if w_t > 0.5 else (-1.0 if rnd.random() < 0.5 else 1.0))
+            self._brow_ev_start = t_now
+            self._brow_ev_dur = rnd.uniform(0.5, 1.4)
+            self._brow_ev_amp = rnd.uniform(0.10, 0.26) * (1.3 if expr_name in ("smug", "surprised") else 1.0)
+            busy = 0.55 if (w_t > 0.5 or expr_name == "smug" or speaking) else 1.0
+            self._next_brow_ev = t_now + rnd.uniform(2.5, 7.0) * busy
+        bu = (t_now - self._brow_ev_start) / max(0.05, self._brow_ev_dur)
+        brow_ev = self._brow_ev_amp * (math.sin(bu * math.pi) ** 1.3 if 0.0 <= bu <= 1.0 else 0.0)
+        # Thinking: the glance-side brow lifts, the other one dips slightly.
+        tl = 0.5 * (1.0 + _clamp(think_side, -1.0, 1.0))           # 1 = glancing to the L-brow side (continuous)
+        tr = 1.0 - tl
+        brow_l_extra = brow_ev * (1.0 if self._brow_ev_side > 0 else -0.25) + w_t * (0.38 * tl - 0.08)
+        brow_r_extra = brow_ev * (1.0 if self._brow_ev_side < 0 else -0.25) + w_t * (0.38 * tr - 0.08)
+        # Brow angle: + = worried / soft (inner ends up), - = cross. Sad / shy / thinking soften, pout sharpens.
+        ang_base = 0.30 * max(0.0, -mv) + (0.25 if expr_name == "shy" else 0.0) - (0.45 if expr_name == "pout" else 0.0)
+        ang_l = self.sp_brow_angle_l.step(ang_base + 0.25 * w_t * (0.4 + 0.6 * tl), dt, 6.0, 0.9)
+        ang_r = self.sp_brow_angle_r.step(ang_base + 0.25 * w_t * (0.4 + 0.6 * tr), dt, 6.0, 0.9)
 
-        g_r_tgt = float(rig_cfg.get("armRGesture", 0.0))
-        g_l_tgt = float(rig_cfg.get("armLGesture", 0.0))
-        l_r_tgt = float(rig_cfg.get("armRLift", 0.0))
-        l_l_tgt = float(rig_cfg.get("armLLift", 0.0))
+        # 7. Raised wave arms (manual / emote / temp action) + speech gestures
+        auto_gest = bool(rig_cfg.get("autoGestureOnSpeech", True))
+        ag_gain = _clamp(_ff(lip_cfg.get("speechToArmGesture", 0.75), 0.75), 0.0, 2.0)
+        t_arm_r = _ff(temp["armR"], 0.0) if temp and "armR" in temp else _ff(rig_cfg.get("armRPose", 0.0), 0.0)
+        t_arm_l = _ff(temp["armL"], 0.0) if temp and "armL" in temp else _ff(rig_cfg.get("armLPose", 0.0), 0.0)
 
-        # Playful live wave / conversational gesture whenever an arm is raised!
+        # 7.1 Talking-arm gesture state machine (3-bone resting arms; automatic whenever she speaks)
+        excited = stress > 0.72 or ma > 0.45 or expr_name == "excited" or (expr_name == "happy" and stress > 0.5)
+        rest_free = (t_arm_r < 0.5 and t_arm_l < 0.5) and not em_id and m_clip is None
+        gest_allowed = auto_gest and rest_free and ag_gain > 0.0
+        gest = self._gesture_step(t_now, dt, speaking, energy, stress, onset, excited,
+                                  ag_gain / 0.75, gest_allowed)
+        if not self._has_rest_arms and auto_gest and self._gest_phase in ("prepare", "stroke", "hold"):
+            # Older models without the 3-bone rest rig: raise the dominant arm for the phrase instead.
+            if self._gest_side == "R":
+                t_arm_r = max(t_arm_r, 1.0)
+            else:
+                t_arm_l = max(t_arm_l, 1.0)
+
+        arm_r_pose = _clamp(self.sp_arm_r_pose.step(t_arm_r, dt, 22.0, 0.92), 0.0, 1.0)
+        arm_l_pose = _clamp(self.sp_arm_l_pose.step(t_arm_l, dt, 22.0, 0.92), 0.0, 1.0)
+        g_r_tgt = _ff(rig_cfg.get("armRGesture", 0.0), 0.0)
+        g_l_tgt = _ff(rig_cfg.get("armLGesture", 0.0), 0.0)
+        l_r_tgt = _ff(rig_cfg.get("armRLift", 0.0), 0.0)
+        l_l_tgt = _ff(rig_cfg.get("armLLift", 0.0), 0.0)
         if arm_r_pose > 0.5:
-            if temp and temp.get("armR", 0) > 0.5:
+            if temp and _ff(temp.get("armR", 0), 0.0) > 0.5:
                 g_r_tgt += 0.25 + 0.55 * math.sin(t_now * 7.2)
-            elif rig_cfg.get("autoGestureOnSpeech", True) and speaking:
-                ag = float(lip_cfg.get("speechToArmGesture", 0.75))
-                g_r_tgt += ag * (0.18 + 0.36 * math.sin(t_now * 3.1) + 0.42 * stress)
-                l_r_tgt += ag * (0.30 * energy)
+            elif auto_gest and speaking:
+                g_r_tgt += ag_gain * (0.18 + 0.36 * math.sin(t_now * 3.1) + 0.42 * stress)
+                l_r_tgt += ag_gain * (0.30 * energy + 0.25 * max(0.0, pr))
             else:
                 g_r_tgt += 0.14 * math.sin(t_now * 1.9)
         if arm_l_pose > 0.5:
-            if temp and temp.get("armL", 0) > 0.5:
+            if temp and _ff(temp.get("armL", 0), 0.0) > 0.5:
                 g_l_tgt += 0.22 + 0.52 * math.sin(t_now * 6.8 + 0.6)
-            elif rig_cfg.get("autoGestureOnSpeech", True) and speaking:
-                ag = float(lip_cfg.get("speechToArmGesture", 0.75))
-                g_l_tgt += ag * (0.18 + 0.36 * math.sin(t_now * 2.8 + 0.9) + 0.42 * stress)
-                l_l_tgt += ag * (0.30 * energy)
+            elif auto_gest and speaking:
+                g_l_tgt += ag_gain * (0.18 + 0.36 * math.sin(t_now * 2.8 + 0.9) + 0.42 * stress)
+                l_l_tgt += ag_gain * (0.30 * energy + 0.25 * max(0.0, pr))
             else:
                 g_l_tgt += 0.14 * math.sin(t_now * 1.7 + 0.8)
 
-        arm_r_gest = max(-0.48, min(0.92, self.sp_arm_r_gest.step(g_r_tgt, dt, 14.0, 0.85)))
-        arm_l_gest = max(-0.48, min(0.92, self.sp_arm_l_gest.step(g_l_tgt, dt, 14.0, 0.85)))
-        arm_r_lift = max(-0.75, min(0.85, self.sp_arm_r_lift.step(l_r_tgt, dt, 11.0, 0.88)))
-        arm_l_lift = max(-0.75, min(0.85, self.sp_arm_l_lift.step(l_l_tgt, dt, 11.0, 0.88)))
+        arm_r_gest = _clamp(self.sp_arm_r_gest.step(g_r_tgt, dt, 14.0, 0.85), -0.48, 0.92)
+        arm_l_gest = _clamp(self.sp_arm_l_gest.step(g_l_tgt, dt, 14.0, 0.85), -0.48, 0.92)
+        arm_r_lift = _clamp(self.sp_arm_r_lift.step(l_r_tgt, dt, 11.0, 0.88), -0.75, 0.85)
+        arm_l_lift = _clamp(self.sp_arm_l_lift.step(l_l_tgt, dt, 11.0, 0.88), -0.75, 0.85)
+        # Raised wrist follow-through: a slow copy of the gesture; the difference flicks the hand.
+        lag_r = self.sp_arm_r_wlag.step(arm_r_gest, dt, 6.0, 0.7)
+        lag_l = self.sp_arm_l_wlag.step(arm_l_gest, dt, 6.0, 0.7)
 
-        # 8. Motion Lab Video-Clip Retargeting Blend (Head, Body, Blinks & Arms ONLY — never overrides live VBridger mouth!)
+        # 7.2 3-bone resting arms: relaxed bend + breath drift + posture coupling + state poses + gestures
+        rest_vals: dict[str, tuple[float, float, float]] = {}
+        if self._has_rest_arms:
+            gp = self._gest_phase
+            om = {"rest": 3.4, "prepare": 7.5, "stroke": 13.0, "hold": 9.0, "relax": 4.4}[gp]
+            em_arm = EMOTE_REST_ARMS.get(em_id) if em_id else None
+            em_env = 0.0
+            if em_arm is not None and em_dur > 0.1:
+                u_e = _clamp(em_el / em_dur, 0.0, 1.0)
+                em_env = _smooth(u_e / 0.2) * _smooth((1.0 - u_e) / 0.3)
+            for idx, s in enumerate(("R", "L")):
+                sgn = 1.0 if s == "R" else -1.0
+                b_sh, b_el, b_wr = self._rest_base[s]
+                sh = b_sh + 0.035 * (breath_val - 0.4) - 0.012 * sgn * body_z
+                el_ = b_el + 0.03 * ma + 0.025 * (breath_val - 0.4) + 0.04 * w_l
+                wr = b_wr + 0.02 * mv
+                # Thinking: the glance-side hand drifts up toward the waist / front.
+                think_k = w_t * (0.25 + 0.75 * (tl if s == "L" else tr))
+                sh -= 0.05 * think_k
+                el_ += 0.42 * think_k
+                wr += 0.28 * think_k
+                g = gest.get(s)
+                if g is not None:
+                    sh += g[0]
+                    el_ += g[1]
+                    wr += g[2]
+                if em_arm is not None:
+                    tgt = em_arm[idx]
+                    sh = sh * (1.0 - em_env) + tgt[0] * em_env
+                    el_ = el_ * (1.0 - em_env) + tgt[1] * em_env
+                    wr = wr * (1.0 - em_env) + tgt[2] * em_env
+                sp = self.sp_rest[s]
+                v_sh = sp[0].step(sh, dt, om * 0.85, 0.92)
+                v_el = sp[1].step(el_, dt, om, 0.78 if gp == "stroke" else 0.9)
+                v_wr = sp[2].step(wr, dt, om * 0.7, 0.55)            # wrist lags + overshoots: follow-through
+                rest_vals[s] = (_clamp(v_sh, -1.0, 1.0), _clamp(v_el, -1.0, 1.0), _clamp(v_wr, -1.0, 1.0))
+
+        # 8. Motion Lab clip blend (head, body, blinks & arms only — never the live mouth)
         if m_clip is not None:
             tracks = m_clip["tracks"]
             n_f = int(m_clip["frames"])
@@ -632,12 +1134,11 @@ class RigController:
             eye_open_l = eye_open_l * (1.0 - w) + tracks["EyeOpen"][fi] * w
             eye_open_r = eye_open_r * (1.0 - w) + tracks["EyeOpen"][fi] * w
             if tracks["ArmR"][fi] > 0.35 and arm_r_pose > 0.5:
-                arm_r_gest = max(-0.48, min(0.92, arm_r_gest + (tracks["ArmR"][fi] - 0.35) * 0.9 * w))
+                arm_r_gest = _clamp(arm_r_gest + (tracks["ArmR"][fi] - 0.35) * 0.9 * w, -0.48, 0.92)
             if tracks["ArmL"][fi] > 0.35 and arm_l_pose > 0.5:
-                arm_l_gest = max(-0.48, min(0.92, arm_l_gest + (tracks["ArmL"][fi] - 0.35) * 0.9 * w))
+                arm_l_gest = _clamp(arm_l_gest + (tracks["ArmL"][fi] - 0.35) * 0.9 * w, -0.48, 0.92)
 
-        # 9. Assign final native Inochi2D v28 parameters!
-        # 9.0 VTube Studio / VBridger mouth parameter mapping (every lip-sync channel is remapped)
+        # 9. Mouth (VTube Studio / VBridger mapping of every lip-sync channel)
         pmap_cfg = lip_cfg.get("paramMap") if isinstance(lip_cfg.get("paramMap"), dict) else {}
         default_map = DEFAULT_PARAM_MAP
 
@@ -647,24 +1148,25 @@ class RigController:
                 m = default_map.get(name)
             elif name in default_map:
                 m = {**default_map[name], **m}
-            return self.mouth_mapper.map(name, raw, dt, m)
+            return self.mouth_mapper.map(name, _ff(raw, 0.0), dt, m)
 
         form_src = lip["form"] if speaking else ev["mouthForm"]
         m_open = _chan("mouthOpen", lip["open"])
         m_form = _chan("mouthForm", form_src)
         m_jaw = _chan("jawOpen", lip["open"])
         m_funnel = _chan("mouthFunnel", lip["funnel"])
-        m_press = _chan("lipsPress", float(lip.get("press", 0.0)))
+        m_press = _chan("lipsPress", lip.get("press", 0.0))
         m_shrug = _chan("mouthShrug", lip["shrug"])
         m_x = _chan("mouthX", lip["x"])
         m_tongue = _chan("tongueOut", lip["tongue"])
 
-        # Mouth Spring: underdamped bounce kicked by plosive releases / syllable onsets + jaw snaps
-        onset = float(lip.get("onset", 0.0))
-        v_open = (lip["open"] - self._prev_lip_open) / max(0.008, dt)
-        self._prev_lip_open = lip["open"]
-        bounce = float(lip_cfg.get("jawBounce", 1.0))
-        self.sp_mouth_spring.v += bounce * (onset * 260.0 + max(-6.0, min(6.0, v_open)) * 1.6) * dt
+        # Mouth Spring: computed for telemetry; only WRITTEN when engine physics is off (otherwise the rig's
+        # SimplePhysics owns it - its anchor now follows VB Mouth / Jaw Open).
+        physics_on = bool(rig_cfg.get("physicsEnabled", True))
+        v_open = (_ff(lip["open"], 0.0) - self._prev_lip_open) / max(0.008, dt)
+        self._prev_lip_open = _ff(lip["open"], 0.0)
+        bounce = _clamp(_ff(lip_cfg.get("jawBounce", 1.0), 1.0), 0.0, 3.0)
+        self.sp_mouth_spring.v += bounce * (onset * 260.0 + _clamp(v_open, -6.0, 6.0) * 1.6) * dt
         m_spring = _chan("mouthSpring", self.sp_mouth_spring.step(0.0, dt, 19.0, 0.28))
 
         self.last_mapped = {
@@ -672,40 +1174,50 @@ class RigController:
             "lipsPress": m_press, "mouthShrug": m_shrug, "mouthX": m_x, "tongueOut": m_tongue,
             "mouthSpring": m_spring,
         }
-        # Disabled channel -> lip-sync stops driving it: rest pose (form falls back to the expression)
         vb_open = m_open if m_open is not None else 0.0
-        vb_form = m_form if m_form is not None else max(-1.0, min(1.0, ev["mouthForm"]))
-        vb_tongue = max(m_tongue if m_tongue is not None else 0.0, float(rig_cfg.get("tongueOut", 0.0)))
+        vb_form = m_form if m_form is not None else _clamp(ev["mouthForm"], -1.0, 1.0)
+        vb_tongue = max(m_tongue if m_tongue is not None else 0.0, _ff(rig_cfg.get("tongueOut", 0.0), 0.0))
+        mouth_x_v = m_x if m_x is not None else self.defaults.get("Mouth X", (0.0, 0.0))[0]
+        funnel_v = m_funnel if m_funnel is not None else self.defaults.get("Mouth Funnel", (0.0, 0.0))[0]
+        if not speaking and w_t > 0.02:                              # thinking: pursed, pulled to one side
+            mouth_x_v = _clamp(mouth_x_v + 0.28 * think_side * w_t, -1.0, 1.0)
+            funnel_v = _clamp(funnel_v + 0.12 * w_t, 0.0, 1.0)
 
-        p["Angle"] = (max(-30.0, min(30.0, head_x)), max(-24.0, min(24.0, head_y)))
-        p["Angle Z"] = (max(-25.0, min(25.0, head_z)), 0.0)
-        p["Body Angle X"] = (max(-10.0, min(10.0, body_x)), 0.0)
-        p["Body Angle Y"] = (max(-10.0, min(10.0, body_y)), 0.0)
-        p["Body Angle Z"] = (max(-10.0, min(10.0, body_z)), 0.0)
-        p["Body Lean"] = (max(-10.0, min(10.0, body_lean)), 0.0)
+        # 10. Assign Inochi2D parameters
+        p["Angle"] = (_clamp(head_x, -30.0, 30.0), _clamp(head_y, -24.0, 24.0))
+        p["Angle Z"] = (_clamp(head_z, -25.0, 25.0), 0.0)
+        p["Body Angle X"] = (_clamp(body_x, -10.0, 10.0), 0.0)
+        p["Body Angle Y"] = (_clamp(body_y, -10.0, 10.0), 0.0)
+        p["Body Angle Z"] = (_clamp(body_z, -10.0, 10.0), 0.0)
+        p["Body Lean"] = (_clamp(body_lean, -10.0, 10.0), 0.0)
 
+        smile = _clamp(ev["eyeSmile"] + idle_smile_boost, 0.0, 1.0)
+        brow_base = ev["browY"] + brow_speech + idle_brow_boost
         p["EyeBall"] = (eye_x, eye_y)
-        p["Left Eye Open"] = (max(0.0, min(1.0, eye_open_l)), 0.0)
-        p["Right Eye Open"] = (max(0.0, min(1.0, eye_open_r)), 0.0)
-        p["Eye L Smile"] = (max(0.0, min(1.0, ev["eyeSmile"] + idle_smile_boost)), 0.0)
-        p["Eye R Smile"] = (max(0.0, min(1.0, ev["eyeSmile"] + idle_smile_boost)), 0.0)
+        p["Left Eye Open"] = (_clamp(eye_open_l, 0.0, 1.2), 0.0)
+        p["Right Eye Open"] = (_clamp(eye_open_r, 0.0, 1.2), 0.0)
+        p["Eye L Smile"] = (smile, 0.0)
+        p["Eye R Smile"] = (smile, 0.0)
         p["Eye L Squint"] = (squint, 0.0)
         p["Eye R Squint"] = (squint, 0.0)
-        p["Brow L Y"] = (max(-1.0, min(1.0, ev["browY"] + brow_speech + idle_brow_boost)), 0.0)
-        p["Brow R Y"] = (max(-1.0, min(1.0, ev["browY"] + brow_speech + idle_brow_boost)), 0.0)
-        p["Brow L Form"] = (max(-1.0, min(1.0, ev["browForm"])), 0.0)
-        p["Brow R Form"] = (max(-1.0, min(1.0, ev["browForm"])), 0.0)
+        p["Left Brow Y"] = (_clamp(brow_base + brow_l_extra, -1.0, 1.0), 0.0)
+        p["Right Brow Y"] = (_clamp(brow_base + brow_r_extra, -1.0, 1.0), 0.0)
+        p["Brow L Form"] = (_clamp(ev["browForm"], -1.0, 1.0), 0.0)
+        p["Brow R Form"] = (_clamp(ev["browForm"], -1.0, 1.0), 0.0)
+        if self._has_brow_angle:
+            p["Brow L Angle"] = (_clamp(ang_l, -1.0, 1.0), 0.0)
+            p["Brow R Angle"] = (_clamp(ang_r, -1.0, 1.0), 0.0)
+        if self._has_cheek:
+            p["Cheek"] = (cheek, 0.0)
 
-        p["VB Mouth"] = (max(-1.0, min(1.0, vb_form)), max(0.0, min(1.0, vb_open)))
-        p["Mouth Funnel"] = (m_funnel if m_funnel is not None else self.defaults.get("Mouth Funnel", (0.0, 0.0))[0], 0.0)
-        p["Mouth X"] = (m_x if m_x is not None else self.defaults.get("Mouth X", (0.0, 0.0))[0], 0.0)
+        p["VB Mouth"] = (_clamp(vb_form, -1.0, 1.0), _clamp(vb_open, 0.0, 1.0))
+        p["Mouth Funnel"] = (funnel_v, 0.0)
+        p["Mouth X"] = (mouth_x_v, 0.0)
         p["Mouth Shrug"] = (m_shrug if m_shrug is not None else self.defaults.get("Mouth Shrug", (0.0, 0.0))[0], 0.0)
         if "Lips Press / Part" in p:
             p["Lips Press / Part"] = (m_press if m_press is not None else self.defaults["Lips Press / Part"][0], 0.0)
-        p["Tongue Out"] = (max(0.0, min(1.0, vb_tongue)), 0.0)
+        p["Tongue Out"] = (_clamp(vb_tongue, 0.0, 1.0), 0.0)
         p["Jaw Open"] = (m_jaw if m_jaw is not None else self.defaults.get("Jaw Open", (0.0, 0.0))[0], 0.0)
-        if "Mouth Spring" in p:
-            p["Mouth Spring"] = (m_spring if m_spring is not None else self.defaults["Mouth Spring"][0], 0.0)
         p["Cheek Puff"] = (cheek_puff, 0.0)
 
         p["Arm R Pose"] = (arm_r_pose, 0.0)
@@ -714,36 +1226,55 @@ class RigController:
         p["Arm L Pose"] = (arm_l_pose, 0.0)
         p["Arm L Gesture"] = (arm_l_gest, 0.0)
         p["Arm L Lift"] = (arm_l_lift, 0.0)
+        if self._has_raised_joints:
+            p["Arm R Elbow"] = (_clamp(0.10 * arm_r_pose * math.sin(t_now * 1.3), -1.0, 1.0), 0.0)
+            p["Arm L Elbow"] = (_clamp(0.10 * arm_l_pose * math.sin(t_now * 1.1 + 0.7), -1.0, 1.0), 0.0)
+            p["Arm R Wrist"] = (_clamp(1.4 * (lag_r - arm_r_gest) * arm_r_pose, -1.0, 1.0), 0.0)
+            p["Arm L Wrist"] = (_clamp(1.4 * (lag_l - arm_l_gest) * arm_l_pose, -1.0, 1.0), 0.0)
+        if rest_vals:
+            for s, (v_sh, v_el, v_wr) in rest_vals.items():
+                p[f"Rest Arm {s} Shoulder"] = (v_sh, 0.0)
+                p[f"Rest Arm {s} Elbow"] = (v_el, 0.0)
+                p[f"Rest Arm {s} Wrist"] = (v_wr, 0.0)
 
         p["Sparkle Eyes"] = (sparkle, 0.0)
         p["Anime Blush Lines"] = (blush, 0.0)
 
-        # 9.2 Apply Smooth Cubic/Spring Tweened Emote Clips & Transforms (Chibi / Gloom / Emissive Glow)
-        chibi_tgt = max(0.0, min(1.0, float(rig_cfg.get("chibiMode", 0.0))))
-        gloom_tgt = max(0.0, min(1.0, float(rig_cfg.get("gloom", 0.0))))
+        # 10.2 Tweened emote clips (Chibi / Gloom / Emissive glow)
+        chibi_tgt = _clamp(_ff(rig_cfg.get("chibiMode", 0.0), 0.0), 0.0, 1.0)
+        gloom_tgt = _clamp(_ff(rig_cfg.get("gloom", 0.0), 0.0), 0.0, 1.0)
         em_glow_boost = 0.0
 
         if em_id and em_dur > 0.1:
-            u_t = max(0.0, min(1.0, em_el / em_dur))
-            # Smooth cubic envelope: quick ease-in (0..0.16), hold, silky ease-out (0.72..1.0)
+            u_t = _clamp(em_el / em_dur, 0.0, 1.0)
             env_in = min(1.0, u_t / 0.16)
             env_in = env_in * env_in * (3.0 - 2.0 * env_in)
             env_out = min(1.0, (1.0 - u_t) / 0.28)
             env_out = env_out * env_out * (3.0 - 2.0 * env_out)
             env = env_in * env_out
 
+            def _bump(name: str, amount: float, lo: float = -1.0, hi: float = 1.0) -> None:
+                if name in p:
+                    p[name] = (_clamp(p[name][0] + amount, lo, hi), p[name][1])
+
+            def _atleast(name: str, value: float) -> None:
+                if name in p:
+                    p[name] = (_clamp(max(p[name][0], value), 0.0, 1.0), p[name][1])
+
             if em_id == "excited_hop":
                 hop = math.sin(u_t * math.pi * 4.0)
                 body_y += 8.2 * env * hop
                 head_y += 9.0 * env * hop
                 head_z += 12.0 * env * math.sin(u_t * math.pi * 2.0)
-                p["Eye L Smile"] = (min(1.0, max(p["Eye L Smile"][0], 0.92 * env)), 0.0)
-                p["Eye R Smile"] = (min(1.0, max(p["Eye R Smile"][0], 0.92 * env)), 0.0)
-                p["Sparkle Eyes"] = (min(1.0, max(p["Sparkle Eyes"][0], 1.0 * env)), 0.0)
-                p["Arm R Pose"] = (max(p["Arm R Pose"][0], env), 0.0)
-                p["Arm L Pose"] = (max(p["Arm L Pose"][0], env), 0.0)
+                _atleast("Eye L Smile", 0.92 * env)
+                _atleast("Eye R Smile", 0.92 * env)
+                _atleast("Sparkle Eyes", 1.0 * env)
+                _atleast("Arm R Pose", env)
+                _atleast("Arm L Pose", env)
                 p["Arm R Gesture"] = (0.45 * math.sin(u_t * math.pi * 6.0) * env, 0.0)
                 p["Arm L Gesture"] = (0.45 * math.sin(u_t * math.pi * 6.0 + 0.5) * env, 0.0)
+                _bump("Left Brow Y", 0.30 * env)
+                _bump("Right Brow Y", 0.30 * env)
                 em_glow_boost = 0.65 * env
             elif em_id == "shy_blush":
                 head_x -= 11.0 * env
@@ -751,20 +1282,26 @@ class RigController:
                 head_z += 11.0 * env
                 body_lean += 4.5 * env
                 p["EyeBall"] = (max(-1.0, eye_x - 0.35 * env), max(-1.0, eye_y - 0.28 * env))
-                p["Anime Blush Lines"] = (min(1.0, max(p["Anime Blush Lines"][0], 1.0 * env)), 0.0)
-                p["Eye L Smile"] = (min(1.0, max(p["Eye L Smile"][0], 0.55 * env)), 0.0)
-                p["Eye R Smile"] = (min(1.0, max(p["Eye R Smile"][0], 0.55 * env)), 0.0)
-                p["Brow L Y"] = (min(1.0, max(-1.0, p["Brow L Y"][0] - 0.25 * env)), 0.0)
-                p["Brow R Y"] = (min(1.0, max(-1.0, p["Brow R Y"][0] - 0.25 * env)), 0.0)
+                _atleast("Anime Blush Lines", 1.0 * env)
+                _atleast("Eye L Smile", 0.55 * env)
+                _atleast("Eye R Smile", 0.55 * env)
+                _bump("Left Brow Y", -0.25 * env)
+                _bump("Right Brow Y", -0.25 * env)
+                if self._has_brow_angle:
+                    _bump("Brow L Angle", 0.45 * env)
+                    _bump("Brow R Angle", 0.45 * env)
+                if self._has_cheek:
+                    _atleast("Cheek", 0.85 * env)
             elif em_id == "wink_wave":
                 head_z += 10.5 * env
                 head_x += 7.0 * env
                 p["Right Eye Open"] = (max(0.0, p["Right Eye Open"][0] * (1.0 - env)), 0.0)
-                p["Eye R Smile"] = (min(1.0, max(p["Eye R Smile"][0], 0.95 * env)), 0.0)
-                p["Eye L Smile"] = (min(1.0, max(p["Eye L Smile"][0], 0.55 * env)), 0.0)
-                p["Arm R Pose"] = (max(p["Arm R Pose"][0], env), 0.0)
-                p["Arm R Gesture"] = (0.30 + 0.55 * math.sin(u_t * math.pi * 6.0) * env, 0.0)
-                p["Sparkle Eyes"] = (min(1.0, max(p["Sparkle Eyes"][0], 0.75 * env)), 0.0)
+                _atleast("Eye R Smile", 0.95 * env)
+                _atleast("Eye L Smile", 0.55 * env)
+                _atleast("Arm R Pose", env)
+                p["Arm R Gesture"] = ((0.30 + 0.55 * math.sin(u_t * math.pi * 6.0)) * env, 0.0)
+                _atleast("Sparkle Eyes", 0.75 * env)
+                _bump("Left Brow Y", 0.22 * env)
                 em_glow_boost = 0.40 * env
             elif em_id == "gloom_shake":
                 shiver = math.sin(u_t * math.pi * 24.0) * env
@@ -772,99 +1309,118 @@ class RigController:
                 head_y -= 10.0 * env
                 body_y -= 4.0 * env
                 gloom_tgt = max(gloom_tgt, env)
-                p["Brow L Form"] = (-0.85 * env, 0.0)
-                p["Brow R Form"] = (-0.85 * env, 0.0)
+                p["Brow L Form"] = (-0.85 * env + p["Brow L Form"][0] * (1.0 - env), 0.0)
+                p["Brow R Form"] = (-0.85 * env + p["Brow R Form"][0] * (1.0 - env), 0.0)
+                _bump("Left Brow Y", -0.20 * env)
+                _bump("Right Brow Y", -0.20 * env)
+                if self._has_brow_angle:
+                    _bump("Brow L Angle", 0.70 * env)
+                    _bump("Brow R Angle", 0.70 * env)
                 em_glow_boost = -0.55 * env
             elif em_id == "curious_lean":
                 head_z -= 16.0 * env
                 head_y += 4.0 * env
                 body_lean += 7.5 * env
                 body_z -= 4.5 * env
-                p["Brow L Y"] = (min(1.0, p["Brow L Y"][0] + 0.55 * env), 0.0)
-                p["Brow R Y"] = (min(1.0, p["Brow R Y"][0] + 0.20 * env), 0.0)
+                _bump("Left Brow Y", 0.55 * env)
+                _bump("Right Brow Y", 0.20 * env)
+                if self._has_brow_angle:
+                    _bump("Brow R Angle", -0.25 * env)
                 em_glow_boost = 0.25 * env
             elif em_id == "chibi_pop":
                 chibi_tgt = max(chibi_tgt, env)
                 body_y += 5.5 * math.sin(u_t * math.pi * 3.0) * env
-                p["Sparkle Eyes"] = (min(1.0, max(p["Sparkle Eyes"][0], 0.90 * env)), 0.0)
+                _atleast("Sparkle Eyes", 0.90 * env)
                 em_glow_boost = 0.50 * env
             elif em_id == "pout_puff":
                 head_x += 12.0 * env
                 head_z -= 8.0 * env
-                p["Cheek Puff"] = (min(1.0, max(p["Cheek Puff"][0], 1.0 * env)), 0.0)
-                p["Anime Blush Lines"] = (min(1.0, max(p["Anime Blush Lines"][0], 0.65 * env)), 0.0)
-                p["Brow L Form"] = (-0.75 * env, 0.0)
-                p["Brow R Form"] = (-0.75 * env, 0.0)
-                p["VB Mouth"] = (-0.65 * env, p["VB Mouth"][1])
+                _atleast("Cheek Puff", 1.0 * env)
+                _atleast("Anime Blush Lines", 0.65 * env)
+                p["Brow L Form"] = (-0.75 * env + p["Brow L Form"][0] * (1.0 - env), 0.0)
+                p["Brow R Form"] = (-0.75 * env + p["Brow R Form"][0] * (1.0 - env), 0.0)
+                _bump("Left Brow Y", -0.30 * env)
+                _bump("Right Brow Y", -0.30 * env)
+                if self._has_brow_angle:
+                    _bump("Brow L Angle", -0.65 * env)
+                    _bump("Brow R Angle", -0.65 * env)
+                if self._has_cheek:
+                    _atleast("Cheek", 0.55 * env)
+                p["VB Mouth"] = (-0.65 * env + p["VB Mouth"][0] * (1.0 - env), p["VB Mouth"][1])
             elif em_id == "heart_sparkle":
                 head_y += 5.0 * env
                 head_z += 7.5 * math.sin(u_t * math.pi * 2.0) * env
-                p["Sparkle Eyes"] = (min(1.0, max(p["Sparkle Eyes"][0], 1.0 * env)), 0.0)
-                p["Anime Blush Lines"] = (min(1.0, max(p["Anime Blush Lines"][0], 0.85 * env)), 0.0)
-                p["Eye L Smile"] = (min(1.0, max(p["Eye L Smile"][0], 0.72 * env)), 0.0)
-                p["Eye R Smile"] = (min(1.0, max(p["Eye R Smile"][0], 0.72 * env)), 0.0)
+                _atleast("Sparkle Eyes", 1.0 * env)
+                _atleast("Anime Blush Lines", 0.85 * env)
+                _atleast("Eye L Smile", 0.72 * env)
+                _atleast("Eye R Smile", 0.72 * env)
+                if self._has_cheek:
+                    _atleast("Cheek", 0.7 * env)
                 em_glow_boost = 0.95 * env
-
             elif em_id == "greet_wave":
-                # Four big waves, head tilting into the wave, tiny happy bounce
                 wave = math.sin(u_t * math.pi * 8.0)
                 head_z += 8.0 * env + 2.5 * wave * env
                 head_x += 4.0 * env
                 body_y += 3.0 * abs(math.sin(u_t * math.pi * 4.0)) * env
                 body_z += 2.0 * env
-                p["Arm R Pose"] = (max(p["Arm R Pose"][0], env), 0.0)
-                p["Arm R Lift"] = (max(p["Arm R Lift"][0], 0.45 * env), 0.0)
+                _atleast("Arm R Pose", env)
+                _atleast("Arm R Lift", 0.45 * env)
                 p["Arm R Gesture"] = ((0.20 + 0.62 * wave) * env, 0.0)
-                p["Eye L Smile"] = (min(1.0, max(p["Eye L Smile"][0], 0.80 * env)), 0.0)
-                p["Eye R Smile"] = (min(1.0, max(p["Eye R Smile"][0], 0.80 * env)), 0.0)
-                p["Sparkle Eyes"] = (min(1.0, max(p["Sparkle Eyes"][0], 0.50 * env)), 0.0)
+                _atleast("Eye L Smile", 0.80 * env)
+                _atleast("Eye R Smile", 0.80 * env)
+                _atleast("Sparkle Eyes", 0.50 * env)
+                _bump("Left Brow Y", 0.25 * env)
+                _bump("Right Brow Y", 0.25 * env)
                 em_glow_boost = 0.45 * env
             elif em_id == "cheer_bounce":
-                bounce = abs(math.sin(u_t * math.pi * 5.0))
+                bnc = abs(math.sin(u_t * math.pi * 5.0))
                 pump = math.sin(u_t * math.pi * 10.0)
-                body_y += 9.0 * bounce * env
-                head_y += 7.0 * bounce * env
+                body_y += 9.0 * bnc * env
+                head_y += 7.0 * bnc * env
                 head_z += 6.0 * math.sin(u_t * math.pi * 2.5) * env
-                p["Arm R Pose"] = (max(p["Arm R Pose"][0], env), 0.0)
-                p["Arm L Pose"] = (max(p["Arm L Pose"][0], env), 0.0)
-                p["Arm R Lift"] = (max(p["Arm R Lift"][0], (0.55 + 0.25 * pump) * env), 0.0)
-                p["Arm L Lift"] = (max(p["Arm L Lift"][0], (0.55 - 0.25 * pump) * env), 0.0)
+                _atleast("Arm R Pose", env)
+                _atleast("Arm L Pose", env)
+                _atleast("Arm R Lift", (0.55 + 0.25 * pump) * env)
+                _atleast("Arm L Lift", (0.55 - 0.25 * pump) * env)
                 p["Arm R Gesture"] = (0.35 * pump * env, 0.0)
                 p["Arm L Gesture"] = (-0.35 * pump * env, 0.0)
-                p["Eye L Smile"] = (min(1.0, max(p["Eye L Smile"][0], 1.0 * env)), 0.0)
-                p["Eye R Smile"] = (min(1.0, max(p["Eye R Smile"][0], 1.0 * env)), 0.0)
-                p["Sparkle Eyes"] = (min(1.0, max(p["Sparkle Eyes"][0], 1.0 * env)), 0.0)
+                _atleast("Eye L Smile", 1.0 * env)
+                _atleast("Eye R Smile", 1.0 * env)
+                _atleast("Sparkle Eyes", 1.0 * env)
+                _bump("Left Brow Y", 0.35 * env)
+                _bump("Right Brow Y", 0.35 * env)
                 em_glow_boost = 0.80 * env
             elif em_id == "smug_tease":
-                # Asymmetric brow, squinty smirk, little "heh heh" bob, leaning back
                 heh = math.sin(u_t * math.pi * 6.0) * _smooth(u_t / 0.3) * (1.0 - _smooth((u_t - 0.5) / 0.3))
                 head_z -= 9.0 * env
                 head_x += 6.0 * env
                 head_y += 2.5 * heh * env
                 body_lean -= 3.0 * env
-                p["Brow L Y"] = (min(1.0, p["Brow L Y"][0] + 0.50 * env), 0.0)
-                p["Brow R Y"] = (max(-1.0, p["Brow R Y"][0] - 0.15 * env), 0.0)
-                p["Eye L Squint"] = (min(1.0, max(p["Eye L Squint"][0], 0.55 * env)), 0.0)
-                p["Eye R Squint"] = (min(1.0, max(p["Eye R Squint"][0], 0.55 * env)), 0.0)
-                p["Eye L Smile"] = (min(1.0, max(p["Eye L Smile"][0], 0.45 * env)), 0.0)
-                p["Eye R Smile"] = (min(1.0, max(p["Eye R Smile"][0], 0.45 * env)), 0.0)
-                if not speaking:
-                    p["VB Mouth"] = (max(p["VB Mouth"][0], 0.60 * env), p["VB Mouth"][1])
-                    p["Mouth X"] = (max(-1.0, min(1.0, p["Mouth X"][0] + 0.35 * env)), 0.0)
+                _bump("Left Brow Y", 0.50 * env)
+                _bump("Right Brow Y", -0.15 * env)
+                if self._has_brow_angle:
+                    _bump("Brow R Angle", -0.35 * env)
+                _atleast("Eye L Squint", 0.55 * env)
+                _atleast("Eye R Squint", 0.55 * env)
+                _atleast("Eye L Smile", 0.45 * env)
+                _atleast("Eye R Smile", 0.45 * env)
+                eq = env * quiet
+                p["VB Mouth"] = (p["VB Mouth"][0] + (max(p["VB Mouth"][0], 0.60) - p["VB Mouth"][0]) * eq, p["VB Mouth"][1])
+                p["Mouth X"] = (_clamp(p["Mouth X"][0] + 0.35 * eq, -1.0, 1.0), 0.0)
                 em_glow_boost = 0.20 * env
             elif em_id == "starry_awe":
                 head_y += 8.0 * env
                 head_z += 6.0 * math.sin(u_t * math.pi * 2.0) * env
                 body_lean -= 2.0 * env
                 p["EyeBall"] = (p["EyeBall"][0] * (1.0 - 0.6 * env), min(1.0, p["EyeBall"][1] + 0.45 * env))
-                p["Brow L Y"] = (min(1.0, p["Brow L Y"][0] + 0.70 * env), 0.0)
-                p["Brow R Y"] = (min(1.0, p["Brow R Y"][0] + 0.70 * env), 0.0)
-                p["Sparkle Eyes"] = (min(1.0, max(p["Sparkle Eyes"][0], 1.0 * env)), 0.0)
-                p["Anime Blush Lines"] = (min(1.0, max(p["Anime Blush Lines"][0], 0.35 * env)), 0.0)
-                if not speaking:
-                    p["VB Mouth"] = (-0.20 * env + p["VB Mouth"][0] * (1.0 - env), max(p["VB Mouth"][1], 0.32 * env))
-                    p["Mouth Funnel"] = (max(p["Mouth Funnel"][0], 0.45 * env), 0.0)
-                    p["Jaw Open"] = (max(p["Jaw Open"][0], 0.25 * env), 0.0)
+                _bump("Left Brow Y", 0.70 * env)
+                _bump("Right Brow Y", 0.70 * env)
+                _atleast("Sparkle Eyes", 1.0 * env)
+                _atleast("Anime Blush Lines", 0.35 * env)
+                eq = env * quiet
+                p["VB Mouth"] = (-0.20 * eq + p["VB Mouth"][0] * (1.0 - eq), max(p["VB Mouth"][1], 0.32 * eq))
+                p["Mouth Funnel"] = (max(p["Mouth Funnel"][0], 0.45 * eq), 0.0)
+                p["Jaw Open"] = (max(p["Jaw Open"][0], 0.25 * eq), 0.0)
                 em_glow_boost = 0.85 * env
             elif em_id == "flustered_shy":
                 shake = math.sin(u_t * math.pi * 18.0) * env
@@ -873,23 +1429,27 @@ class RigController:
                 head_y -= 9.0 * env
                 head_z += 7.0 * env
                 body_lean += 3.5 * env
-                p["EyeBall"] = (max(-1.0, min(1.0, 0.40 * dart * env + p["EyeBall"][0] * (1.0 - env))), max(-1.0, p["EyeBall"][1] - 0.25 * env))
-                p["Anime Blush Lines"] = (min(1.0, max(p["Anime Blush Lines"][0], 1.0 * env)), 0.0)
-                p["Eye L Squint"] = (min(1.0, max(p["Eye L Squint"][0], 0.50 * env)), 0.0)
-                p["Eye R Squint"] = (min(1.0, max(p["Eye R Squint"][0], 0.50 * env)), 0.0)
-                p["Cheek Puff"] = (min(1.0, max(p["Cheek Puff"][0], 0.35 * env)), 0.0)
+                p["EyeBall"] = (_clamp(0.40 * dart * env + p["EyeBall"][0] * (1.0 - env), -1.0, 1.0), max(-1.0, p["EyeBall"][1] - 0.25 * env))
+                _atleast("Anime Blush Lines", 1.0 * env)
+                _atleast("Eye L Squint", 0.50 * env)
+                _atleast("Eye R Squint", 0.50 * env)
+                _atleast("Cheek Puff", 0.35 * env)
                 p["Brow L Form"] = (-0.45 * env + p["Brow L Form"][0] * (1.0 - env), 0.0)
                 p["Brow R Form"] = (-0.45 * env + p["Brow R Form"][0] * (1.0 - env), 0.0)
-                p["Brow L Y"] = (min(1.0, p["Brow L Y"][0] + 0.30 * env), 0.0)
-                p["Brow R Y"] = (min(1.0, p["Brow R Y"][0] + 0.30 * env), 0.0)
-                p["Arm R Pose"] = (max(p["Arm R Pose"][0], env), 0.0)
-                p["Arm L Pose"] = (max(p["Arm L Pose"][0], env), 0.0)
+                _bump("Left Brow Y", 0.30 * env)
+                _bump("Right Brow Y", 0.30 * env)
+                if self._has_brow_angle:
+                    _bump("Brow L Angle", 0.55 * env)
+                    _bump("Brow R Angle", 0.55 * env)
+                if self._has_cheek:
+                    _atleast("Cheek", 1.0 * env)
+                _atleast("Arm R Pose", env)
+                _atleast("Arm L Pose", env)
                 p["Arm R Gesture"] = (0.30 * math.sin(u_t * math.pi * 14.0) * env, 0.0)
                 p["Arm L Gesture"] = (0.30 * math.sin(u_t * math.pi * 14.0 + 1.2) * env, 0.0)
                 em_glow_boost = 0.30 * env
             elif em_id == "sleepy_yawn":
-                # Phase 1 (0..0.55): stretch-yawn. Phase 2: droopy, heavy-lidded settle.
-                yawn = math.sin(math.pi * max(0.0, min(1.0, u_t / 0.55)))
+                yawn = math.sin(math.pi * _clamp(u_t / 0.55, 0.0, 1.0))
                 droop = _smooth((u_t - 0.45) / 0.25) * env
                 head_y += 7.0 * yawn * env - 6.0 * droop
                 head_z += 5.0 * droop
@@ -897,103 +1457,130 @@ class RigController:
                 lid = max(0.0, 1.0 - 0.85 * yawn * env - 0.50 * droop)
                 p["Left Eye Open"] = (p["Left Eye Open"][0] * lid, 0.0)
                 p["Right Eye Open"] = (p["Right Eye Open"][0] * lid, 0.0)
-                p["Eye L Squint"] = (min(1.0, max(p["Eye L Squint"][0], 0.60 * droop)), 0.0)
-                p["Eye R Squint"] = (min(1.0, max(p["Eye R Squint"][0], 0.60 * droop)), 0.0)
-                p["Brow L Y"] = (max(-1.0, p["Brow L Y"][0] - 0.35 * env), 0.0)
-                p["Brow R Y"] = (max(-1.0, p["Brow R Y"][0] - 0.35 * env), 0.0)
-                p["Arm R Pose"] = (max(p["Arm R Pose"][0], yawn * env), 0.0)
-                p["Arm L Pose"] = (max(p["Arm L Pose"][0], yawn * env), 0.0)
-                p["Arm R Lift"] = (max(p["Arm R Lift"][0], 0.50 * yawn * env), 0.0)
-                p["Arm L Lift"] = (max(p["Arm L Lift"][0], 0.50 * yawn * env), 0.0)
-                if not speaking:
-                    p["VB Mouth"] = (-0.10 * yawn * env + p["VB Mouth"][0] * (1.0 - yawn * env), max(p["VB Mouth"][1], 0.85 * yawn * env))
-                    p["Jaw Open"] = (max(p["Jaw Open"][0], 0.75 * yawn * env), 0.0)
-                    p["Mouth Funnel"] = (max(p["Mouth Funnel"][0], 0.35 * yawn * env), 0.0)
+                _atleast("Eye L Squint", 0.60 * droop)
+                _atleast("Eye R Squint", 0.60 * droop)
+                _bump("Left Brow Y", -0.35 * env)
+                _bump("Right Brow Y", -0.35 * env)
+                _atleast("Arm R Pose", yawn * env)
+                _atleast("Arm L Pose", yawn * env)
+                _atleast("Arm R Lift", 0.50 * yawn * env)
+                _atleast("Arm L Lift", 0.50 * yawn * env)
+                yq = yawn * env * quiet
+                p["VB Mouth"] = (-0.10 * yq + p["VB Mouth"][0] * (1.0 - yq), max(p["VB Mouth"][1], 0.85 * yq))
+                p["Jaw Open"] = (max(p["Jaw Open"][0], 0.75 * yq), 0.0)
+                p["Mouth Funnel"] = (max(p["Mouth Funnel"][0], 0.35 * yq), 0.0)
                 em_glow_boost = -0.25 * env
             elif em_id == "gentle_nod":
                 nod = math.sin(u_t * math.pi * 4.0) ** 2
                 head_y -= 6.0 * nod * env
                 head_z += 7.0 * env
                 body_lean += 2.0 * env
-                p["Eye L Smile"] = (min(1.0, max(p["Eye L Smile"][0], 0.50 * env)), 0.0)
-                p["Eye R Smile"] = (min(1.0, max(p["Eye R Smile"][0], 0.50 * env)), 0.0)
+                _atleast("Eye L Smile", 0.50 * env)
+                _atleast("Eye R Smile", 0.50 * env)
                 p["Brow L Form"] = (-0.30 * env + p["Brow L Form"][0] * (1.0 - env), 0.0)
                 p["Brow R Form"] = (-0.30 * env + p["Brow R Form"][0] * (1.0 - env), 0.0)
-                p["Brow L Y"] = (min(1.0, p["Brow L Y"][0] + 0.15 * env), 0.0)
-                p["Brow R Y"] = (min(1.0, p["Brow R Y"][0] + 0.15 * env), 0.0)
-                p["Anime Blush Lines"] = (min(1.0, max(p["Anime Blush Lines"][0], 0.30 * env)), 0.0)
+                _bump("Left Brow Y", 0.15 * env)
+                _bump("Right Brow Y", 0.15 * env)
+                if self._has_brow_angle:
+                    _bump("Brow L Angle", 0.30 * env)
+                    _bump("Brow R Angle", 0.30 * env)
+                _atleast("Anime Blush Lines", 0.30 * env)
                 em_glow_boost = 0.15 * env
 
-            # Re-apply updated head/body angles from emote clip
-            p["Angle"] = (max(-30.0, min(30.0, head_x)), max(-24.0, min(24.0, head_y)))
-            p["Angle Z"] = (max(-25.0, min(25.0, head_z)), 0.0)
-            p["Body Angle Y"] = (max(-10.0, min(10.0, body_y)), 0.0)
-            p["Body Angle Z"] = (max(-10.0, min(10.0, body_z)), 0.0)
-            p["Body Lean"] = (max(-10.0, min(10.0, body_lean)), 0.0)
+            p["Angle"] = (_clamp(head_x, -30.0, 30.0), _clamp(head_y, -24.0, 24.0))
+            p["Angle Z"] = (_clamp(head_z, -25.0, 25.0), 0.0)
+            p["Body Angle Y"] = (_clamp(body_y, -10.0, 10.0), 0.0)
+            p["Body Angle Z"] = (_clamp(body_z, -10.0, 10.0), 0.0)
+            p["Body Lean"] = (_clamp(body_lean, -10.0, 10.0), 0.0)
 
-        chibi_val = max(0.0, min(1.0, self.sp_chibi.step(chibi_tgt, dt, 12.0, 0.55)))
-        gloom_val = max(0.0, min(1.0, self.sp_gloom.step(gloom_tgt, dt, 10.0, 0.80)))
+        chibi_val = _clamp(self.sp_chibi.step(chibi_tgt, dt, 12.0, 0.55), 0.0, 1.0)
+        gloom_val = _clamp(self.sp_gloom.step(gloom_tgt, dt, 10.0, 0.80), 0.0, 1.0)
         if "Proportion (Chibi)" in p:
             p["Proportion (Chibi)"] = (chibi_val, 0.0)
         if "Gloom" in p:
             p["Gloom"] = (gloom_val, 0.0)
 
-        # Live GPU Emissive Glow (pulses subtly with breath, speech energy, sparkle eyes & emotes!)
-        em_base = max(0.0, min(2.0, float(rig_cfg.get("emissiveGlow", 1.0))))
-        em_tgt = max(0.0, min(2.0, em_base * (0.90 + 0.10 * math.sin(t_now * 2.4) + 0.30 * energy + 0.32 * p["Sparkle Eyes"][0] + em_glow_boost)))
-        em_val = max(0.0, min(2.0, self.sp_emissive.step(em_tgt, dt, 10.0, 0.85)))
+        em_base = _clamp(_ff(rig_cfg.get("emissiveGlow", 1.0), 1.0), 0.0, 2.0)
+        em_tgt = _clamp(em_base * (0.90 + 0.10 * (breath_val - 0.4) + 0.30 * energy + 0.32 * p["Sparkle Eyes"][0] + em_glow_boost), 0.0, 2.0)
+        em_val = _clamp(self.sp_emissive.step(em_tgt, dt, 10.0, 0.85), 0.0, 2.0)
         if "Emissive Glow" in p:
             p["Emissive Glow"] = (em_val, 0.0)
 
-        # 9.5 Coupled 60 FPS Underdamped Spring-Bounce (Bust XY + Eye Jelly)
-        if rig_cfg.get("physicsEnabled", True):
-            jiggle = max(0.0, min(2.5, float(rig_cfg.get("jiggleScale", 1.25))))
+        # 10.5 Physics-owned params: Inochi2D owns them while drivers run (the body / head / breath / arm-root
+        # motion above moves their anchors). Script fallback springs only while engine physics is OFF.
+        if not physics_on:
             inv_dt = 1.0 / max(0.008, min(0.05, dt))
             v_bx = (body_x - self._prev_body_x) * inv_dt
             v_by = (body_y - self._prev_body_y) * inv_dt
             v_br = (breath_val - self._prev_breath) * inv_dt
-            arm_sum = arm_r_pose + arm_l_pose + 0.5 * (arm_r_gest + arm_l_gest)
-            v_arm = (arm_sum - self._prev_arm_sum) * inv_dt
-            v_eo = (eye_open_r - self._prev_eye_open) * inv_dt
-            v_eye = math.hypot(eye_x - self._prev_eye_x, eye_y - self._prev_eye_y) * inv_dt
-
-            # Inject natural inertia impulses into underdamped springs (zeta=0.26 -> juicy Live2D bounce!)
-            self.sp_chest_y.v += jiggle * (v_by * 0.42 + v_br * 2.4 + abs(v_arm) * 0.48 + stress * 2.8) * dt * 16.0
-            self.sp_chest_x.v += jiggle * (-v_bx * 0.36 + (arm_r_gest - arm_l_gest) * 0.12 - v_arm * 0.22) * dt * 14.0
-            # Subtle eye jelly micro-settle on blink reopen & fast eye saccades (heavily damped by default)
-            eye_kick = (max(0.0, v_eo) * 0.10 + v_eye * 0.04) * min(1.0, jiggle)
-            self.sp_eye_jelly.v += eye_kick * dt * 10.0
-
+            self.sp_fb_chest_y.v += jiggle * (v_by * 0.42 + v_br * 2.4 + stress * 2.8) * dt * 16.0
+            self.sp_fb_chest_x.v += jiggle * (-v_bx * 0.36) * dt * 14.0
             cy_tgt = jiggle * (0.28 * (breath_val - 0.5) + 0.22 * energy * math.sin(t_now * 6.5))
             cx_tgt = jiggle * (-0.032 * body_x - 0.028 * body_z)
-            chest_y = max(-1.0, min(1.0, self.sp_chest_y.step(cy_tgt, dt, 15.5, 0.26)))
-            chest_x = max(-1.0, min(1.0, self.sp_chest_x.step(cx_tgt, dt, 13.5, 0.28)))
-            eye_j = max(-0.22, min(0.22, self.sp_eye_jelly.step(0.0, dt, 22.0, 0.78)))
+            if "Chest Y" in p:
+                p["Chest Y"] = (_clamp(self.sp_fb_chest_y.step(cy_tgt, dt, 15.5, 0.26), -1.0, 1.0), 0.0)
+            if "Chest X" in p:
+                p["Chest X"] = (_clamp(self.sp_fb_chest_x.step(cx_tgt, dt, 13.5, 0.28), -1.0, 1.0), 0.0)
+            if "Eye Jelly" in p:
+                p["Eye Jelly"] = (_clamp(0.6 * squash, -0.22, 0.22), 0.0)
+            if "Mouth Spring" in p and m_spring is not None:
+                p["Mouth Spring"] = (m_spring, 0.0)
+        self._prev_body_x = body_x
+        self._prev_body_y = body_y
+        self._prev_breath = breath_val
 
-            p["Chest Y"] = (chest_y, 0.0)
-            p["Chest X"] = (chest_x, 0.0)
-            p["Eye Jelly"] = (eye_j, 0.0)
-
-            self._prev_body_x = body_x
-            self._prev_body_y = body_y
-            self._prev_breath = breath_val
-            self._prev_arm_sum = arm_sum
-            self._prev_eye_open = eye_open_r
-            self._prev_eye_x = eye_x
-            self._prev_eye_y = eye_y
-
-        # 10. Apply raw user parameter overrides (from the All-91-Param Inspector)
+        # 11. Raw user overrides (finite-checked and clamped: a NaN must never reach the engine)
         overrides = rig_cfg.get("overrides") or {}
-        for pname, ov in overrides.items():
-            if pname in p and isinstance(ov, (list, tuple)) and len(ov) == 2:
-                p[pname] = (float(ov[0]), float(ov[1]))
+        if isinstance(overrides, dict):
+            for pname, ov in overrides.items():
+                if pname in p and isinstance(ov, (list, tuple)) and len(ov) == 2:
+                    ox, oy = _ff(ov[0], float("nan")), _ff(ov[1], float("nan"))
+                    if ox == ox and oy == oy:
+                        p[pname] = (_clamp(ox, -1000.0, 1000.0), _clamp(oy, -1000.0, 1000.0))
 
-        # 11. Fire Plugin Hooks (hot 60 FPS extensible layer!)
+        # 12. Plugin hooks
         frame_bundle = {"params": p, "camera": cam_cfg, "energy": energy, "stress": stress, "dt": dt, "time": t_now}
         self.hooks.emit_sync("on_frame_params", ctx, frame_bundle)
         self.hooks.emit_sync("on_shader_uniforms", ctx, shader_cfg)
 
+        # 13. Final guard: fold legacy names, warn once about unknown names, drop non-finite values
+        self._finalize_params(p)
+
         self.last_params = p
         self.last_shader = shader_cfg
         self.last_camera = cam_cfg
+        self.last_state = {
+            "interaction": istate, "mood": (round(mv, 3), round(ma, 3)), "gesture": self._gest_phase,
+            "gestureSide": self._gest_side, "breathSigh": self._breath_is_sigh, "blink": self._blink_kind if self._blink_active else "",
+            "pitchRel": round(pr, 3),
+        }
         return p, shader_cfg, cam_cfg
+
+    def _finalize_params(self, p: dict[str, tuple[float, float]]) -> None:
+        if len(p) != len(self.defaults):
+            for old, new in LEGACY_PARAM_ALIASES.items():
+                if old in p and new in self._known:
+                    ov = p.pop(old)
+                    try:
+                        dv = float(ov[0]) - self.defaults[new][0]     # plugins wrote "default + boost"
+                    except (TypeError, ValueError, IndexError):
+                        dv = 0.0
+                    if math.isfinite(dv):
+                        cur = p.get(new, self.defaults[new])
+                        p[new] = (_clamp(cur[0] + dv, -1.0, 1.0), cur[1])
+            unknown = [k for k in p if k not in self._known]
+            for k in unknown:
+                if k not in self._warned_unknown:
+                    self._warned_unknown.add(k)
+                    log.warning("RigController wrote parameter %r which the loaded rig does not have (dropped)", k)
+                p.pop(k, None)
+        isf = math.isfinite
+        for k, v in p.items():
+            try:
+                x, y = v
+                if isf(x) and isf(y):
+                    continue
+                d = self.defaults[k]
+                p[k] = (x if isf(x) else d[0], y if isf(y) else d[1])
+            except (TypeError, ValueError):
+                p[k] = self.defaults[k]

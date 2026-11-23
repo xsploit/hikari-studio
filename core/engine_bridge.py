@@ -57,6 +57,10 @@ class NativeEngineBridge:
         self._frame_started: float | None = None          # set while a frame round-trip is in flight
         self.stderr_tail: deque[str] = deque(maxlen=50)
         self.kills = 0
+        # Set once here and replaced only by a successful start(): an old engine's exiting stderr reader
+        # can never wipe the new engine's parameter list.
+        self.param_names: list[str] = []
+        self.param_index: dict[str, int] = {}
         self._watchdog = threading.Thread(target=self._watchdog_loop, daemon=True, name="engine-watchdog")
         self._watchdog.start()
 
@@ -88,8 +92,6 @@ class NativeEngineBridge:
                 self.stderr_tail.append(line.decode("utf-8", errors="replace").rstrip())
         except Exception:
             pass
-        self.param_names: list[str] = []
-        self.param_index: dict[str, int] = {}
 
     def start(self) -> None:
         with self._lock:

@@ -30,6 +30,7 @@ DEFAULT_EMBEDDING_MODEL = "openai/text-embedding-3-small"
 DEFAULT_GATEWAY_HEADERS = {"http-referer": "https://hikari.studio.local", "x-title": "Hikari Studio"}
 _BLOCKED_HEADERS = {"authorization", "content-type", "content-length", "host", "cookie"}
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")       # CR, LF, NUL, tabs, DEL: never allowed in a header
 
 
 class GatewayNotConfigured(RuntimeError):
@@ -138,10 +139,18 @@ def gateway_headers(cfg: dict[str, Any], key: str) -> dict[str, str]:
     headers = dict(DEFAULT_GATEWAY_HEADERS)
     extra = cfg.get("vercelHeaders")
     if isinstance(extra, dict):
-        for k, v in extra.items():
+        for k, v in list(extra.items())[:16]:
+            # CR / LF / NUL (and other control chars): a name containing one is dropped (never glued into a
+            # different header name); a value has them stripped. A pasted newline can never inject a header or
+            # make httpx reject every gateway call.
             k2 = str(k).strip().lower()
-            if k2 and k2 not in _BLOCKED_HEADERS and re.match(r"^[a-z0-9-]{1,64}$", k2):
-                headers[k2] = str(v)[:256]
+            if not k2 or _CTRL_RE.search(k2) or k2 in _BLOCKED_HEADERS or not re.fullmatch(r"[a-z0-9-]{1,64}", k2):
+                continue
+            if v is None or isinstance(v, (dict, list, tuple, bool)):
+                continue
+            v2 = _CTRL_RE.sub("", str(v)).strip()[:256]
+            if v2:
+                headers[k2] = v2
     headers["Content-Type"] = "application/json"
     if key:
         headers["Authorization"] = f"Bearer {key}"

@@ -17,6 +17,7 @@ from pathlib import Path
 import random
 import re
 import time
+from typing import Any
 import uuid
 
 import httpx
@@ -29,6 +30,9 @@ from modules.vercel_gateway import (
 )
 
 BRAIN_MODES = ("fish_duplex", "vercel_fish", "local_4b_fish")
+HISTORY_MAX_MESSAGES = 24
+HISTORY_MAX_CHARS = 16_000          # chat history budget by size, not just message count
+MAX_CHAT_CHARS = 4000               # longest accepted chat message
 
 # Hikari-chan's original personality, copied byte-for-byte from Waifu Studio
 # src/personality_catalog.rs (itself verbatim from WebWaifu4 createDefaultPersonas).
@@ -154,20 +158,25 @@ def parse_emotion_and_clean(text: str) -> tuple[str, str, dict]:
     return clean, tag, TAG_TO_STATE.get(tag, TAG_TO_STATE["happy"])
 
 
+def _has_word(text: str, *words: str) -> bool:
+    """Whole-word / whole-phrase match ('hi' never matches 'this', 'yo' never matches 'you')."""
+    return re.search(r"(?<![\w'])(?:" + "|".join(re.escape(w) for w in words) + r")(?![\w'])", text) is not None
+
+
 def offline_hikari_reply(user_msg: str) -> str:
     low = user_msg.lower().strip()
-    if any(w in low for w in ("hi", "hello", "hey", "yo", "sup", "morning", "evening")):
+    if _has_word(low, "hi", "hello", "hey", "yo", "sup", "morning", "evening"):
         return random.choice([
             "[wave] Hey! Welcome to my room! My real Fish Audio voice and sixty FPS VBridger rig are locked in and ready to go!",
             "[wave] Hi there! I'm all warmed up—try tweaking my shaders, visemes, or jumping into a live Fish Drama 3 call!",
         ])
-    if any(w in low for w in ("wave", "hand", "arm", "arms", "cheer")):
+    if _has_word(low, "wave", "hand", "arm", "arms", "cheer"):
         return "[cheer] Check out these rigid-bone arms—zero hand stretching, pure anime bounce! Both hands up for you!"
-    if any(w in low for w in ("fish", "voice", "sound", "talk")):
+    if _has_word(low, "fish", "voice", "sound", "talk"):
         return "[sparkle] Yep, I'm speaking with my real Fish Audio voice right now, and I also sync live to your Fish Drama 3 call on port 8766!"
-    if any(w in low for w in ("cute", "pretty", "love", "best", "good job", "fire", "sick", "clean")):
+    if _has_word(low, "cute", "pretty", "love", "best", "good job", "fire", "sick", "clean"):
         return "[blush] W-wait, really?! Hearing that makes my blush lines pop right out... thank you! Let's keep cooking!"
-    if any(w in low for w in ("pout", "angry", "mad", "hmph")):
+    if _has_word(low, "pout", "angry", "mad", "hmph"):
         return "[pout] Hmph! Don't tease me just because my cheek puff slider looks adorable!"
     return random.choice([
         "[sparkle] Ooh, I love that! Every syllable is driving my six-layer VBridger mouth and rigid arms live at sixty FPS!",
@@ -205,6 +214,7 @@ class AICompanion:
         self.gateway = VercelGateway(self.cfg)
         self.fish_tts = FishTtsStreamer(self.cfg, audio_dir)
         self.last_turn: dict = {}
+        self.last_error: str = ""
 
     @property
     def fish_key_ready(self) -> bool:
@@ -240,69 +250,123 @@ class AICompanion:
 
     def _push_user(self, user_message: str) -> None:
         self.history.append({"role": "user", "content": user_message})
-        if len(self.history) > 24:
-            self.history = self.history[-24:]
+        self._trim_history()
 
-    def _messages(self, context: str = "", merge_system: bool = False) -> list[dict[str, str]]:
-        """Verbatim persona first; recalled memories / dreams as a separate system note."""
-        if context and merge_system:
-            sys_msgs = [{"role": "system", "content": f"{self.persona}\n\n{context}"}]
-        else:
-            sys_msgs = [{"role": "system", "content": self.persona}]
-            if context:
-                sys_msgs.append({"role": "system", "content": context})
-        return [*sys_msgs, *self.history[-16:]]
+    def _trim_history(self) -> None:
+        """Keep <= HISTORY_MAX_MESSAGES and <= HISTORY_MAX_CHARS (oldest dropped first; latest always kept)."""
+        if len(self.history) > HISTORY_MAX_MESSAGES:
+            self.history = self.history[-HISTORY_MAX_MESSAGES:]
+        total = sum(len(m.get("content") or "") for m in self.history)
+        while len(self.history) > 1 and total > HISTORY_MAX_CHARS:
+            total -= len(self.history[0].get("content") or "")
+            self.history.pop(0)
 
-    def _llm_request(self, context: str) -> tuple[str, dict, dict]:
+    def _fail(self, message: str) -> str:
+        """A turn that could not be generated: nothing is spoken or remembered (no 'Couldn't reach...' line in
+        history / wake log); the unanswered user line is dropped so the next turn stays well-formed."""
+        self.last_error = message
+        if self.history and self.history[-1].get("role") == "user":
+            self.history.pop()
+        return ""
+
+    @staticmethod
+    def _split_context(context: Any) -> tuple[str, str]:
+        """str (legacy: dynamic block) or a PromptContext-like object with .pinned / .dynamic."""
+        if not context:
+            return "", ""
+        if isinstance(context, str):
+            return "", context
+        return str(getattr(context, "pinned", "") or ""), str(getattr(context, "dynamic", "") or "")
+
+    def _messages(self, context: Any = "", merge_system: bool = False) -> list[dict[str, str]]:
+        """Persona (verbatim) in the system role; pinned core facts as a separate quoted DATA block; the dynamic
+        context (now line, recalled notes, session hook) placed right before the latest user message, so
+        user-derived text never sits in the system role at the top. Local models get it prepended to the turn."""
+        pinned, dynamic = self._split_context(context)
+        hist = list(self.history[-16:])
+        if merge_system:
+            msgs = [{"role": "system", "content": self.persona + (f"\n\n{pinned}" if pinned else "")}, *hist]
+            if dynamic and msgs[-1]["role"] == "user":
+                msgs[-1] = {"role": "user", "content": f"{dynamic}\n\n{msgs[-1]['content']}"}
+            return msgs
+        msgs = [{"role": "system", "content": self.persona}]
+        if pinned:
+            msgs.append({"role": "system", "content": pinned})
+        if dynamic and hist and hist[-1]["role"] == "user":
+            return [*msgs, *hist[:-1], {"role": "system", "content": dynamic}, hist[-1]]
+        return [*msgs, *([{"role": "system", "content": dynamic}] if dynamic else []), *hist]
+
+    def _llm_request(self, context: Any) -> tuple[str, dict, dict]:
         if self.brain_mode == "local_4b_fish":
             return local_chat_request(self.cfg, self._messages(context, merge_system=True))
         return self.gateway.chat_request(self._messages(context), stream=True)
 
-    async def generate_reply(self, user_message: str, context: str = "") -> str:
-        """Text-only reply (TTS happens later in speak_text)."""
+    async def generate_reply(self, user_message: str, context: Any = "") -> str:
+        """Text-only reply (TTS happens later in speak_text). Returns "" (and sets last_error) on failure."""
         mode = self.brain_mode
+        self.last_error = ""
         self._push_user(user_message)
         if mode in ("vercel_fish", "local_4b_fish"):
+            where = "Vercel AI Gateway" if mode == "vercel_fish" else "the local 4B model"
             try:
                 endpoint, headers, payload = self._llm_request(context)
                 reply = (await complete_openai_compat(endpoint, headers, dict(payload, stream=False))).strip()
             except Exception as exc:
-                where = "Vercel AI Gateway" if mode == "vercel_fish" else "the local 4B model"
-                reply = f"[surprised] Couldn't reach {where} ({exc.__class__.__name__}). Check AI & Voice settings!"
+                return self._fail(f"Couldn't reach {where} ({exc.__class__.__name__}). Check AI & Voice settings!")
+            if not reply:
+                return self._fail(f"{where} returned an empty reply.")
             self.history.append({"role": "assistant", "content": reply})
+            self._trim_history()
             return reply
         return await self._generate_legacy(user_message, context)
 
-    async def generate_reply_with_voice(self, user_message: str, context: str = "") -> tuple[str, Path | None]:
+    async def generate_reply_with_voice(self, user_message: str, context: Any = "",
+                                        on_segment: Any = None) -> tuple[str, Path | None]:
         """Vercel / local 4B LLM streamed straight into Fish Speech TTS (sentence overlap).
-        Returns (reply_text, wav_path or None when Fish was unavailable)."""
+        With `on_segment(pcm, rate, text, index)` each sentence is handed over IN ORDER as soon as it is
+        synthesized (playback starts while later sentences are still being written); otherwise one WAV.
+        Returns (reply_text, wav_path or None). reply "" + last_error set = the turn failed (nothing to speak).
+        If the voice breaks mid-stream the LLM is still read to the end, so the reply is never cut off, and
+        last_turn["unvoiced"] holds the part that still needs speaking."""
+        self.last_error = ""
         self._push_user(user_message)
         mode = self.brain_mode
+        where = "Vercel AI Gateway" if mode == "vercel_fish" else "the local 4B model"
         t0 = time.perf_counter()
         streamed: list[str] = []
+        voiced: list[str] = []
         try:
             endpoint, headers, payload = self._llm_request(context)
         except Exception as exc:
-            reply = f"[surprised] Couldn't reach Vercel AI Gateway ({exc.__class__.__name__}). Check AI & Voice settings!"
-            self.history.append({"role": "assistant", "content": reply})
-            return reply, None
+            return self._fail(f"Couldn't reach {where} ({exc.__class__.__name__}). Check AI & Voice settings!"), None
 
         async def deltas():
             async for d in stream_openai_compat(endpoint, headers, payload):
                 streamed.append(d)
                 yield d
 
+        async def seg_cb(pcm: bytes, rate: int, text: str, idx: int) -> None:
+            await on_segment(pcm, rate, text, idx)
+            voiced.append(text)
+
+        gen = deltas()
         reply, wav, err = "", None, ""
         if self.cfg.get("ttsEnabled", True) and self.fish_tts.configured:
             try:
-                reply, pcm, rate = await self.fish_tts.speak_stream(deltas())
-                wav = await self.fish_tts.save_wav(pcm, rate)
+                reply, pcm, rate = await self.fish_tts.speak_stream(gen, on_segment=seg_cb if on_segment else None)
+                if on_segment is None:
+                    wav = await self.fish_tts.save_wav(pcm, rate)
             except Exception as exc:
                 err = exc.__class__.__name__
+                try:                                   # keep reading the LLM: the reply is never cut off
+                    async for _ in gen:
+                        pass
+                except Exception:
+                    pass
                 reply = "".join(streamed)
         else:
             try:
-                async for _ in deltas():
+                async for _ in gen:
                     pass
             except Exception as exc:
                 err = exc.__class__.__name__
@@ -313,23 +377,33 @@ class AICompanion:
             try:
                 reply = (await complete_openai_compat(endpoint, headers, dict(payload, stream=False))).strip()
             except Exception as exc:
-                where = "Vercel AI Gateway" if mode == "vercel_fish" else "the local 4B model"
-                reply = f"[surprised] Couldn't reach {where} ({exc.__class__.__name__}). Check AI & Voice settings!"
-        elif err and wav is None and streamed:
-            # Voice broke mid-stream: speak_text voices the text; nothing was played yet.
-            reply = (reply + find_overlapping_suffix(reply, "".join(streamed))).strip()
+                return self._fail(f"Couldn't reach {where} ({exc.__class__.__name__}). Check AI & Voice settings!"), None
+            if not reply:
+                return self._fail(f"{where} returned an empty reply."), None
         self.history.append({"role": "assistant", "content": reply})
+        self._trim_history()
+        voiced_text = " ".join(voiced).strip()
+        unvoiced = ""
+        if on_segment is not None:
+            spoken = clean_for_speech(reply)
+            if not voiced_text:
+                unvoiced = spoken
+            elif err:
+                unvoiced = find_overlapping_suffix(voiced_text, spoken).strip()
         self.last_turn = {"brainMode": mode, "ms": round((time.perf_counter() - t0) * 1000.0, 1),
-                          "voicedInline": wav is not None, "error": err, "tts": dict(self.fish_tts.last_stats)}
+                          "voicedInline": wav is not None or (bool(voiced) and not unvoiced), "segmented": on_segment is not None,
+                          "segments": len(voiced), "voicedText": voiced_text, "unvoiced": unvoiced,
+                          "error": err, "tts": dict(self.fish_tts.last_stats)}
         return reply, wav
 
-    async def _generate_legacy(self, user_message: str, context: str = "") -> str:
+    async def _generate_legacy(self, user_message: str, context: Any = "") -> str:
         provider = str(self.cfg.get("provider", "offline")).lower()
 
         if provider == "offline":
             await asyncio.sleep(0.10)
             reply = offline_hikari_reply(user_message)
             self.history.append({"role": "assistant", "content": reply})
+            self._trim_history()
             return reply
 
         base_url = str(self.cfg.get("baseUrl") or "").rstrip("/")
@@ -364,8 +438,11 @@ class AICompanion:
             data = r.json()
             reply = data["choices"][0]["message"]["content"].strip()
         except Exception as exc:
-            reply = f"[surprised] Couldn't reach {provider} at {base_url} ({exc.__class__.__name__}). Check AI & Voice settings!"
+            return self._fail(f"Couldn't reach {provider} at {base_url} ({exc.__class__.__name__}). Check AI & Voice settings!")
+        if not reply:
+            return self._fail(f"{provider} returned an empty reply.")
         self.history.append({"role": "assistant", "content": reply})
+        self._trim_history()
         return reply
 
     # ------------------------------------------------------------------ TTS (classic path)

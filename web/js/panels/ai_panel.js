@@ -56,6 +56,8 @@ const DECISION_MODE_DESC = {
   jev: 'Typesafe Jev via the Vercel AI Gateway',
 };
 const GATEWAY_MODES = new Set(['auto', 'gateway', 'pplx', 'luna', 'jev']);
+// Keys whose change can flip the gateway status / active decider.
+const GATEWAY_KEY_FIELDS = new Set(['vercelApiKey', 'cloudflareAccountId', 'cloudflareApiToken', 'perplexityApiKey']);
 
 const DEFAULT_EVAL_MODEL = 'perplexity/pplx-decider-flash-v1.3';
 const FALLBACK_EVAL_MODELS = [
@@ -68,9 +70,10 @@ const FALLBACK_EVAL_MODELS = [
 ];
 
 // GET /api/deciders/models — fetched only while the Voice & Brain tab renders (cached 30 s, no timers).
-const deciders = { models: null, gatewayConfigured: null, activeModel: '', fetchedAt: 0, loading: false, error: '' };
+const deciders = { models: null, gatewayConfigured: null, activeModel: '', activeMode: '', fetchedAt: 0, loading: false, error: '', queued: false };
 async function loadDeciders(store, force = false) {
-  if (deciders.loading || (!force && Date.now() - deciders.fetchedAt < 30000)) return;
+  if (deciders.loading) { if (force) deciders.queued = true; return; } // re-run once the in-flight fetch finishes
+  if (!force && Date.now() - deciders.fetchedAt < 30000) return;
   deciders.loading = true;
   try {
     const r = await fetch('/api/deciders/models', { cache: 'no-store' });
@@ -80,14 +83,21 @@ async function loadDeciders(store, force = false) {
     deciders.models = list.length ? list : null;
     deciders.gatewayConfigured = typeof d?.gatewayConfigured === 'boolean' ? d.gatewayConfigured : null;
     deciders.activeModel = String(d?.activeModel || '');
+    deciders.activeMode = String(d?.activeMode || '');
     deciders.error = '';
   } catch (err) {
     deciders.error = err.message || 'unavailable';
   } finally {
     deciders.loading = false;
     deciders.fetchedAt = Date.now();
+    if (deciders.queued) { deciders.queued = false; loadDeciders(store, true); return; }
     if (store.activeTab === 'voice') store.rerenderPanel();
   }
+}
+
+/** Re-check the gateway right after a key changes (one-shot, after the patch has reached the server). */
+function refreshDecidersSoon(store) {
+  setTimeout(() => loadDeciders(store, true), 400);
 }
 
 const TTS = [
@@ -113,9 +123,21 @@ export function renderAiPanel(store) {
     const input = textIn({
       type, autocomplete: 'off', 'aria-label': label,
       placeholder: isSet ? 'Saved — type to replace' : blankHint,
-      onchange: (e) => { const v = e.target.value.trim(); if (v) { set({ [field]: v }); e.target.value = ''; store.rerenderPanel(); } },
+      onchange: (e) => {
+        const v = e.target.value.trim();
+        if (!v) return;
+        set({ [field]: v });
+        e.target.value = '';
+        if (GATEWAY_KEY_FIELDS.has(field)) refreshDecidersSoon(store);
+        store.rerenderPanel();
+      },
     });
-    return isSet ? [input, btn('Clear', () => { set({ [field]: null }); store.rerenderPanel(); })] : input;
+    const clear = () => {
+      set({ [field]: null });
+      if (GATEWAY_KEY_FIELDS.has(field)) refreshDecidersSoon(store);
+      store.rerenderPanel();
+    };
+    return isSet ? [input, btn('Clear', clear)] : input;
   };
 
   const callState = fc?.connecting ? 'connecting' : (fc?.connected ? 'live' : 'idle');
@@ -161,6 +183,9 @@ export function renderAiPanel(store) {
   const evalModel = ai.gatewayEvalModel || DEFAULT_EVAL_MODEL;
   const evalItems = withCurrent(evalModels.map((m) => [m.id, m.label || m.id]), evalModel);
   const evalInfo = evalModels.find((m) => m.id === evalModel);
+  // A leftover "Custom decision model" silently beats the Evaluation model dropdown in gateway modes — surface it.
+  const overrideActive = Boolean((ai.decisionModel || '').trim()) && (decMode === 'auto' || decMode === 'gateway')
+    && ai.decisionModel.trim() !== evalModel;
   // Prefer the server's answer; otherwise a saved override implies a key (env key presence is unknown client-side).
   const gwReady = deciders.gatewayConfigured ?? (ai.vercelApiKey ? true : null);
   const gatewayStatusRow = row({
@@ -258,7 +283,22 @@ export function renderAiPanel(store) {
     ]),
 
     group('Decision Engine', [
-      row({ title: 'Decision engine', desc: DECISION_MODE_DESC[decMode] || 'Custom decider mode', control: modeSelect }),
+      row({
+        title: 'Decision engine',
+        desc: `${DECISION_MODE_DESC[decMode] || 'Custom decider mode'}${brainMode === 'fish_duplex' && decMode === 'auto' ? ' · live Fish calls only use deciders fast enough for real time' : ''}`,
+        control: modeSelect,
+      }),
+      deciders.activeModel ? row({
+        title: 'Active decider',
+        desc: `What is actually deciding right now${deciders.activeMode ? ` · ${deciders.activeMode} mode` : ''}`,
+        control: el('code', { class: 'model-chip', text: deciders.activeModel, title: deciders.activeModel }),
+      }) : null,
+      overrideActive ? row({
+        title: 'Custom model override is active',
+        desc: `“${ai.decisionModel}” overrides the dropdown — clear it to use ${evalModel}`,
+        cls: 'warn-row',
+        control: btn('Clear override', () => { set({ decisionModel: '' }); refreshDecidersSoon(store); store.rerenderPanel(); }),
+      }) : null,
       GATEWAY_MODES.has(decMode) ? gatewayStatusRow : null,
       (decMode === 'auto' || decMode === 'gateway') ? row({
         title: 'Evaluation model',
@@ -302,10 +342,13 @@ export function renderAiPanel(store) {
     ], { desc: 'How Hikari decides what to feel and do' }),
 
     group('Speech Body Language', [
-      toggle({ label: 'Gesture while speaking', desc: 'Raise and move arms automatically during speech', checked: rig.autoGestureOnSpeech, onChange: (v) => store.patch('rig', { autoGestureOnSpeech: v }) }),
+      toggle({
+        label: 'Talking gestures', desc: 'Relaxed, bent arms move naturally while she speaks (also in Motion → Arms)',
+        checked: rig.autoGestureOnSpeech ?? true, onChange: (v) => store.patch('rig', { autoGestureOnSpeech: v }),
+      }),
       slider({ label: 'Speech → head nod', min: 0, max: 1.5, step: 0.05, value: ls.speechToHeadNod ?? 0.8, def: 0.80, onInput: (v) => store.patch('lipsync', { speechToHeadNod: v }) }),
       slider({ label: 'Speech → eyebrow lift', min: 0, max: 1.5, step: 0.05, value: ls.speechToBrows ?? 0.72, def: 0.72, onInput: (v) => store.patch('lipsync', { speechToBrows: v }) }),
-      slider({ label: 'Speech → arm gesture', min: 0, max: 1.5, step: 0.05, value: ls.speechToArmGesture ?? 0.85, def: 0.85, onInput: (v) => store.patch('lipsync', { speechToArmGesture: v }) }),
+      slider({ label: 'Talking gesture intensity', desc: 'How much speech moves her arms', min: 0, max: 1.5, step: 0.05, value: ls.speechToArmGesture ?? 0.85, def: 0.85, onInput: (v) => store.patch('lipsync', { speechToArmGesture: v }) }),
     ]),
 
     group('Personality & Memory', [

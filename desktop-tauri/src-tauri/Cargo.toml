@@ -10,7 +10,7 @@ tauri-build = { version = "2", default-features = false }
 
 [dependencies]
 tauri = { version = "2", default-features = false, features = ["wry", "common-controls-v6", "tray-icon", "image-png", "custom-protocol"] }
-tokio = { version = "1", default-features = false, features = ["process", "net", "time", "io-util", "fs"] }
+tokio = { version = "1", default-features = false, features = ["process", "net", "time", "io-util", "fs", "rt", "sync", "macros"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }

@@ -66,8 +66,16 @@ def sanitize_ai_brain_patch(values: dict[str, Any]) -> dict[str, Any]:
     if "deciderRoute" in out:
         r = str(out["deciderRoute"] or "").lower()
         out["deciderRoute"] = r if r in ("auto", "gateway", "direct") else "auto"
-    if "vercelHeaders" in out and not isinstance(out["vercelHeaders"], dict):
-        out["vercelHeaders"] = {}
+    if "vercelHeaders" in out:
+        out["vercelHeaders"] = sanitize_headers(out["vercelHeaders"])
+    if "gatewayEvalModel" in out:
+        out["gatewayModelSource"] = "gatewayEvalModel"          # the dropdown was the last explicit choice
+    elif "decisionModel" in out:
+        from modules.decision_engine import is_eval_model_id as _is_eval
+        if _is_eval(str(out.get("decisionModel") or "").strip()):
+            out["gatewayModelSource"] = "decisionModel"
+    if "gatewayModelSource" in out and out["gatewayModelSource"] not in ("gatewayEvalModel", "decisionModel"):
+        out["gatewayModelSource"] = "gatewayEvalModel"
     for k in ("vercelModel", "vercelEmbeddingModel", "localModel", "localBaseUrl", "localLoraPath",
               "clefModel", "pplxModel", "jevModel", "lunaModel", "decisionModel"):
         if k in out:
@@ -88,6 +96,168 @@ def sanitize_ai_brain_patch(values: dict[str, Any]) -> dict[str, Any]:
     for k in INTERNAL_AI_FIELDS:
         out.pop(k, None)
     return out
+
+
+_HEADER_NAME_RE = __import__("re").compile(r"^[a-z0-9-]{1,64}$")
+
+
+def sanitize_headers(value: Any) -> dict[str, str]:
+    """Extra gateway headers: lowercase token names, no CR / LF / NUL anywhere (header injection), <= 8."""
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in value.items():
+        name = str(k).strip().lower()
+        val = str(v) if isinstance(v, (str, int, float)) and not isinstance(v, bool) else ""
+        if not _HEADER_NAME_RE.match(name) or any(c in name + val for c in "\r\n\x00"):
+            continue
+        out[name] = val.strip()[:256]
+        if len(out) >= 8:
+            break
+    return out
+
+
+# ----------------------------------------------------------------------------- frame-safe section patches
+# rig / camera / shader / stage / visemes feed the 60 FPS loop. Every value is type-checked against the default
+# config; numbers must be finite and are clamped, so a bad patch (NaN, Inf, "abc", huge values) can never break
+# a frame or be persisted by "Save".
+import math as _math
+
+_NUM_LIMITS: dict[tuple[str, str], tuple[float, float]] = {
+    ("camera", "scale"): (0.2, 6.0), ("camera", "x"): (-4000.0, 4000.0), ("camera", "y"): (-4000.0, 4000.0),
+    ("stage", "avatarScale"): (0.2, 4.0), ("stage", "avatarX"): (-2.0, 3.0), ("stage", "avatarY"): (-2.0, 2.0),
+    ("stage", "roomBlur"): (0.0, 40.0), ("stage", "roomDim"): (0.0, 1.0), ("stage", "parallax"): (0.0, 4.0),
+    ("shader", "keyAngle"): (-720.0, 720.0),
+    ("rig", "jiggleScale"): (0.0, 2.5), ("rig", "emissiveGlow"): (0.0, 2.0), ("rig", "chibiMode"): (0.0, 1.0),
+    ("rig", "gloom"): (0.0, 1.0), ("rig", "blinkRate"): (0.05, 6.0), ("rig", "breathAmp"): (0.0, 3.0),
+    ("rig", "idleSway"): (0.0, 3.0), ("rig", "mouseLookStrength"): (0.0, 2.0), ("rig", "autoGazeLiveliness"): (0.0, 3.0),
+}
+_SECTION_DEFAULT_LIMIT: dict[str, tuple[float, float]] = {
+    "shader": (-10.0, 10.0), "rig": (-100.0, 100.0), "camera": (-4000.0, 4000.0), "stage": (-100.0, 100.0),
+}
+_COLOR_KEYS = {"keyColor", "fillColor", "tint", "ambientColor"}
+_HEX_RE = __import__("re").compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def _finite_number(v: Any) -> float | None:
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        f = float(v)
+    elif isinstance(v, str):
+        try:
+            f = float(v.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    return f if _math.isfinite(f) else None
+
+
+def _scalar(sec: str, key: str, v: Any) -> tuple[bool, Any]:
+    """Accept an unknown key's value only if it is a safe scalar (finite number / bool / short string)."""
+    if isinstance(v, bool):
+        return True, v
+    if isinstance(v, (int, float)):
+        f = _finite_number(v)
+        if f is None:
+            return False, None
+        lo, hi = _SECTION_DEFAULT_LIMIT.get(sec, (-1e4, 1e4))
+        return True, max(lo, min(hi, f))
+    if isinstance(v, str) and len(v) <= 500:
+        return True, v
+    if v is None:
+        return True, None
+    return False, None
+
+
+def sanitize_overrides(value: Any) -> dict[str, Any]:
+    """rig.overrides {param: [x, y] | null}: finite numbers only, clamped, <= 128 params."""
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for name, ov in list(value.items())[:128]:
+        if not isinstance(name, str) or not name or len(name) > 64:
+            continue
+        if ov is None:
+            out[name] = None
+            continue
+        if isinstance(ov, (list, tuple)) and len(ov) == 2:
+            a, b = _finite_number(ov[0]), _finite_number(ov[1])
+            if a is not None and b is not None:
+                out[name] = [max(-1000.0, min(1000.0, a)), max(-1000.0, min(1000.0, b))]
+    return out
+
+
+def sanitize_section(sec: str, values: Any, template: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Validate a rig / camera / shader / stage / visemes patch against the default config's types."""
+    if not isinstance(values, dict):
+        return {}
+    if sec == "visemes":
+        out_v: dict[str, Any] = {}
+        for code, axes in values.items():
+            if isinstance(code, str) and len(code) <= 4 and isinstance(axes, dict):
+                clean = {}
+                for ax, v in axes.items():
+                    if ax == "label" and isinstance(v, str):
+                        clean[ax] = v[:60]
+                        continue
+                    f = _finite_number(v)
+                    if f is not None and isinstance(ax, str) and len(ax) <= 16:
+                        clean[ax] = max(-2.0, min(2.0, f))
+                if clean:
+                    out_v[code] = clean
+        return out_v
+    tpl = template if template is not None else (default_config().get(sec) or {})
+    out: dict[str, Any] = {}
+    for k, v in values.items():
+        if not isinstance(k, str) or not k or len(k) > 64:
+            continue
+        if sec == "rig" and k == "overrides":
+            out[k] = sanitize_overrides(v)
+            continue
+        if k not in tpl:
+            if isinstance(v, dict):                       # forward-compat: new nested settings, scalars only
+                sub = {str(a): _scalar(sec, str(a), b) for a, b in list(v.items())[:64] if isinstance(a, str) and len(a) <= 64}
+                out[k] = {a: r[1] for a, r in sub.items() if r[0]}
+                continue
+            ok, val = _scalar(sec, k, v)
+            if ok:
+                out[k] = val
+            continue
+        d = tpl[k]
+        if isinstance(d, bool):
+            f = _finite_number(v) if not isinstance(v, bool) else None
+            if isinstance(v, bool):
+                out[k] = v
+            elif f is not None:
+                out[k] = bool(f)
+        elif isinstance(d, (int, float)):
+            f = _finite_number(v)
+            if f is None:
+                continue                                   # NaN / Inf / "abc" / null -> dropped
+            lo, hi = _NUM_LIMITS.get((sec, k), _SECTION_DEFAULT_LIMIT.get(sec, (-1e4, 1e4)))
+            out[k] = max(lo, min(hi, f))
+        elif isinstance(d, str):
+            if not isinstance(v, str):
+                continue
+            if k in _COLOR_KEYS and not _HEX_RE.match(v):
+                continue
+            if sec == "rig" and k == "expression" and v not in EXPRESSION_PRESETS:
+                continue
+            out[k] = v[:500]
+        elif isinstance(d, dict):
+            if isinstance(v, dict):
+                out[k] = {kk: vv for kk, vv in ((str(a), _scalar(sec, str(a), b)) for a, b in v.items()) if vv[0]}
+                out[k] = {kk: vv[1] for kk, vv in out[k].items()}
+        else:
+            ok, val = _scalar(sec, k, v)
+            if ok:
+                out[k] = val
+    return out
+
+
+FRAME_SECTIONS = ("stage", "camera", "shader", "rig", "visemes")
 
 
 def sanitize_memory_patch(values: dict[str, Any]) -> dict[str, Any]:
@@ -344,6 +514,9 @@ class ConfigStore:
             try:
                 saved = json.loads(self.path.read_text(encoding="utf-8"))
                 if isinstance(saved, dict):
+                    for sec in FRAME_SECTIONS:                # a bad value already on disk can't break frames
+                        if isinstance(saved.get(sec), dict):
+                            saved[sec] = sanitize_section(sec, saved[sec], self.data.get(sec) if sec != "visemes" else None)
                     _deep_merge(self.data, saved)
             except Exception:
                 pass

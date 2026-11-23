@@ -61,6 +61,15 @@ export function renderRigPanel(store) {
         items: ARM_PRESETS.map(([id, lbl]) => [id, lbl]), active: curArm,
         onPick: (id) => { set(ARM_PRESETS.find((p) => p[0] === id)[2]); store.rerenderPanel(); },
       }),
+      toggle({
+        label: 'Talking gestures', desc: 'Relaxed, bent arms move naturally while she speaks',
+        checked: rig.autoGestureOnSpeech ?? true, onChange: (v) => set({ autoGestureOnSpeech: v }),
+      }),
+      slider({
+        label: 'Talking gesture intensity', min: 0, max: 1.5, step: 0.05,
+        value: (store.config.lipsync || {}).speechToArmGesture ?? 0.85, def: 0.85,
+        onInput: (v) => store.patch('lipsync', { speechToArmGesture: v }),
+      }),
       more({ id: 'motion.arms.more', title: 'Fine-tune arms', desc: 'Gesture and shoulder lift per side' }, [
         rs('Right gesture', 'armRGesture', -0.48, 0.92, 0.02, 0),
         rs('Right shoulder lift', 'armRLift', -0.7, 0.8, 0.02, 0),

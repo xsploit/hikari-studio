@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import io
 import json
+import logging
+import math
 from pathlib import Path
 import struct
 from typing import Any
@@ -25,6 +27,8 @@ from core.texture_upscaler import (
 )
 
 from core.wardrobe import SHOE_TEXTURES, TOP_TEXTURE, Wardrobe
+
+log = logging.getLogger("hikari.customizer")
 
 DEFAULT_VRM_PATH = Path(r"D:\Waifu Studio\assets\characters\models\a4f45d37bdbb-hikari-refined.vrm")
 ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
@@ -1225,6 +1229,434 @@ def _attach_wraparound_collar(
     return header[:8] + len(content).to_bytes(4, "big") + content
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# 3-bone articulated resting arms, sliced straight out of assets/hd_parts/arm_right_hd.png (no new art).
+# ---------------------------------------------------------------------------------------------------------------
+_TEX_NONE = 4294967295
+# Node uuids: R arm 53000.., L arm 53010..; parameter uuids 53100..
+REST_ARM_NODES = {
+    "R": {"shoulder": 53000, "upper": 53001, "elbow": 53002, "forearm": 53003, "wrist": 53004, "hand": 53005},
+    "L": {"shoulder": 53010, "upper": 53011, "elbow": 53012, "forearm": 53013, "wrist": 53014, "hand": 53015},
+}
+REST_ARM_PARAMS = {
+    "Rest Arm R Shoulder": 53100, "Rest Arm R Elbow": 53101, "Rest Arm R Wrist": 53102,
+    "Rest Arm L Shoulder": 53103, "Rest Arm L Elbow": 53104, "Rest Arm L Wrist": 53105,
+    "Arm R Elbow": 53110, "Arm R Wrist": 53111, "Arm L Elbow": 53112, "Arm L Wrist": 53113,
+}
+# Draw order (higher zsort = further back). Upper arm tucks just behind ArtMeshTopwear (-7.0) so the deltoid stays
+# under the strap; forearm + hand sit in front of the top/skirt (a bent hand can rest in front of the body) and
+# behind the footwear (-8.0) / face.
+REST_ARM_Z = {
+    "R": {"upper": -6.94, "forearm": -7.56, "hand": -7.64},
+    "L": {"upper": -6.97, "forearm": -7.58, "hand": -7.66},
+}
+_REST_SEGMENT_FEATHER_PX = 8.0       # soft overlap where the next bone covers the previous one (HD texture px)
+_REST_OUTLINE_PX = 3.2               # matches the 3 px warm-brown lineart of arm_right_hd.png
+
+
+def _deg(v: float) -> float:
+    return float(np.deg2rad(v))
+
+
+def _analyze_rest_arm(rgba: np.ndarray) -> dict[str, Any]:
+    """Find shoulder / elbow / wrist pivots (texture px) on the resting-arm art from its alpha medial axis.
+    Elbow & wrist = narrowest medial points (anatomical joints); each gets the largest round cap that fits inside
+    the silhouette, so the rest pose renders pixel-identical to the original art."""
+    a = rgba[..., 3].astype(np.float32) / 255.0
+    h, w = a.shape
+    dist = cv2.distanceTransform((a > 0.5).astype(np.uint8), cv2.DIST_L2, 5)
+
+    def medial(y0: int, y1: int, pick_min: bool) -> tuple[float, float, float]:
+        y0, y1 = max(0, y0), min(h, y1)
+        rows = dist[y0:y1]
+        row_max = rows.max(axis=1)
+        k = cv2.GaussianBlur(row_max.reshape(-1, 1), (1, 0), 6.0).ravel() if len(row_max) > 12 else row_max
+        iy = int(np.argmin(k) if pick_min else np.argmax(k))
+        ix = int(np.argmax(rows[iy]))
+        return float(ix) + 0.5, float(y0 + iy) + 0.5, float(rows[iy, ix])
+
+    ex, ey, er = medial(int(0.30 * h), int(0.50 * h), True)
+    wx, wy, wr = medial(int(0.66 * h), int(0.82 * h), True)
+    # Shoulder pivot: medial point near the top of the deltoid (where the raised-arm root sits on the trapezius).
+    sy = int(0.073 * h)
+    sx = float(np.argmax(dist[sy])) + 0.5
+    # Hand tip: centroid of the lowest 6% of opaque pixels (sets the hand axis for the wrist cut).
+    ys, xs = np.nonzero(a > 0.5)
+    low = ys > (ys.max() - 0.06 * h)
+    tx, ty = float(xs[low].mean()) + 0.5, float(ys[low].mean()) + 0.5
+
+    def unit(dx: float, dy: float) -> np.ndarray:
+        v = np.array([dx, dy], dtype=np.float64)
+        return v / max(1e-6, float(np.linalg.norm(v)))
+
+    up_dir = unit(ex - sx, ey - sy)
+    fo_dir = unit(wx - ex, wy - ey)
+    ha_dir = unit(tx - wx, ty - wy)
+    bg_y, bg_x = np.nonzero(a <= 0.5)
+    bg_px, bg_py = bg_x.astype(np.float64) + 0.5, bg_y.astype(np.float64) + 0.5
+
+    def cap_radii(cx: float, cy: float, axis: np.ndarray, fallback: float) -> tuple[float, float]:
+        """Largest cap radius that stays inside the silhouette on each side of the bone axis (+perp / -perp):
+        the elbow crease side and the convex side are not equally wide."""
+        perp = np.array([axis[1], -axis[0]])
+        dx, dy = bg_px - cx, bg_py - cy
+        d = np.hypot(dx, dy)
+        side = dx * perp[0] + dy * perp[1]
+        near = d < 4.0 * fallback + 40.0
+        r_pos = float(d[near & (side > 0)].min()) if np.any(near & (side > 0)) else fallback
+        r_neg = float(d[near & (side <= 0)].min()) if np.any(near & (side <= 0)) else fallback
+        return max(6.0, r_pos - 0.8), max(6.0, r_neg - 0.8)
+
+    e_axis = unit(*(up_dir + fo_dir))
+    w_axis = unit(*(fo_dir + ha_dir))
+    return {
+        "size": (w, h),
+        "shoulder": (sx, float(sy) + 0.5),
+        "elbow": (ex, ey), "elbow_axis": e_axis, "elbow_r": cap_radii(ex, ey, e_axis, er),
+        "wrist": (wx, wy), "wrist_axis": w_axis, "wrist_r": cap_radii(wx, wy, w_axis, wr),
+    }
+
+
+def _slice_rest_arm(rgba: np.ndarray, geo: dict[str, Any]) -> dict[str, tuple[np.ndarray, tuple[int, int, int, int]]]:
+    """Cut the arm into overlapping upper / forearm / hand segments.
+    - upper keeps a round cap (disc) at the elbow, forearm a round cap at the wrist: the cap is rotation-invariant
+      about the pivot, so bending never opens a gap or notch;
+    - the hidden lower half of each cap carries a painted lineart arc (sampled outline colour) that only shows on
+      the convex side of a bend, giving a clean round elbow / wrist contour;
+    - the next segment fades in over a few px across the cut so there is never a dark seam.
+    Returns straight-alpha float RGBA crops + their pixel boxes."""
+    h, w = rgba.shape[:2]
+    rgb = rgba[..., :3].astype(np.float32)
+    a = rgba[..., 3].astype(np.float32) / 255.0
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    px, py = xx + 0.5, yy + 0.5
+    feather, line_w = _REST_SEGMENT_FEATHER_PX, _REST_OUTLINE_PX
+
+    # Sample the lineart colour from the art itself (outer 1-2.5 px of the silhouette).
+    dist = cv2.distanceTransform((a > 0.5).astype(np.uint8), cv2.DIST_L2, 5)
+    # The source art is only ~98.5 % opaque inside (export artefact). Overlapping bones would stack that into a
+    # visibly denser band, so make the interior fully opaque; the anti-aliased silhouette edge is kept as-is.
+    a = a + (1.0 - a) * np.clip((dist - 2.0) / 2.0, 0.0, 1.0)
+    edge = (dist >= 1.0) & (dist <= 2.5) & (a > 0.9)
+    line_rgb = np.median(rgb[edge], axis=0) if np.any(edge) else np.array([148.0, 96.0, 77.0], dtype=np.float32)
+
+    def joint_fields(key: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        cx, cy = geo[key]
+        ax_x, ax_y = geo[f"{key}_axis"]
+        along = (px - cx) * ax_x + (py - cy) * ax_y
+        side = (px - cx) * ax_y - (py - cy) * ax_x          # + = the +perp side used by _analyze_rest_arm
+        rad = np.hypot(px - cx, py - cy)
+        r_pos, r_neg = geo[f"{key}_r"]
+        return along, rad, np.where(side > 0.0, r_pos, r_neg).astype(np.float32)
+
+    d_e, rad_e, r_e = joint_fields("elbow")
+    d_w, rad_w, r_w = joint_fields("wrist")
+
+    def before(d: np.ndarray) -> np.ndarray:                       # anti-aliased half-plane "d < 0"
+        return np.clip(0.5 - d, 0.0, 1.0)
+
+    def disc(rad: np.ndarray, r: np.ndarray) -> np.ndarray:
+        return np.clip(r - rad + 0.5, 0.0, 1.0)
+
+    def front_cut(d: np.ndarray, rad: np.ndarray, r: np.ndarray) -> np.ndarray:
+        """Coverage of the NEXT bone: soft `feather` ramp inside the cap (the previous bone's cap is always
+        underneath there, at any bend angle) and a crisp complementary cut outside it (the silhouette edge)."""
+        t = np.clip(d / feather, 0.0, 1.0)
+        soft = t * t * (3.0 - 2.0 * t)
+        hard = np.clip(d + 0.5, 0.0, 1.0)
+        w_in = np.clip(r - 1.5 - rad, 0.0, 1.0)
+        return w_in * soft + (1.0 - w_in) * hard
+
+    def cap_outline(rgb_in: np.ndarray, rad: np.ndarray, d: np.ndarray, r: np.ndarray) -> np.ndarray:
+        ring = np.clip(1.0 - np.abs(rad - (r - 0.5 * line_w)) / (0.5 * line_w + 0.5), 0.0, 1.0)
+        ring *= np.clip((d - 1.0) / 3.0, 0.0, 1.0)                 # only on the hidden half beyond the cut
+        return rgb_in * (1.0 - ring[..., None]) + line_rgb[None, None, :] * ring[..., None]
+
+    a_up = a * np.maximum(before(d_e), disc(rad_e, r_e))
+    rgb_up = cap_outline(rgb, rad_e, d_e, r_e)
+    a_fo = a * front_cut(d_e, rad_e, r_e) * np.maximum(before(d_w), disc(rad_w, r_w))
+    rgb_fo = cap_outline(rgb, rad_w, d_w, r_w)
+    a_ha = a * front_cut(d_w, rad_w, r_w)
+
+    out: dict[str, tuple[np.ndarray, tuple[int, int, int, int]]] = {}
+    for name, c_rgb, c_a in (("upper", rgb_up, a_up), ("forearm", rgb_fo, a_fo), ("hand", rgb, a_ha)):
+        ys, xs = np.nonzero(c_a > 1.0 / 255.0)
+        x0, x1 = max(0, int(xs.min()) - 2), min(w, int(xs.max()) + 3)
+        y0, y1 = max(0, int(ys.min()) - 2), min(h, int(ys.max()) + 3)
+        crop = np.zeros((y1 - y0, x1 - x0, 4), dtype=np.float32)
+        crop[..., :3] = c_rgb[y0:y1, x0:x1]
+        crop[..., 3] = c_a[y0:y1, x0:x1]
+        out[name] = (crop, (x0, y0, x1, y1))
+    return out
+
+
+def _premul_png_from_straight(crop: np.ndarray, mirror: bool = False) -> bytes:
+    c = crop[:, ::-1] if mirror else crop
+    a = np.clip(c[..., 3], 0.0, 1.0)
+    out = np.zeros(c.shape, dtype=np.uint8)
+    out[..., :3] = np.clip(np.rint(c[..., :3] * a[..., None]), 0, 255).astype(np.uint8)
+    out[..., 3] = np.clip(np.rint(a * 255.0), 0, 255).astype(np.uint8)
+    out[out[..., 3] == 0] = 0
+    buf = io.BytesIO()
+    Image.fromarray(out).save(buf, format="PNG", compress_level=3)
+    return buf.getvalue()
+
+
+def _uv_to_world_affine(node: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    """Per-axis linear map uv -> local vertex position of a (rest pose) art mesh."""
+    m = node["mesh"]
+    verts = np.array(m["verts"], dtype=np.float64).reshape(-1, 2)
+    uvs = np.array(m["uvs"], dtype=np.float64).reshape(-1, 2)
+    sx = np.polyfit(uvs[:, 0], verts[:, 0], 1)
+    sy = np.polyfit(uvs[:, 1], verts[:, 1], 1)
+    return np.array([sx[0], sy[0]]), np.array([sx[1], sy[1]])
+
+
+def _rigid_fit(src: np.ndarray, dst: np.ndarray, wts: np.ndarray, pivot: np.ndarray) -> tuple[float, float, float]:
+    """Weighted 2D Procrustes (rotation + translation) of src -> dst; returns (dx, dy, dtheta) for a node that
+    rotates about `pivot` (translation = where the pivot lands)."""
+    wsum = float(wts.sum()) or 1.0
+    cs = (src * wts[:, None]).sum(0) / wsum
+    cd = (dst * wts[:, None]).sum(0) / wsum
+    s0, d0 = src - cs, dst - cd
+    num = float((wts * (s0[:, 0] * d0[:, 1] - s0[:, 1] * d0[:, 0])).sum())
+    den = float((wts * (s0[:, 0] * d0[:, 0] + s0[:, 1] * d0[:, 1])).sum())
+    th = math.atan2(num, den)
+    c, s = math.cos(th), math.sin(th)
+    rel = pivot - cs
+    landed = cd + np.array([c * rel[0] - s * rel[1], s * rel[0] + c * rel[1]])
+    d = landed - pivot
+    return float(d[0]), float(d[1]), th
+
+
+def _bind_1d(param: dict[str, Any], node: int, prop: str, v_neg: float, v_zero: float, v_pos: float) -> None:
+    """Replace/insert a binding on a 3-point (-1, 0, +1) 1D parameter."""
+    bs = param.setdefault("bindings", [])
+    bs[:] = [b for b in bs if not (b.get("node") == node and b.get("param_name") == prop)]
+    bs.append({
+        "node": node, "param_name": prop, "interpolate_mode": "Linear",
+        "isSet": [[True, True], [True, True], [True, True]],
+        "values": [[round(v_neg, 5), round(v_neg, 5)], [round(v_zero, 5), round(v_zero, 5)], [round(v_pos, 5), round(v_pos, 5)]],
+    })
+
+
+def _new_param_1d(name: str, uid: int) -> dict[str, Any]:
+    return {"name": name, "uuid": uid, "is_vec2": False, "merge_mode": "Additive", "min": [-1.0, 0.0],
+            "max": [1.0, 1.0], "defaults": [0.0, 0.0], "axis_points": [[0.0, 0.5, 1.0], [0.0, 1.0]], "bindings": []}
+
+
+def _rest_arm_part(uid: int, name: str, tex_id: int, z: float, quad: list[float]) -> dict[str, Any]:
+    x0, y0, x1, y1 = quad
+    return {
+        "uuid": uid, "name": name, "type": "Part", "enabled": True, "zsort": z,
+        "transform": {"trans": [0.0, 0.0, 0.0], "rot": [0.0, 0.0, 0.0], "scale": [1.0, 1.0]},
+        "lockToRoot": False, "textures": [tex_id, _TEX_NONE, _TEX_NONE], "blend_mode": "Normal",
+        "tint": [1.0, 1.0, 1.0], "screenTint": [0.0, 0.0, 0.0], "mask_threshold": 0.5, "opacity": 1.0, "masks": [],
+        "mesh": {
+            "verts": [round(v, 4) for v in (x0, y0, x1, y0, x0, y1, x1, y1)],
+            "uvs": [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            "indices": [0, 1, 3, 0, 3, 2],
+            "origin": [0.0, 0.0],
+        },
+        "children": [],
+    }
+
+
+def _rest_arm_node(uid: int, name: str, trans: tuple[float, float], children: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "uuid": uid, "name": name, "type": "Node", "enabled": True, "zsort": 0.0, "lockToRoot": False,
+        "transform": {"trans": [round(trans[0], 4), round(trans[1], 4), 0.0], "rot": [0.0, 0.0, 0.0], "scale": [1.0, 1.0]},
+        "children": children,
+    }
+
+
+def _install_rest_arm_rig(header: bytes, geo: dict[str, Any], boxes: dict[str, tuple[int, int, int, int]],
+                          tex_ids: dict[str, dict[str, int]]) -> bytes:
+    """Mount the sliced resting arms on true 3-bone rigid hierarchies (Shoulder -> Upper + Elbow -> Forearm + Wrist ->
+    Hand) replacing #1046 / #1000, and wire every parameter:
+      * torso attachment: shoulder root t.x / t.y / r.z bindings fitted (weighted Procrustes) to exactly how the
+        original resting-arm mesh deforms under Body Angle X/Y/Z, Body Lean, Breath and Chibi -> never detaches;
+      * Rest Arm R/L Shoulder / Elbow / Wrist (1D, -1..+1) joint rotations;
+      * Arm R/L Pose cross-fade, Arm R/L Swing physics follow-through on elbow & wrist;
+      * wider raised-wave ranges + separate Arm R/L Elbow / Wrist on the raised pivots;
+      * physics anchors: arm-swing pendulums are kicked by shoulder/elbow motion, Mouth Spring follows VB Mouth / Jaw."""
+    puppet = json.loads(header[12:])
+    nodes: dict[int, dict[str, Any]] = {}
+    parent: dict[int, dict[str, Any]] = {}
+    stack = [puppet["nodes"]]
+    while stack:
+        n = stack.pop()
+        nodes[n["uuid"]] = n
+        for c in n.get("children", ()):
+            parent[c["uuid"]] = n
+            stack.append(c)
+    params = puppet.setdefault("param", [])
+    by_name = {str(p.get("name")): p for p in params}
+    tw, th = geo["size"]
+
+    for side, src_uid in (("R", 1046), ("L", 1000)):
+        src = nodes.get(src_uid)
+        if src is None or not src.get("mesh") or src_uid not in parent:
+            continue
+        ids = REST_ARM_NODES[side]
+        scale_uv, off_uv = _uv_to_world_affine(src)
+        mirror = side == "L"
+
+        def to_world(px: float, py: float) -> np.ndarray:
+            u = (tw - px) / tw if mirror else px / tw
+            return np.array([scale_uv[0] * u + off_uv[0], scale_uv[1] * (py / th) + off_uv[1]])
+
+        S = to_world(*geo["shoulder"])
+        E = to_world(*geo["elbow"])
+        W = to_world(*geo["wrist"])
+
+        def quad(seg: str, origin: np.ndarray) -> list[float]:
+            x0, y0, x1, y1 = boxes[seg]
+            p0, p1 = to_world(x0, y0), to_world(x1, y1)
+            # For L the crop texture is mirrored as well, so min..max world x still maps to u = 0..1.
+            lo = np.minimum(p0, p1) - origin
+            hi = np.maximum(p0, p1) - origin
+            return [float(lo[0]), float(lo[1]), float(hi[0]), float(hi[1])]
+
+        z = REST_ARM_Z[side]
+        lbl = "Right" if side == "R" else "Left"
+        hand = _rest_arm_part(ids["hand"], f"{lbl} rest arm · hand", tex_ids[side]["hand"], z["hand"], quad("hand", W))
+        wrist = _rest_arm_node(ids["wrist"], f"{lbl} rest arm · wrist pivot", tuple(W - E), [hand])
+        fore = _rest_arm_part(ids["forearm"], f"{lbl} rest arm · forearm", tex_ids[side]["forearm"], z["forearm"], quad("forearm", E))
+        elbow = _rest_arm_node(ids["elbow"], f"{lbl} rest arm · elbow pivot", tuple(E - S), [fore, wrist])
+        upper = _rest_arm_part(ids["upper"], f"{lbl} rest arm · upper", tex_ids[side]["upper"], z["upper"], quad("upper", S))
+        shoulder = _rest_arm_node(ids["shoulder"], f"{lbl} rest arm · shoulder root", tuple(S), [upper, elbow])
+
+        par = parent[src_uid]
+        kids = par.setdefault("children", [])
+        kids[:] = [c for c in kids if c.get("uuid") != ids["shoulder"]]
+        kids.append(shoulder)
+        src["enabled"] = False            # original single-mesh art stays in the file (fallback) but never draws
+
+        # --- torso attachment: fit the shoulder root to how the original mesh moves --------------------------
+        verts = np.array(src["mesh"]["verts"], dtype=np.float64).reshape(-1, 2)
+        up_len = float(np.linalg.norm(E - S))
+        along = ((verts - S) @ (E - S)) / max(1e-6, up_len ** 2)
+        wts = np.exp(-((np.clip(along, 0.0, None) / 0.9) ** 2)) * (along > -0.35)     # upper-arm weighted
+        wts = wts + 1e-4
+        for pname in ("Body Angle X", "Body Angle Y", "Body Angle Z", "Body Lean", "Breath", "Proportion (Chibi)"):
+            prm = by_name.get(pname)
+            if prm is None:
+                continue
+            bsrc = next((b for b in prm.get("bindings", []) if b.get("node") == src_uid and b.get("param_name") == "deform"), None)
+            if bsrc is None:
+                continue
+            vals = bsrc["values"]
+            gx: list[list[float]] = []
+            gy: list[list[float]] = []
+            gr: list[list[float]] = []
+            for row in vals:
+                rx, ry, rr = [], [], []
+                for cell in row:
+                    off = np.array(cell, dtype=np.float64).reshape(-1, 2)
+                    if off.shape != verts.shape:
+                        dx = dy = dr = 0.0
+                    else:
+                        dx, dy, dr = _rigid_fit(verts, verts + off, wts, S)
+                    rx.append(round(dx, 4))
+                    ry.append(round(dy, 4))
+                    rr.append(round(dr, 5))
+                gx.append(rx)
+                gy.append(ry)
+                gr.append(rr)
+            bs = prm.setdefault("bindings", [])
+            bs[:] = [b for b in bs if b.get("node") != ids["shoulder"]]
+            for prop, grid in (("transform.t.x", gx), ("transform.t.y", gy), ("transform.r.z", gr)):
+                bs.append({"node": ids["shoulder"], "param_name": prop, "interpolate_mode": "Linear",
+                           "isSet": json.loads(json.dumps(bsrc.get("isSet"))), "values": grid})
+
+        # --- joint parameters ----------------------------------------------------------------------------------
+        # Rotation sign: Inochi2D r.z > 0 is clockwise on screen. For the right arm (screen left) moving the hand
+        # toward the body (inward) is counter-clockwise (negative); the left arm mirrors.
+        inward = -1.0 if side == "R" else 1.0
+        defs = (
+            (f"Rest Arm {side} Shoulder", ids["shoulder"], -inward * _deg(-35.0), -inward * _deg(45.0)),   # + = abduct
+            (f"Rest Arm {side} Elbow", ids["elbow"], inward * _deg(-15.0), inward * _deg(75.0)),            # + = bend in
+            (f"Rest Arm {side} Wrist", ids["wrist"], inward * _deg(-30.0), inward * _deg(30.0)),            # + = flex in
+        )
+        for pname, nid, v_neg, v_pos in defs:
+            prm = by_name.get(pname)
+            if prm is None:
+                prm = _new_param_1d(pname, REST_ARM_PARAMS[pname])
+                params.append(prm)
+                by_name[pname] = prm
+            _bind_1d(prm, nid, "transform.r.z", v_neg, 0.0, v_pos)
+
+        # Arm Pose cross-fade: rest segments fade exactly like the original resting art did.
+        pose = by_name.get(f"Arm {side} Pose")
+        if pose is not None:
+            ob = next((b for b in pose.get("bindings", []) if b.get("node") == src_uid and b.get("param_name") == "opacity"), None)
+            if ob is not None:
+                bs = pose["bindings"]
+                for seg in ("upper", "forearm", "hand"):
+                    bs[:] = [b for b in bs if b.get("node") != ids[seg]]
+                    nb = json.loads(json.dumps(ob))
+                    nb["node"] = ids[seg]
+                    bs.append(nb)
+
+        # Physics follow-through: the arm-swing pendulum lags the elbow & wrist (lag is world-space, so same sign).
+        swing = by_name.get(f"Arm {side} Swing")
+        if swing is not None:
+            _bind_1d(swing, ids["elbow"], "transform.r.z", -0.10, 0.0, 0.10)
+            _bind_1d(swing, ids["wrist"], "transform.r.z", -0.13, 0.0, 0.13)
+        # Kick the arm-swing anchor with shoulder / elbow motion so gestures get organic wobble.
+        anchor = 21400 if side == "R" else 21300
+        if anchor in nodes:
+            out_x = -1.0 if side == "R" else 1.0        # abduction moves the elbow outward (screen -x for R)
+            fore_len = float(np.linalg.norm(W - E))
+            _bind_1d(by_name[f"Rest Arm {side} Shoulder"], anchor, "transform.t.x",
+                     -out_x * 0.45 * up_len * math.sin(_deg(35.0)), 0.0, out_x * 0.45 * up_len * math.sin(_deg(45.0)))
+            _bind_1d(by_name[f"Rest Arm {side} Elbow"], anchor, "transform.t.x",
+                     out_x * 0.25 * fore_len * math.sin(_deg(15.0)), 0.0, -out_x * 0.25 * fore_len * math.sin(_deg(75.0)))
+
+    # --- raised wave arms: wider natural ranges + separate elbow / wrist ------------------------------------------
+    for side, sh, el, wr in (("R", 50006, 50005, 50004), ("L", 50015, 50014, 50013)):
+        if el not in nodes:
+            continue
+        sg = 1.0 if side == "R" else -1.0
+        lift = by_name.get(f"Arm {side} Lift")
+        if lift is not None:
+            _bind_1d(lift, sh, "transform.r.z", sg * _deg(-45.0), 0.0, sg * _deg(35.0))
+        gest = by_name.get(f"Arm {side} Gesture")
+        if gest is not None:
+            _bind_1d(gest, el, "transform.r.z", sg * _deg(28.0), 0.0, sg * _deg(-28.0))
+            _bind_1d(gest, wr, "transform.r.z", sg * _deg(22.0), 0.0, sg * _deg(-22.0))
+        # Beyond about -35 / +30 deg the wave art's elbow overlap opens up, so the extra range stops there.
+        for pname, nid, v_neg, v_pos in ((f"Arm {side} Elbow", el, sg * _deg(-35.0), sg * _deg(30.0)),   # + = fold
+                                         (f"Arm {side} Wrist", wr, sg * _deg(-30.0), sg * _deg(30.0))):
+            prm = by_name.get(pname)
+            if prm is None:
+                prm = _new_param_1d(pname, REST_ARM_PARAMS[pname])
+                params.append(prm)
+                by_name[pname] = prm
+            _bind_1d(prm, nid, "transform.r.z", v_neg, 0.0, v_pos)
+
+    # --- Mouth Spring anchor: follow the live VB Mouth / Jaw Open (legacy 'Mouth' param is never driven) ----------
+    if 21200 in nodes:
+        vb = by_name.get("VB Mouth")
+        if vb is not None:
+            xs_ax, ys_ax = vb["axis_points"][0], vb["axis_points"][1]
+            bs = vb.setdefault("bindings", [])
+            bs[:] = [b for b in bs if b.get("node") != 21200]
+            bs.append({"node": 21200, "param_name": "transform.t.x", "interpolate_mode": "Linear",
+                       "isSet": [[True] * len(ys_ax) for _ in xs_ax],
+                       "values": [[round(52.0 * float(yv), 4) for yv in ys_ax] for _ in xs_ax]})
+        jaw = by_name.get("Jaw Open")
+        if jaw is not None:
+            bs = jaw.setdefault("bindings", [])
+            bs[:] = [b for b in bs if b.get("node") != 21200]
+            bs.append({"node": 21200, "param_name": "transform.t.y", "interpolate_mode": "Linear",
+                       "isSet": [[True, True], [True, True]], "values": [[0.0, 0.0], [24.0, 24.0]]})
+
+    content = json.dumps(puppet, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return header[:8] + len(content).to_bytes(4, "big") + content
+
+
 class CharacterCustomizer:
     """Caches base 4x-upscaled textures in RAM so applying ANY eye/hair/outfit tweak rebuilds the INP in ~0.25s!"""
     def __init__(self, src_inp: Path, cache_dir: Path, vrm_assets_dir: Path) -> None:
@@ -1237,6 +1669,7 @@ class CharacterCustomizer:
         header, self._raw_textures, self._trailing = _unpack_inp(src_inp)
         header = _pad_all_meshes(header, self._raw_textures)
         header = _upgrade_spring_physics(header)
+        header = self._prepare_rest_arm_rig(header)
         self._header_seethrough = header
         self._header_solid = _sweep_front_bangs(header)
         self._header_json = self._header_solid
@@ -1248,6 +1681,31 @@ class CharacterCustomizer:
         self._wraparound_collar = _load_wraparound_collar_asset()
         self.vrm_eyes: dict[str, Path] = {}
         self._ensure_default_vrm_eyes()
+
+    def _prepare_rest_arm_rig(self, header: bytes) -> bytes:
+        """Slice arm_right_hd.png into upper / forearm / hand (mirrored for the left arm) and mount the 3-bone resting
+        arm rig. Segment textures are appended after the base textures (fixed ids) in every build."""
+        self._rest_arm_textures: list[bytes] = []
+        self._rest_arm_tex_base = len(self._raw_textures)
+        if not HD_ARM_RIGHT.exists():
+            return header
+        try:
+            rgba = np.array(Image.open(HD_ARM_RIGHT).convert("RGBA"))
+            geo = _analyze_rest_arm(rgba)
+            segs = _slice_rest_arm(rgba, geo)
+            tex_ids: dict[str, dict[str, int]] = {"R": {}, "L": {}}
+            pngs: list[bytes] = []
+            for side in ("R", "L"):
+                for seg in ("upper", "forearm", "hand"):
+                    tex_ids[side][seg] = self._rest_arm_tex_base + len(pngs)
+                    pngs.append(_premul_png_from_straight(segs[seg][0], mirror=(side == "L")))
+            new_header = _install_rest_arm_rig(header, geo, {k: v[1] for k, v in segs.items()}, tex_ids)
+        except Exception:
+            log.exception("3-bone resting arm rig could not be built; keeping the original resting arms")
+            return header
+        self._rest_arm_textures = pngs
+        self.rest_arm_geometry = geo
+        return new_header
 
     def _load_premul_cached(self, img_path: Path, feather_shoulder_tabs: bool = False) -> bytes:
         mtime = img_path.stat().st_mtime
@@ -1319,6 +1777,11 @@ class CharacterCustomizer:
     def build_custom_model(self, cfg: dict[str, Any], out_inp: Path) -> Path:
         base_texs = self._ensure_base_hd()
         out_texs = list(base_texs)
+        if self._rest_arm_textures:
+            # Rest-arm segment textures live at fixed ids right after the base set (see _prepare_rest_arm_rig).
+            if len(out_texs) != self._rest_arm_tex_base:
+                raise RuntimeError(f"base texture count {len(out_texs)} != {self._rest_arm_tex_base}; delete the BaseHD cache")
+            out_texs.extend((0, png) for png in self._rest_arm_textures)
 
         style = str(cfg.get("eyeStyle") or "vrm_refined")
         custom_eye = Path(str(cfg.get("customEyePath") or "")) if cfg.get("customEyePath") else None
@@ -1406,14 +1869,29 @@ class CharacterCustomizer:
         h_hue = float(cfg.get("hairHue", 0.0))
         h_sat = float(cfg.get("hairSat", 1.0))
         h_val = float(cfg.get("hairVal", 1.0))
+        # Recolored hair is cached per (layer, source, settings): rebuilds that only touch eyes / outfit / rig skip it.
+        hair_cache: dict[tuple[Any, ...], bytes] = self.__dict__.setdefault("_hair_cache", {})
         if h_cstr >= 0.01:
-            for tid in TEX_HAIR:
-                if tid < len(out_texs) and out_texs[tid][0] == 0:
-                    out_texs[tid] = (0, _recolor_hair_direct_png(out_texs[tid][1], h_col, h_cstr, h_sat, h_val))
+            hair_mode: tuple[Any, ...] | None = ("direct", h_col, round(h_cstr, 4), round(h_sat, 4), round(h_val, 4))
         elif abs(h_hue) >= 0.5 or abs(h_sat - 1.0) >= 0.01 or abs(h_val - 1.0) >= 0.01:
+            hair_mode = ("hsv", round(h_hue, 3), round(h_sat, 4), round(h_val, 4))
+        else:
+            hair_mode = None
+        if hair_mode is not None:
+            if len(hair_cache) > 4 * len(TEX_HAIR):
+                hair_cache.clear()
             for tid in TEX_HAIR:
                 if tid < len(out_texs) and out_texs[tid][0] == 0:
-                    out_texs[tid] = (0, _tint_premul_png(out_texs[tid][1], h_hue, h_sat, h_val))
+                    src_png = out_texs[tid][1]
+                    hkey = (tid, len(src_png), hash(src_png)) + hair_mode
+                    painted_hair = hair_cache.get(hkey)
+                    if painted_hair is None:
+                        if hair_mode[0] == "direct":
+                            painted_hair = _recolor_hair_direct_png(src_png, h_col, h_cstr, h_sat, h_val)
+                        else:
+                            painted_hair = _tint_premul_png(src_png, h_hue, h_sat, h_val)
+                        hair_cache[hkey] = painted_hair
+                    out_texs[tid] = (0, painted_hair)
 
         # Select original or alternate artwork verbatim (no procedural cutout hacking!) before applying fabric tint.
         top_style = cfg.get("outfitStyle", "original")

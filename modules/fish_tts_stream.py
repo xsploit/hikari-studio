@@ -324,9 +324,13 @@ class FishTtsStreamer:
 
     # ---------------- orchestration: LLM delta stream -> one WAV
     async def speak_stream(self, deltas: AsyncIterator[str], *, transport: str | None = None,
-                           on_text: Callable[[str], Awaitable[None] | None] | None = None
+                           on_text: Callable[[str], Awaitable[None] | None] | None = None,
+                           on_segment: Callable[[bytes, int, str, int], Awaitable[None]] | None = None,
                            ) -> tuple[str, bytes, int]:
-        """Consume LLM deltas, synthesize while streaming, return (full_text, pcm, rate)."""
+        """Consume LLM deltas, synthesize while streaming, return (full_text, pcm, rate).
+        `on_segment(pcm, rate, text, index)` (optional) receives each phrase's audio IN ORDER as soon as it is
+        ready, so playback of sentence 1 starts while later sentences are still being written / synthesized.
+        (The live WebSocket transport yields one continuous stream: it is delivered as a single segment.)"""
         transport = transport or self.transport
         t0 = time.perf_counter()
         full: list[str] = []
@@ -358,10 +362,32 @@ class FishTtsStreamer:
             except BaseException:
                 await _cancel_all([ws_task])         # LLM failed / timeout / caller cancelled: stop the socket
                 raise
+            if on_segment is not None and pcm:
+                await on_segment(pcm, rate, clean_for_speech("".join(full)), 0)
         else:
             synth = self.synth_sse if transport == "sse" else self.synth_http
             sem = asyncio.Semaphore(2)               # bounded concurrent Fish requests per reply
             tasks: list[asyncio.Task] = []
+            emit_q: asyncio.Queue = asyncio.Queue()
+            emitter: asyncio.Task | None = None
+
+            async def emit_in_order() -> None:
+                idx = 0
+                while True:
+                    item = await emit_q.get()
+                    if item is None:
+                        return
+                    task, phrase = item
+                    seg_pcm, seg_rate = await task
+                    if seg_pcm:
+                        await on_segment(seg_pcm, seg_rate, phrase, idx)
+                        idx += 1
+
+            def spawn(phrase: str) -> None:
+                task = asyncio.create_task(run(phrase))
+                tasks.append(task)
+                if on_segment is not None:
+                    emit_q.put_nowait((task, phrase))
 
             async def run(phrase: str) -> tuple[bytes, int]:
                 async with sem:
@@ -371,21 +397,27 @@ class FishTtsStreamer:
                     return res
 
             try:
+                if on_segment is not None:
+                    emitter = asyncio.create_task(emit_in_order())
                 if transport == "http" and not self.cfg.get("fishHttpChunked", False):
                     async for d in deltas:
                         full.append(d)
                     text = clean_for_speech("".join(full))
-                    tasks = [asyncio.create_task(run(text))] if text else []
+                    if text:
+                        spawn(text)
                 else:
                     async for d in deltas:
                         full.append(d)
                         for ph in chunker.feed(d):
-                            tasks.append(asyncio.create_task(run(ph)))
+                            spawn(ph)
                     for ph in chunker.flush():
-                        tasks.append(asyncio.create_task(run(ph)))
+                        spawn(ph)
                 results = await asyncio.wait_for(asyncio.gather(*tasks), REMOTE_TTS_TIMEOUT) if tasks else []
+                if emitter is not None:
+                    emit_q.put_nowait(None)
+                    await asyncio.wait_for(emitter, REMOTE_TTS_TIMEOUT + 120.0)   # playback of queued segments
             except BaseException:
-                await _cancel_all(tasks)             # never leave phrase synthesis running after a failure
+                await _cancel_all(tasks + ([emitter] if emitter is not None else []))   # never leave work running
                 raise
             rate = max((r for _, r in results), default=DEFAULT_PCM_RATE)
             gap = b"\x00\x00" * int(rate * 0.06)     # 60 ms breath between phrases

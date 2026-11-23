@@ -25,8 +25,11 @@ Or by hand: `cd src-tauri && cargo build --release`, then run
      as `/api/state` answers.
 3. If the backend it started crashes, it goes back to the splash and restarts
    it (up to 3 times). Backend output goes to `logs\backend.log`.
-4. When you close the window or pick **Quit**, the backend and
-   `hikari-live-engine.exe` are killed. They live in a Windows Job Object
+4. When you close the window or pick **Quit**, the windows hide right away
+   and a backend the shell started gets `POST /api/shutdown`, so it can end
+   Fish calls and save settings. If it hasn't exited after 2.5 s (or the
+   request fails), it and `hikari-live-engine.exe` are killed. A backend you
+   started yourself is never touched. They live in a Windows Job Object
    (`KILL_ON_JOB_CLOSE`), so they also die if the shell crashes or is killed
    from Task Manager. No leftover processes.
 
