@@ -1,34 +1,48 @@
 ---
 name: inochi2d-puppet-builder
-description: Build, curate, upscale, rig, and visually verify flagship 2.5D Inochi2D (.inp) VTuber puppets using AI coding agents (Codex, Claude, Antigravity) and image generation. Covers .inp binary packing/unpacking, premultiplied alpha matting, 3-bone rigid toggle arms, 6-layer stencil-masked VBridger mouths, VRM GLB eye extraction, and headless visual QA.
+description: End-to-end playbook for creating, converting (from Live2D .moc3 / PSD2Live / VRM / AI art), upgrading, rigging, and visually verifying 60 FPS 2.5D Inochi2D (.inp) VTuber puppets with AI coding agents (Codex, Claude, Antigravity, Cursor). Makes going from zero to a working Hikari Studio puppet as easy as possible.
 ---
 
 # Inochi2D (`.inp`) AI Puppet Builder Skill
 
-Use this skill whenever the user wants to create, upgrade, debug, or re-rig a **2.5D Inochi2D (`.inp`)** VTuber puppet with AI-assisted art generation and programmatic rigging.
+Use this skill whenever the user wants to **create a new 2.5D VTuber puppet**, **convert an existing Live2D (`.moc3`) or VRM model into Inochi2D (`.inp`)**, or **upgrade textures, eyes, mouth, physics, or gesture arms** for Hikari Studio.
 
-## 1. Core Inochi2D `.inp` Binary Wire Format
+---
 
-An Inochi2D `.inp` puppet is a compact, deterministic binary container — **no proprietary GUI required** to inspect, patch, upgrade textures, or assemble full rigs programmatically:
+## 0. Pick the Easiest Starting Path First
 
-```
+Ask the user what they already have (or inspect their workspace) and pick the **lowest-effort path**:
+
+| What the User Has | Recommended Path | Time |
+| :--- | :--- | :---: |
+| **Wants a custom character fast** (or just wants to swap eyes, hair color, bangs, outfit, shoes) | **Path A — Reskin Existing `.inp` Rig:** Start from `models/Hikari-v28-BaseHD-v5.inp` and use `core/customizer.py` + `core/wardrobe.py` (supports `.vrm` eye extraction, skin-safe outfit tinting, custom hair/top PNG swaps, `<0.6s` hot-reload). | ~5 min |
+| **Has a Live2D model (`.moc3` / `.model3.json`) or single AI anime portrait** *(exact pipeline we used for Hikari!)* | **Path B — Live2D → Inochi2D via MINT + Upgrade Pass:** Auto-rig the portrait into Live2D (PSD2Live / Live2D Cubism) if needed → convert `.moc3` to `.inp` with **MINT (`mint-cli.exe`)** → restore dropped physics → upgrade to VBridger mouth, 3-bone rigid arms & 2× HD premultiplied textures. | 30–60 min |
+| **Building from scratch in Inochi Creator** (layered PSD) | **Path C — Direct Inochi Creator → Programmatic Polish:** Cut layers in PSD → import into Inochi Creator (`.inx`), export `.inp`, then run Phases 3–6 below in Python for HD upscaling, 3-bone arms, and automated visual QA. | 1–2 hrs |
+
+---
+
+## 1. The `.inp` Binary Format (Why AI Agents Can Edit Puppets Directly)
+
+An Inochi2D `.inp` file is a simple, open binary container — **never guess or hack binary offsets**; unpack and repack cleanly in Python:
+
+```text
 [8 bytes]  Magic header:  b"TRNSRTS\0"
-[4 bytes]  Big-endian uint32: JSON scene-graph payload length (L)
-[L bytes]  UTF-8 JSON scene graph (nodes, meshes, UVs, params, bindings, physics)
+[4 bytes]  Big-endian uint32: JSON scene-graph length (L)
+[L bytes]  UTF-8 JSON scene graph (meta, nodes, meshes, UVs, param, bindings, automation)
 [8 bytes]  Section tag:   b"TEX_SECT"
-[4 bytes]  Big-endian uint32: Texture slot count (N)
+[4 bytes]  Big-endian uint32: Texture count (N)
 For i in 0..N-1:
   [4 bytes] Big-endian uint32: Encoded texture byte length (T_i)
   [1 byte]  Encoding flag (0 = PNG, 1 = TGA, 2 = BC7)
   [T_i B]   Raw encoded image bytes
-[rest]     Optional trailing EXT_SECT metadata (preserve verbatim!)
+[rest]     Optional trailing EXT_SECT metadata (preserve or strip cleanly)
 ```
 
-### Reference Unpack / Pack Helpers (Python)
-
 ```python
-import json
+import io, json
 from pathlib import Path
+import numpy as np
+from PIL import Image
 
 def unpack_inp(path: Path) -> tuple[dict, list[tuple[int, bytes]], bytes]:
     raw = path.read_bytes()
@@ -48,46 +62,72 @@ def unpack_inp(path: Path) -> tuple[dict, list[tuple[int, bytes]], bytes]:
 
 def pack_inp(model: dict, textures: list[tuple[int, bytes]], trailing: bytes = b"") -> bytes:
     payload = json.dumps(model, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    chunks = [b"TRNSRTS\0", len(payload).to_bytes(4, "big"), payload, b"TEX_SECT", len(textures).to_bytes(4, "big")]
+    out = [b"TRNSRTS\0", len(payload).to_bytes(4, "big"), payload, b"TEX_SECT", len(textures).to_bytes(4, "big")]
     for enc, data in textures:
-        chunks.extend([len(data).to_bytes(4, "big"), bytes([enc]), data])
+        out.extend([len(data).to_bytes(4, "big"), bytes([enc]), data])
     if trailing:
-        chunks.append(trailing)
-    return b"".join(chunks)
+        out.append(trailing)
+    return b"".join(out)
+
+def premul_png(rgb: np.ndarray, alpha: np.ndarray) -> bytes:
+    """Inochi2D OpenGL REQUIRES premultiplied alpha PNGs (rgb * alpha)."""
+    a = np.clip(np.nan_to_num(alpha, nan=0.0), 0.0, 1.0)
+    c = np.clip(np.nan_to_num(rgb, nan=0.0), 0.0, 255.0) * a[..., None]
+    rgba = np.zeros((*a.shape, 4), dtype=np.uint8)
+    rgba[..., :3] = np.clip(np.rint(c), 0, 255).astype(np.uint8)
+    rgba[..., 3] = np.clip(np.rint(a * 255.0), 0, 255).astype(np.uint8)
+    buf = io.BytesIO()
+    Image.fromarray(rgba, "RGBA").save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
 ```
 
-> **CRITICAL ALPHA RULE:** Inochi2D expects **premultiplied alpha** (`rgb_out = rgb * alpha`). Writing straight RGBA into `TEX_SECT` produces dark/black fringes around hair, eyelashes, and arms! Always un-premultiply (`rgb / max(alpha, eps)`) before any color/HSV/upscale edit, and re-premultiply (`rgb * alpha`) before saving PNG bytes back into `.inp`.
+> **#1 RULE — PREMULTIPLIED ALPHA:** Inochi2D stores **premultiplied RGBA** in `TEX_SECT`. Before *any* color shift, upscale, or crop, un-premultiply (`rgb / np.maximum(alpha, 1e-6)`). Before writing back into `.inp`, re-premultiply (`rgb * alpha`). Skipping this creates dark halos around hair and eyelashes!
 
 ---
 
-## 2. Step-by-Step AI Curation & Rigging Pipeline
+## 2. Path B Playbook: Converting Live2D (`.moc3`) → Flagship Inochi2D (`.inp`)
 
-Follow these phases in order. **Never skip Phase 6 (visual verification)** — inspecting rendered frames catches 95% of Z-order, UV, and alpha defects immediately.
+This is the exact, battle-tested pipeline we ran to build Hikari (all real gotchas included so you don't hit them twice):
 
-### Phase 1: Base Character & Layered Part Separation
-1. Start from a clean, symmetrical, front-facing character reference (neutral T-pose / A-pose, flat cel/anime lighting, solid chroma or alpha background) OR extract reference textures from an existing `.vrm` (GLB 2.0) model.
-2. Decompose into clean anatomical & depth-sorted `Part` layers (back-to-front Z-sort):
-   - Back hair / twin-tails
-   - Legs, bottomwear, torso/topwear, neck, resting arms
-   - Face base, blush overlay (`///`), ears
-   - Sclera (masked), left/right irises + specular highlights (stencil-clipped to sclera), upper/lower eyelashes, eyelids, eyebrows
-   - 6-layer geometric mouth (inner cavity, tongue, upper teeth, lower teeth, lip lines, skin mask)
-   - Front hair / bangs (solid or subtle see-through pass over eyes), ahoge
-   - Toggle gesture arms (hidden by default at `opacity = 0` until triggered)
+### Step 1 — Start With Clean Front-Facing Art (If Generating First)
+- Generate a symmetrical, front-facing anime character in **neutral T/A-pose**, flat cel lighting, plain solid background, eyes open, neutral mouth.
+- If using an auto-rigger (PSD2Live / Live2D Cubism / Image2Live2D), export the complete Live2D folder (`*.moc3`, `*.model3.json`, `*.cdi3.json`, `*.physics3.json`, textures).
 
-### Phase 2: Non-Destructive HD Texture Upscaling & Silhouette Matting
-- Never upscale premultiplied PNGs directly with naive bicubic filters — halos will bleed inward.
-- Un-premultiply → run edge-preserving 2× anime lineart upscale (Lanczos + bilateral denoise + unsharp lineart restoration + smooth silhouette alpha matting) → re-premultiply.
-- Keep reference implementation in `core/texture_upscaler.py` (`_upscale_premul_png`, `smooth_premul_silhouette_png`).
+### Step 2 — Convert Live2D `.moc3` to `.inp` via MINT
+Use `mint-cli` (from MINT — Live2D-to-Inochi2D converter):
 
-### Phase 3: Symmetrical VRM Eye Extraction & Zero-Lazy-Eye Mapping
-When upgrading eyes from a `.vrm` (GLB 2.0) or generated high-res eye sheet:
-1. Parse GLB chunks (`glTF` header → JSON chunk → BIN chunk → `materials` matching `eyeiris` / `eyehighlight`).
-2. Compute the tight non-zero alpha bounding box of the iris, center it symmetrically onto both Left and Right Inochi2D iris texture canvases, and mirror the secondary highlight cleanly so gaze tracking has **zero cross-eye or lazy-eye drift**.
-3. Bind separate `Eye::LookX/Y` parameter ranges with clamped inner/outer travel so irises never clip past the sclera stencil mask.
+```bash
+# CRITICAL GOTCHA #1: mint-cli requires the .model3.json stem to EXACTLY match the .moc3 stem!
+# Copy into a temp folder and rename <name>.model3.json -> <moc_stem>.model3.json first.
+mint-cli.exe export path/to/model.moc3 path/to/output --inp
+```
 
-### Phase 4: True 3-Bone Rigid Toggle Arms (No Spaghetti Mesh Deformation!)
-Deforming a single mesh arm through a 120° wave stretches fingers into taffy. Instead, build a **true 3-bone rigid node hierarchy** (see `assets/hd_parts/wave/` and `core/rig_controller.py`):
+### Step 3 — Rescue What MINT Drops (Critical Post-Conversion Fixes!)
+1. **Physics Deformations (`Front hair`, `Back hair`, `Skirt`):** MINT frequently strips Cubism physics deform bindings, leaving hair/clothes stiff.
+   - *Fix:* Sample Cubism physics meshes before conversion (`cubism-physics-samples.json`) OR inject smooth parametric deform bindings into `model["param"]` with matching `min`/`defaults`/`max` and `axis_points` for hair sway, ahoge bounce, skirt swing, eye bounce, brow spring, mouth spring, and arm swing.
+2. **Head-Turn Mouth Detachment:** Check that the `Angle` (Head X/Y) parameter still has `deform` bindings for every mouth part UUID (`mouth_ids <= posed`), or the mouth will float off the face during head turns!
+3. **Closed-Eye Artifacts:** Auto-rigged Live2D models often leave stray iris pixels or jagged lash lines when `EyeOpen == 0`. Clean eyelash/sclera alpha mats and calm eyelid bounce springs (`damping >= 0.78`, `overshoot <= ±0.22`).
+
+---
+
+## 3. Flagship Quality Upgrades (Apply to Any `.inp`)
+
+### Upgrade 1 — Non-Destructive 2× HD Lineart Upscale & Silhouette Smoothing
+- Un-premultiply → run edge-preserving 2× upscale (Lanczos + bilateral denoise + unsharp lineart restoration + smooth silhouette alpha matting) → re-premultiply.
+- Reference implementation: `core/texture_upscaler.py` (`_upscale_premul_png`, `smooth_premul_silhouette_png`).
+
+### Upgrade 2 — Symmetrical VRM Eye Transfer (Zero Lazy-Eye!)
+If the character has a 3D `.vrm` (GLB 2.0) model:
+1. Parse GLB (`glTF` header → JSON chunk → BIN chunk → materials matching `eyeiris` / `eyehighlight`, see `core/customizer.py:extract_vrm_eye_assets`).
+2. Tight-crop non-zero alpha iris bounds and center **symmetrically** onto both Left and Right Inochi2D iris canvases (mirroring secondary highlights). This completely eliminates cross-eye / lazy-eye drift.
+
+### Upgrade 3 — Replace Sprite-Swapped Mouths with a 6-Layer Stencil VBridger Mouth
+Flat mouth sprite swapping looks choppy. Replace it with an Inochi2D **OpenGL stencil-masked geometric mouth**:
+- 6 layers: inner mouth cavity (stencil `Mask`), tongue, upper teeth, lower teeth, smooth 11-point Bezier-like upper/lower lip curves, and outer skin blend.
+- Bind to the standard 8-parameter VTS/VBridger space (`jawOpen`, `mouthOpen`, `mouthForm`, `mouthFunnel`, `lipsPress`, `mouthShrug`, `mouthX`, `tongueOut`) so `modules/lipsync.py` (12-MFCC + IPA F1/F2 Formants at `0.28 ms/frame`) drives smooth anime vowels (`A, I, U, E, O, M/B/P, F/V`).
+
+### Upgrade 4 — True 3-Bone Rigid Toggle Arms (No Spaghetti Fingers!)
+Never deform a single arm mesh through a 120° wave — fingers turn into taffy. Build a **3-bone rigid Node hierarchy** (see `assets/hd_parts/wave/`):
 
 ```text
 Shoulder Node          (rigid translation anchored to torso + lift rotation)
@@ -95,42 +135,40 @@ Shoulder Node          (rigid translation anchored to torso + lift rotation)
 └── Elbow Node         (rigid transform.r.z rotation for wave & secondary spring swing)
     ├── Forearm Part   (rounded elbow-to-wrist overlap cap)
     └── Wrist Node     (rigid transform.r.z wrist flick + spring follow-through)
-        └── Hand Part  (100% rigid — zero finger distortion at any angle!)
+        └── Hand Part  (100% rigid — zero finger stretching at any angle!)
 ```
 
-- Generate the waving pose once with an image generator matched to the puppet's exact lighting & camera projection.
-- Segment into `upper`, `forearm`, and `hand` with feathered circular joint caps centered directly on the verified `(shoulder, elbow, wrist)` pixel pivots.
-- Mirror cleanly for left/right symmetry and cross-fade `opacity` against the resting arm during `greet_wave` / `cheer_bounce`.
+- Generate one waving arm reference matching the puppet's exact lighting & camera projection.
+- Segment into `upper`, `forearm`, and `hand` with feathered circular joint caps centered on verified `(shoulder, elbow, wrist)` pixel pivots, mirror for left/right, and cross-fade `opacity` against the resting arm during `greet_wave` / `cheer_bounce`.
 
-### Phase 5: 6-Layer VBridger Mouth & 8-Parameter Lip-Sync Binding
-Bind the mouth rig to the standard VTS/VBridger 8-parameter space so any lip-sync engine (MFCC, IPA Formants, Hybrid, or audio amplitude) drives expressive anime phonemes (`A, I, U, E, O, M/B/P, F/V`):
-- `jawOpen`, `mouthOpen`, `mouthForm` (smile ↔ frown), `mouthFunnel` (pucker for `O`/`U`), `lipsPress` (`M/B/P`), `mouthShrug`, `mouthX`, `tongueOut`.
-- Use an Inochi2D `Mask` on the inner mouth cavity so teeth and tongue stay strictly inside the lip silhouette at every opening angle.
-
-### Phase 6: Automated Visual Verification Loop (MANDATORY)
-Never trust JSON edits blind. After every `.inp` build:
-1. Render the puppet through the real GPU engine (`engine/hikari-live-engine.exe` or `server.py` WebSocket frame capture) under **multiple stress poses**:
-   - Neutral front, Head Yaw `±15°`, Head Pitch `±12°`
-   - Full blink (`eyeOpen = 0`), Wide sparkle eyes
-   - Vowel grid (`A, I, U, E, O, M/B/P`)
-   - Full arm wave (`greet_wave` peak frame)
-   - Shader ON **and** Shader OFF (`GL_COLOR_ATTACHMENT0` sanity check!)
-2. Visually inspect every captured frame for:
-   - Black/white premultiplied alpha fringes
-   - Detached neck/collar or elbow seams
-   - Iris clipping outside sclera or mismatched gaze convergence
-   - Z-order pops (bangs behind eyes, waving arm clipping in front of face)
-3. Fix the root cause in the builder script (never hand-edit binary blobs) and re-verify until every pose is artifact-free.
+### Upgrade 5 — Skin-Safe HSV Wardrobe & Hair Recoloring
+When recoloring outfits on shared body/clothing textures (`core/customizer.py`, `core/wardrobe.py`), mask out the peach skin hue/saturation band before shifting fabric colors so neck, collarbone, and midriff skin stay untouched.
 
 ---
 
-## 3. Common Pitfalls & Fast Fixes
+## 4. Mandatory Visual Verification Loop (Never Ship Blind!)
+
+After **every** `.inp` script edit, render through the real native GPU engine (`engine/hikari-live-engine.exe` or `server.py` WebSocket capture) and **visually inspect** this stress grid:
+
+1. **Neutral front** (check overall framing, halo-free hair/eyelash edges, centered symmetrical gaze)
+2. **Head Yaw `±15°` & Pitch `±12°`** (verify mouth, eyes, nose, and bangs stay locked to the face)
+3. **Full blink (`eyeOpen = 0`) & Sparkle Eyes** (no stray iris bleed, clean closed lash curve)
+4. **Vowel Grid (`A, I, U, E, O, M/B/P`)** (teeth/tongue strictly clipped inside mouth stencil mask)
+5. **Wave Arm Peak (`greet_wave`)** (seamless shoulder tuck, rounded elbow/wrist caps, crisp rigid fingers)
+6. **Shader ON and Shader OFF** (verifies `GL_COLOR_ATTACHMENT0` albedo blit when GLSL post-shader is bypassed)
+
+---
+
+## 5. Fast Troubleshooting Table
 
 | Symptom | Root Cause | Fix |
 | :--- | :--- | :--- |
-| Dark halo around pink hair / eyelashes | Straight RGBA packed instead of premultiplied alpha | Multiply `rgb *= alpha` before PNG encode (`premul_png`) |
-| Eyes look slightly cross-eyed or lazy | Asymmetric iris UV bbox or uncentered VRM crop | Center iris centroid symmetrically on both L/R canvases |
-| Waving fingers stretch or bend unnaturally | Single-mesh deformer rotated >45° | Switch to 3-bone rigid Node hierarchy (`Shoulder → Elbow → Wrist`) |
-| Outfit recolor turns skin red/pink | Global HSV shift on combined body/outfit texture | Mask out peach skin hue/saturation band before tinting fabric |
-| Shader OFF shows black or neon silhouette | Blitting `GL_COLOR_ATTACHMENT1` (emissive) instead of `0` | Read `GL_COLOR_ATTACHMENT0` (albedo) when post-shader is disabled |
-| Blink feels jittery or overly bouncy | Under-damped eyelid spring | Set eye-bounce spring damping `>= 0.78` and clamp overshoot `<= ±0.22` |
+| `mint-cli` fails to find `.model3.json` | `.model3.json` filename stem differs from `.moc3` | Copy to temp dir & rename to `<moc_stem>.model3.json` |
+| Hair/skirt froze after MINT conversion | MINT dropped Cubism physics deform bindings | Restore/synthesize hair, ahoge, skirt & spring deform bindings in `param` |
+| Mouth floats off face during head turn | `Angle` param lost `deform` bindings for mouth UUIDs | Assert `mouth_ids <= posed` on `Angle` param after editing |
+| Black/dark halos on pink hair or lashes | Straight RGBA packed instead of premultiplied alpha | Multiply `rgb *= alpha` before PNG encode (`premul_png`) |
+| Cross-eyed / lazy-eye gaze | Uncentered iris crop or asymmetric L/R UV offset | Center tight iris alpha bbox identically on both L/R canvases |
+| Waving hand stretches like rubber | Single mesh deformed >45° | Use 3-bone rigid Node hierarchy (`Shoulder → Elbow → Wrist`) |
+| Outfit tint turns skin red/purple | Global HSV shift on combined body+top texture | Mask out skin HSV band before recoloring fabric |
+| Shader OFF shows black / neon frame | Blitting `GL_COLOR_ATTACHMENT1` instead of `0` | Read `GL_COLOR_ATTACHMENT0` when shader is disabled |
+| Blink looks overly jiggly / jelly | Under-damped eyelid bounce spring | Set damping `>= 0.78`, clamp overshoot `<= ±0.22` |

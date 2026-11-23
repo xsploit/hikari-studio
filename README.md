@@ -124,11 +124,10 @@ Measured live on Windows 11 at full 60 FPS streaming (`1280×720` / `326 KB` fra
   ```bash
   pip install fastapi uvicorn websockets pillow numpy opencv-python sounddevice httpx
   ```
-- Optional API keys (set as environment variables or in `.env` — **never committed**):
-  - `FISH_AUDIO_API_KEY` (or `FISH_SPEECH_API_KEY`) — Fish Audio Drama 3 / Live 3 & streaming TTS
-  - `AI_GATEWAY_API_KEY` — Vercel AI Gateway + cheap embeddings (`openai/text-embedding-3-small`)
-  - `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN` — Cloudflare `@cf/cloudflare/clef-flash` decider
-  - `PERPLEXITY_API_KEY` / `OPENAI_API_KEY` — Optional deciders & direct LLM providers
+- **API Keys (only 2 keys needed for the full stack — set as env vars or in `.env`, never committed):**
+  - `AI_GATEWAY_API_KEY` — **Vercel AI Gateway** (single unified key for all LLMs — OpenAI, Anthropic, Perplexity, Google, etc. — plus cheap embeddings `openai/text-embedding-3-small` and evaluation/decision models like `typesafe-ai/jev`)
+  - `FISH_AUDIO_API_KEY` (or `FISH_SPEECH_API_KEY`) — **Fish Audio** Drama 3 / Live 3 duplex calls & SSE/WS streaming TTS
+  - *(Optional direct-endpoint overrides only if bypassing Vercel AI Gateway: `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN`, `PERPLEXITY_API_KEY`, `OPENAI_API_KEY`)*
 
 ### 2. Run Hikari Studio
 
