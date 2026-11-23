@@ -1911,6 +1911,12 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             pass                                    # already closed by /api/shutdown
         await http_pool.aclose()
 
+    async def on_response_prepare(req, resp):
+        if req.path in ("/", "/obs") or req.path.startswith("/static/"):
+            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+            resp.headers["Pragma"] = "no-cache"
+
+    app.on_response_prepare.append(on_response_prepare)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app
