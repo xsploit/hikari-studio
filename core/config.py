@@ -59,6 +59,13 @@ def sanitize_ai_brain_patch(values: dict[str, Any]) -> dict[str, Any]:
         # True = restrict strictly to vercelProviderOrder (UI checkbox); a list/string = explicit providers
         only = out["vercelProviderOnly"]
         out["vercelProviderOnly"] = True if only is True else ([] if only in (False, None) else _id_list(only, 12))
+    if "gatewayEvalModel" in out:
+        from modules.decision_engine import DEFAULT_GATEWAY_EVAL_MODEL, is_eval_model_id
+        gm = str(out["gatewayEvalModel"] or "").strip()
+        out["gatewayEvalModel"] = gm if is_eval_model_id(gm) else DEFAULT_GATEWAY_EVAL_MODEL
+    if "deciderRoute" in out:
+        r = str(out["deciderRoute"] or "").lower()
+        out["deciderRoute"] = r if r in ("auto", "gateway", "direct") else "auto"
     if "vercelHeaders" in out and not isinstance(out["vercelHeaders"], dict):
         out["vercelHeaders"] = {}
     for k in ("vercelModel", "vercelEmbeddingModel", "localModel", "localBaseUrl", "localLoraPath",
@@ -99,7 +106,7 @@ def sanitize_memory_patch(values: dict[str, Any]) -> dict[str, Any]:
         out["colabBaseModel"] = m if m in COLAB_BASE_MODELS or (m.startswith("unsloth/") and len(m) < 120) else COLAB_BASE_MODELS[0]
     if "triage" in values:
         t = str(values["triage"] or "").lower()
-        out["triage"] = t if t in ("auto", "off", "jev", "clef", "pplx", "luna") else "auto"
+        out["triage"] = t if t in ("auto", "off", "gateway", "jev", "clef", "pplx", "luna") else "auto"
     if "triageModel" in values:
         out["triageModel"] = str(values["triageModel"] or "").strip()[:200]
     if "recallTopK" in values:
