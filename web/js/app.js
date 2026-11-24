@@ -17,7 +17,7 @@ import { extractSearchEntries, findSearchTarget, searchSettings } from './ui.js'
 const TABS = {
   general:  { title: 'General & Stage',    sub: 'Room, OBS output, atmosphere, framing and presets.',
               render: (s) => [...renderStagePanel(s), renderPresetsSection(s)] },
-  look:     { title: 'Look & Props',       sub: 'Eyes, hair, outfit, shoes, glow and proportions.',
+  look:     { title: 'Look & Props',       sub: 'Puppet library, eyes, hair, outfit, shoes, glow and proportions.',
               render: (s) => renderCustomizerPanel(s) },
   motion:   { title: 'Motion & Emotions',  sub: 'Emotes, expressions, physics, head-pats, arms, gaze and Motion Lab.',
               render: (s) => [...renderRigPanel(s), ...renderMotionPanel(s)] },
@@ -92,6 +92,16 @@ const store = {
     document.getElementById('hud-room-name').textContent = ROOM_TITLES[room] || room || 'Studio';
   },
 
+  /** Subtle top-bar badge naming the puppet on stage — hidden while Hikari herself is active. */
+  setPuppetBadge(id, name) {
+    const badge = document.getElementById('hud-puppet');
+    if (!badge) return;
+    const other = Boolean(id) && id !== 'hikari';
+    badge.hidden = !other;
+    badge.textContent = other ? (name || id) : '';
+    badge.title = other ? `Puppet on stage: ${name || id}` : '';
+  },
+
   async refreshState() {
     const st = await (await fetch('/api/state')).json();
     this.config = st.config;
@@ -106,6 +116,7 @@ const store = {
     this.motionStatus = st.motionStatus || {};
     this.fishStatus = st.fishStatus || {};
     this.setRoomTitle(this.config.stage.room);
+    this.setPuppetBadge(this.config.stage.activeModel || 'hikari', this.config.stage.activeModelName);
   },
 
   async playSample() {

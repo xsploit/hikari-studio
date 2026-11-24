@@ -262,6 +262,11 @@ const SEARCH_SYNONYMS = {
   decider: ['decision', 'decider'], decision: ['decision', 'decider'], brain: ['brain', 'llm', 'decision'], llm: ['llm', 'model'],
   ai: ['ai', 'llm', 'brain', 'gateway'], persona: ['persona', 'personality'], personality: ['personality', 'persona'],
   plugin: ['plugin'], plugins: ['plugin'], param: ['parameter'], params: ['parameter'], parameter: ['parameter'], preset: ['preset'],
+  puppet: ['puppet', 'model'], puppets: ['puppet', 'model'], avatar: ['avatar', 'puppet'], avatars: ['avatar', 'puppet'],
+  rig: ['rig', 'puppet'], rigs: ['rig', 'puppet'], character: ['character', 'puppet'], model: ['model', 'puppet'],
+  models: ['model', 'puppet'], hiyori: ['hiyori', 'puppet'], mao: ['mao', 'puppet'], import: ['import'],
+  live2d: ['live2d', 'puppet'], 'live 2d': ['live2d', 'puppet'], inp: ['inp', 'puppet'], inx: ['inx', 'puppet'],
+  inochi: ['inp', 'puppet'], inochi2d: ['inp', 'puppet'],
   motion: ['motion', 'clip', 'retarget'], video: ['video', 'motion lab'], save: ['save', 'preset'],
 };
 const SYN_PHRASES = Object.keys(SEARCH_SYNONYMS).filter((k) => k.includes(' ')).sort((a, b) => b.length - a.length);
@@ -293,12 +298,13 @@ export function extractSearchEntries(root, tab, tabTitle) {
     entries.push({
       ...e, tab, tabTitle, occ: n,
       hTitle: normSearch(e.title), hDesc: normSearch(e.desc), hKw: normSearch(e.kw), hGroup: normSearch(e.group),
+      hTags: normSearch(e.tags),
     });
   };
   root.querySelectorAll('.s-group').forEach((g) => {
     const group = g.querySelector('.s-group-head h2')?.textContent.trim() || '';
     if (!group) return;
-    add({ kind: 'group', group, title: group, desc: g.querySelector('.s-group-head p')?.textContent.trim() || '', kw: '' });
+    add({ kind: 'group', group, title: group, desc: g.querySelector('.s-group-head p')?.textContent.trim() || '', kw: '', tags: g.dataset?.searchKw || '' });
     g.querySelectorAll('.s-row').forEach((r) => {
       const title = r.querySelector(':scope > .s-row-text > .s-title')?.textContent.trim();
       if (!title) return;
@@ -308,7 +314,7 @@ export function extractSearchEntries(root, tab, tabTitle) {
         .map((n) => n.label || n.textContent || n.getAttribute('aria-label') || '').join(' ').slice(0, 600) : '';
       const parent = r.parentElement?.closest('.s-more-body')
         ? (r.parentElement.closest('.s-more')?.querySelector(':scope > .s-more-head .s-title')?.textContent.trim() || '') : '';
-      add({ kind: r.classList.contains('s-more-head') ? 'section' : 'row', group, title, desc, kw, parent });
+      add({ kind: r.classList.contains('s-more-head') ? 'section' : 'row', group, title, desc, kw, parent, tags: r.dataset?.searchKw || '' });
     });
   });
   return entries;
@@ -331,7 +337,9 @@ export function searchSettings(entries, query, limit = 10) {
         // The typed word (or the same word spaced differently, e.g. lipsync / lip sync) beats a synonym.
         const w = i === 0 || a.replace(/ /g, '') === alts[0].replace(/ /g, '') ? 1 : 0.8;
         // Match at word starts only ("arm" must not hit "warmth"); descriptions outrank button/option text.
-        if (e.hTitle.startsWith(a)) best = Math.max(best, 6 * w);
+        // data-search-kw tags are explicit "jump here" keywords, so they outrank everything.
+        if (e.hTags && atWord(e.hTags, a)) best = Math.max(best, 7 * w);
+        else if (e.hTitle.startsWith(a)) best = Math.max(best, 6 * w);
         else if (atWord(e.hTitle, a)) best = Math.max(best, 4.5 * w);
         else if (atWord(e.hDesc, a)) best = Math.max(best, 2.6 * w);
         else if (atWord(e.hKw, a)) best = Math.max(best, 2.4 * w);

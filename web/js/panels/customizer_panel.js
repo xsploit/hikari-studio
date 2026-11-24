@@ -1,5 +1,6 @@
-/** LOOK & PROPS — wardrobe, eyes, hair & bangs, outfit tint, glow & proportions, imports, props slot. */
+/** LOOK & PROPS — puppet library, wardrobe, eyes, hair & bangs, outfit tint, glow & proportions, imports, props slot. */
 import { actionRow, btn, chipsRow, colorRow, el, group, more, row, segRow, slider } from '../ui.js';
+import { renderPuppetLibrary, renderPuppetNote } from './puppet_library.js';
 
 const HAIR_PRESETS = [
   ['Hikari Sakura',   { hairColor: '#ff6a9e', hairColorStrength: 0.0, hairHue: 0, hairSat: 1.00, hairVal: 1.00 }],
@@ -102,6 +103,7 @@ export function renderCustomizerPanel(store) {
 
   const out = [
     el('div', { class: 'apply-bar' }, [statusLine, applyBtn]),
+    renderPuppetNote(store),
 
     group('Wardrobe', [
       segRow({
@@ -216,12 +218,13 @@ export function renderCustomizerPanel(store) {
   ];
 
   if (applying) {
-    for (const node of out) {
+    for (const node of out.filter(Boolean)) {
       for (const control of node.querySelectorAll('button:not(.s-more-head), input, a.btn')) {
         if (control.tagName === 'A') control.classList.add('disabled');
         else control.disabled = true;
       }
     }
   }
-  return out;
+  // Puppet Library sits above the customizer and keeps its own busy state (not disabled by Apply).
+  return [renderPuppetLibrary(store), ...out.filter(Boolean)];
 }

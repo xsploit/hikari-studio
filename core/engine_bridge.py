@@ -176,6 +176,29 @@ class NativeEngineBridge:
                 raise
             self.model_path = previous
 
+    def switch_model(self, target: Path) -> None:
+        """Live-switch to another puppet file. Nothing on disk is replaced (unlike reload_model). If `target` fails to
+        start, the previous puppet is restarted and the error re-raised; param_names only change on success."""
+        target = Path(target)
+        if not target.is_file():
+            raise FileNotFoundError(f"Puppet not found: {target.name}")
+        with self._lock:
+            if self._closing.is_set():
+                raise RuntimeError("hikari-live-engine is shutting down")
+            previous = self.model_path
+            self._stop_locked()
+            self.model_path = target
+            try:
+                self.start()
+            except Exception:
+                self._stop_locked()
+                self.model_path = previous
+                try:
+                    self.start()
+                except Exception as exc:                  # previous engine also failed: report the original error
+                    self.stderr_tail.append(f"[switch_model] rollback to {previous.name} failed: {exc}")
+                raise
+
     def render_packet(
         self,
         dt: float,

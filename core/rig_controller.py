@@ -29,6 +29,7 @@ from typing import Any
 
 from core.config import EXPRESSION_PRESETS, ROOM_AMBIENT_MAP
 from core.events import HookRegistry
+from core.puppet_adapter import HIKARI_ID, UniversalParamMapper
 from modules.lipsync import DEFAULT_PARAM_MAP, LiveLipSyncEngine, Spring2nd
 
 log = logging.getLogger("hikari.rig")
@@ -420,6 +421,29 @@ class RigController:
         self.last_camera: dict[str, Any] = {}
         self.last_state: dict[str, Any] = {}
         self.frame_count = 0
+
+        # Universal puppet output: the controller always composes Hikari's canonical rig (self.defaults); for any
+        # other loaded puppet a UniversalParamMapper translates that frame onto the puppet's own params.
+        self.active_model_id = HIKARI_ID
+        self._mapper: UniversalParamMapper | None = None
+        self.last_canonical: dict[str, tuple[float, float]] = self.last_params
+
+    def reload_puppet_meta(self, param_meta: list[dict[str, Any]] | None, active_model_id: str) -> dict[str, Any]:
+        """Hot-swap the output puppet. "hikari" (or no meta) = native output, byte-for-byte the old behaviour."""
+        mid = str(active_model_id or HIKARI_ID)
+        mapper = None if mid == HIKARI_ID or not param_meta else UniversalParamMapper(param_meta, mid)
+        with self.lock:
+            self._mapper = mapper
+            self.active_model_id = mid
+        if mapper is None:
+            return {"passthrough": True, "mappedChannels": list(("head", "body", "eyes", "gaze", "brows", "mouth",
+                                                                   "breath", "blush", "vfx")), "unboundChannels": []}
+        return mapper.summary()
+
+    @property
+    def output_defaults(self) -> dict[str, tuple[float, float]]:
+        m = self._mapper
+        return dict(m.defaults) if m is not None else dict(self.defaults)
 
     # ------------------------------------------------------------------ public API
     def set_pointer(self, nx: float, ny: float) -> None:
@@ -1666,6 +1690,21 @@ class RigController:
 
         # 13. Final guard: fold legacy names, warn once about unknown names, drop non-finite values
         self._finalize_params(p)
+
+        # 14. Universal puppet: canonical Hikari frame -> the loaded puppet's params (+ its own raw overrides)
+        mapper = self._mapper
+        if mapper is not None:
+            self.last_canonical = p
+            p = mapper.map_frame(p)
+            if isinstance(overrides, dict) and overrides:
+                known = self._known
+                for pname, ov in overrides.items():
+                    if pname in p and pname not in known and isinstance(ov, (list, tuple)) and len(ov) == 2:
+                        ox, oy = _ff(ov[0], float("nan")), _ff(ov[1], float("nan"))
+                        if ox == ox and oy == oy:
+                            p[pname] = (_clamp(ox, -1000.0, 1000.0), _clamp(oy, -1000.0, 1000.0))
+        else:
+            self.last_canonical = p
 
         self.last_params = p
         self.last_shader = shader_cfg

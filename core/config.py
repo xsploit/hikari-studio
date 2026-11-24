@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from core.customizer import DEFAULT_CUSTOMIZER_CFG, EYE_STYLE_PRESETS
+from core.puppet_adapter import sanitize_model_cameras, valid_model_id
 from modules.ai_companion import BRAIN_MODES, DEFAULT_AI_CFG, LEGACY_AI_KEYS, LEGACY_BRAIN_MODES, upgrade_persona
 from modules.fish_tts_stream import FISH_TRANSPORTS
 from modules.memory_store import DEFAULT_MEMORY_CFG, LEGACY_MEMORY_KEYS
@@ -216,6 +217,13 @@ def sanitize_section(sec: str, values: Any, template: dict[str, Any] | None = No
             continue
         if sec == "rig" and k == "overrides":
             out[k] = sanitize_overrides(v)
+            continue
+        if sec == "stage" and k == "savedModelCameras":
+            out[k] = sanitize_model_cameras(v)
+            continue
+        if sec == "stage" and k == "activeModel":
+            if isinstance(v, str) and valid_model_id(v):
+                out[k] = v
             continue
         if k not in tpl:
             if isinstance(v, dict):                       # forward-compat: new nested settings, scalars only
@@ -475,6 +483,8 @@ def default_config() -> dict[str, Any]:
             "avatarX": 0.50,
             "avatarY": 0.00,
             "avatarScale": 1.00,
+            "activeModel": "hikari",      # "hikari" (customizable) or a models/library/<id>.inp / .inx puppet
+            "savedModelCameras": {},      # {model_id: {scale, x, y}}: each puppet's own framing, restored on switch
         },
         "camera": {
             "scale": 1.82,

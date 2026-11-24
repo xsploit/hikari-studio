@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 from typing import Any
+import urllib.parse
 import uuid
 
 from aiohttp import WSMsgType, web
@@ -36,6 +37,10 @@ from core.customizer import CharacterCustomizer
 from core.engine_bridge import NativeEngineBridge
 from core.events import HookRegistry
 from core.plugins import PluginManager
+from core.puppet_adapter import (
+    DEFAULT_MINT_CLI, HIKARI_ID, MAX_IMPORT_BYTES, PUPPET_EXTS, ImportError_, PuppetFormatError, import_puppet_file,
+    inspect_puppet, sanitize_model_cameras, valid_model_id,
+)
 from core.rig_controller import EMOTE_CATALOG, VFX_PARAMS, RigController
 from core.wardrobe import WARDROBE_STYLES
 from modules import http_pool, server_keys
@@ -60,6 +65,10 @@ MOTIONS_DIR = HERE / "motions"
 UPLOADS_DIR = HERE / "uploads"
 AUDIO_DIR = UPLOADS_DIR / "audio"
 MEMORY_DIR = HERE / "data" / "memory"
+LIBRARY_DIR = MODELS_DIR / "library"                 # extra Inochi2D puppets (.inp / .inx), switchable live
+HIKARI_MODEL = MODELS_DIR / "Hikari-v28-Custom.inp"
+MINT_CLI = DEFAULT_MINT_CLI
+HIKARI_LABEL = "Hikari (Custom)"
 CONFIG_SECTIONS = ("stage", "camera", "shader", "rig", "lipsync", "visemes", "ai", "memory")
 TMP_DIR = HERE / "data" / "tmp"                      # private (never served)
 CUSTOM_ASSETS_DIR = HERE / "data" / "custom_assets"  # validated eye / hair images (never served)
@@ -378,8 +387,13 @@ class StudioRuntime:
         print("[Hikari Studio] Building HD puppet with VRM Refined eyes & customizer...", flush=True)
         self.customizer = CharacterCustomizer(SRC_MODEL, MODELS_DIR, HERE / "assets" / "vrm_eyes")
         self._customizer_lock = asyncio.Lock()
-        self.model_path = self.customizer.build_custom_model(self.config.data["customizer"], MODELS_DIR / "Hikari-v28-Custom.inp")
+        self.model_path = self.customizer.build_custom_model(self.config.data["customizer"], HIKARI_MODEL)
+        # Hikari's params are the rig's canonical output for EVERY puppet (other puppets get a mapped copy)
         self.param_defaults, self.param_meta = _read_param_meta(self.model_path)
+        self.hikari_param_meta = self.param_meta
+        self._frame_lock = threading.Lock()              # render worker step+render vs. a live puppet switch
+        self._model_lock = asyncio.Lock()
+        self.active_model_id = HIKARI_ID
 
         self.hooks = HookRegistry()
         self.lipsync = LiveLipSyncEngine()
@@ -403,8 +417,24 @@ class StudioRuntime:
 
         self.rig = RigController(self.param_defaults, self.lipsync, self.hooks)
         self.sync_rig_flags()
-        self.engine = NativeEngineBridge(ENGINE_EXE, SDL_DLL, self.model_path, width=960, height=1080)
-        self.engine.start()
+        want = str(self.config.data["stage"].get("activeModel") or HIKARI_ID)
+        want_path = self.library_model_path(want) if want != HIKARI_ID else None
+        if want != HIKARI_ID and want_path is None:
+            print(f"[Hikari Studio] Library puppet {want!r} is missing - starting with {HIKARI_LABEL}", flush=True)
+        self.engine = NativeEngineBridge(ENGINE_EXE, SDL_DLL, want_path or self.model_path, width=960, height=1080)
+        try:
+            self.engine.start()
+            if want_path is not None:
+                self._activate_meta(want, want_path)
+        except Exception as exc:
+            if want_path is None:
+                raise
+            print(f"[Hikari Studio] Puppet {want!r} failed to start ({exc}) - falling back to {HIKARI_LABEL}", flush=True)
+            self.engine.stop()
+            self.engine = NativeEngineBridge(ENGINE_EXE, SDL_DLL, self.model_path, width=960, height=1080)
+            self.engine.start()
+            self._activate_meta(HIKARI_ID, self.model_path)
+        self.config.data["stage"]["activeModel"] = self.active_model_id
 
         self.plugins = PluginManager(HERE / "plugins", self.hooks)
         self.plugins.discover_and_load(self, self.config.data.get("plugins", {}))
@@ -458,21 +488,172 @@ class StudioRuntime:
         except Exception:
             return False
 
+    # ------------------------------------------------------------------ universal puppet library
+    @staticmethod
+    def library_model_path(model_id: str) -> Path | None:
+        """models/library/<id>.inp (or .inx), strictly inside the library folder; None if invalid / missing."""
+        if not valid_model_id(model_id) or model_id.lower() == HIKARI_ID:
+            return None
+        root = LIBRARY_DIR.resolve()
+        for ext in PUPPET_EXTS:
+            cand = LIBRARY_DIR / f"{model_id}{ext}"
+            try:
+                res = cand.resolve()
+            except OSError:
+                continue
+            if res.parent == root and res.is_file():
+                return cand
+        return None
+
+    def model_path_for(self, model_id: str) -> Path | None:
+        return self.model_path if model_id == HIKARI_ID else self.library_model_path(model_id)
+
+    def _activate_meta(self, model_id: str, path: Path) -> dict[str, Any]:
+        """Point the rig + UI meta at `model_id` (the engine is already running it)."""
+        if model_id == HIKARI_ID:
+            self.param_meta = self.hikari_param_meta
+            summary = self.rig.reload_puppet_meta(None, HIKARI_ID)
+        else:
+            info = inspect_puppet(path, model_id)
+            self.param_meta = info.bound_param_meta
+            summary = self.rig.reload_puppet_meta(info.param_meta, model_id)
+        self.active_model_id = model_id
+        return summary
+
+    @staticmethod
+    def hikari_default_camera() -> dict[str, float]:
+        cam = FRAME_TEMPLATES["camera"]
+        return {"scale": float(cam["scale"]), "x": float(cam["x"]), "y": float(cam["y"])}
+
+    def model_entry(self, model_id: str, path: Path) -> dict[str, Any]:
+        info = inspect_puppet(path, model_id)
+        pub = info.public()
+        entry = {
+            "id": model_id,
+            "name": HIKARI_LABEL if model_id == HIKARI_ID else info.name,
+            "file": path.name,
+            "builtin": model_id == HIKARI_ID,
+            "customizable": model_id == HIKARI_ID,
+            "active": model_id == self.active_model_id,
+            "sizeBytes": path.stat().st_size,
+            **{k: pub[k] for k in ("artist", "paramCount", "boundParamCount", "mappedChannels", "unboundChannels",
+                                   "recommendedCamera")},
+        }
+        if model_id == HIKARI_ID:
+            entry["recommendedCamera"] = self.hikari_default_camera()      # her hand-tuned framing
+        return entry
+
+    def list_models(self) -> list[dict[str, Any]]:
+        out = [self.model_entry(HIKARI_ID, self.model_path)]
+        seen: set[str] = {HIKARI_ID}
+        if LIBRARY_DIR.is_dir():
+            files = sorted((f for f in LIBRARY_DIR.iterdir() if f.is_file() and f.suffix.lower() in PUPPET_EXTS),
+                           key=lambda f: (f.stem.lower(), PUPPET_EXTS.index(f.suffix.lower())))
+            for f in files:
+                mid = f.stem
+                if mid in seen or not valid_model_id(mid) or mid.lower() == HIKARI_ID:
+                    continue
+                seen.add(mid)
+                try:
+                    out.append(self.model_entry(mid, f))
+                except (OSError, PuppetFormatError) as exc:
+                    out.append({"id": mid, "name": mid, "file": f.name, "builtin": False, "customizable": False,
+                                "active": False, "error": str(exc)[:200], "paramCount": 0, "mappedChannels": [],
+                                "unboundChannels": [], "recommendedCamera": None})
+        return out
+
+    def _switch_engine_sync(self, model_id: str, path: Path) -> dict[str, Any]:
+        with self._frame_lock:                           # no frame renders with a half-switched rig
+            self.engine.switch_model(path)
+            try:
+                return self._activate_meta(model_id, path)
+            except Exception:
+                prev = self.model_path_for(self.active_model_id) or self.model_path
+                self.engine.switch_model(prev)
+                raise
+
+    def _camera_now(self) -> dict[str, float]:
+        cam = self.config.data["camera"]
+        return {"scale": float(cam.get("scale", 1.82)), "x": float(cam.get("x", 0.0)), "y": float(cam.get("y", 355.0))}
+
+    async def _finish_switch(self, prev_id: str, model_id: str, path: Path, auto_frame: bool,
+                             summary: dict[str, Any]) -> dict[str, Any]:
+        """Camera bookkeeping + persistence + broadcast once the engine is running `model_id`."""
+        stage = self.config.data["stage"]
+        saved = sanitize_model_cameras(stage.get("savedModelCameras") or {})
+        saved[prev_id] = self._camera_now()              # remember the framing of the puppet we are leaving
+        camera = self._camera_now()
+        if auto_frame:
+            if model_id in saved and model_id != prev_id:
+                camera = dict(saved[model_id])
+            elif model_id == HIKARI_ID:
+                camera = self.hikari_default_camera()
+            else:
+                info = await asyncio.to_thread(inspect_puppet, path, model_id)
+                camera = dict(info.recommended_camera)
+            self.config.data["camera"].update(camera)
+        stage["savedModelCameras"] = saved
+        stage["activeModel"] = model_id
+        await self.config.save_async()
+        await self.broadcast_json({"type": "model_changed", "activeModel": model_id, "camera": camera,
+                                   "paramsMeta": self.param_meta, "mappedChannels": summary.get("mappedChannels", [])})
+        await self.broadcast_json({"type": "config_sync", "config": public_config(self.config.data)})
+        return {"ok": True, "activeModel": model_id, "camera": camera,
+                "paramCount": len(self.engine.param_names), "mappedChannels": summary.get("mappedChannels", []),
+                "unboundChannels": summary.get("unboundChannels", [])}
+
+    async def select_model(self, model_id: str, auto_frame: bool = True) -> dict[str, Any]:
+        """Live switch engine + rig to `model_id` (KeyError if unknown; re-raises if it cannot start - the previous
+        puppet keeps running)."""
+        async with self._model_lock:
+            path = self.model_path_for(model_id)
+            if path is None:
+                raise KeyError(model_id)
+            await asyncio.to_thread(inspect_puppet, path, model_id)        # validate before stopping anything
+            prev_id = self.active_model_id
+            if model_id == prev_id:
+                summary = await asyncio.to_thread(self._activate_meta, model_id, path)
+            else:
+                async with self._customizer_lock:
+                    summary = await asyncio.to_thread(self._switch_engine_sync, model_id, path)
+            result = await self._finish_switch(prev_id, model_id, path, auto_frame, summary)
+            if model_id != prev_id:
+                label = HIKARI_LABEL if model_id == HIKARI_ID else model_id
+                self.note_stage_event(f"the viewer switched the stage avatar to {label}", "model")
+            return result
+
     async def apply_customizer(self, values: dict[str, Any], vrm: Path | None = None) -> dict[str, Any]:
-        async with self._customizer_lock:
-            config = {**self.config.data["customizer"], **values}
-            if vrm is not None:
-                await asyncio.to_thread(self.customizer.import_vrm, vrm)
-            await asyncio.to_thread(self._reload_customizer, config)
-            self.config.patch("customizer", config)
-            await self.config.save_async()
-            return config
+        async with self._model_lock:
+            async with self._customizer_lock:
+                config = {**self.config.data["customizer"], **values}
+                if vrm is not None:
+                    await asyncio.to_thread(self.customizer.import_vrm, vrm)
+                prev_id = self.active_model_id
+                await asyncio.to_thread(self._reload_customizer, config)
+                self.config.patch("customizer", config)
+                if prev_id != HIKARI_ID:
+                    # a library puppet was live: Hikari was rebuilt and is back on stage
+                    await self._finish_switch(prev_id, HIKARI_ID, self.model_path, True, {"mappedChannels": []})
+                else:
+                    await self.config.save_async()
+                return config
 
     def _reload_customizer(self, config: dict[str, Any]) -> None:
         candidate = self.model_path.with_suffix(".pending.inp")
         try:
             self.customizer.build_custom_model(config, candidate)
-            self.engine.reload_model(candidate)
+            if self.active_model_id == HIKARI_ID:
+                self.engine.reload_model(candidate)
+            else:
+                # reload_model() replaces the engine's CURRENT file - never let it touch a live library puppet.
+                # Start the candidate, install it as Hikari-v28-Custom.inp, put the rig back on Hikari.
+                with self._frame_lock:
+                    self.engine.switch_model(candidate)
+                    with self.engine._lock:
+                        candidate.replace(self.model_path)
+                        self.engine.model_path = self.model_path
+                    self.param_defaults, self.hikari_param_meta = _read_param_meta(self.model_path)
+                    self._activate_meta(HIKARI_ID, self.model_path)
         finally:
             candidate.unlink(missing_ok=True)
 
@@ -752,9 +933,10 @@ class StudioRuntime:
             last_t = t0
 
             try:
-                params, shader, camera = self.rig.step(dt, self.config.data, self)
-                phys_on = bool(self.config.data["rig"].get("physicsEnabled", True))
-                pkt = self.engine.render_packet(dt, camera, shader, phys_on, params, jpeg_quality=95)
+                with self._frame_lock:                       # a live puppet switch never sees a half-mapped frame
+                    params, shader, camera = self.rig.step(dt, self.config.data, self)
+                    phys_on = bool(self.config.data["rig"].get("physicsEnabled", True))
+                    pkt = self.engine.render_packet(dt, camera, shader, phys_on, params, jpeg_quality=95)
                 self._latest_frame = pkt
 
                 if self._loop is not None:
@@ -904,6 +1086,7 @@ class StudioRuntime:
             "eyeStylePresets": EYE_STYLE_PRESETS,
             "roomAmbient": ROOM_AMBIENT_MAP,
             "paramsMeta": self.param_meta,
+            "activeModel": self.active_model_id,
             "plugins": self.plugins.list_metadata(),
             "pluginErrors": self.plugins.load_errors,
             "hooks": self.hooks.stats(),
@@ -1108,6 +1291,9 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             # rig / camera / shader / stage / visemes feed the 60 FPS loop: type-checked against the defaults,
             # NaN / Inf / non-numeric dropped, numbers clamped, rig.overrides finite [x, y] pairs only.
             vals = sanitize_section(sec, raw, FRAME_TEMPLATES.get(sec))
+            if sec == "stage":
+                vals.pop("activeModel", None)           # puppet switching goes through /api/models/select
+                vals.pop("savedModelCameras", None)
         else:
             return
         if not vals:
@@ -1584,6 +1770,9 @@ def build_app(runtime: StudioRuntime) -> web.Application:
                 val = sanitize_lipsync_patch(val)      # voice calibration is per-voice, not per-preset
             elif sec in FRAME_SECTIONS:
                 val = sanitize_section(sec, val, FRAME_TEMPLATES.get(sec))   # an old / hand-edited preset can't break frames
+                if sec == "stage":
+                    val.pop("activeModel", None)
+                    val.pop("savedModelCameras", None)
             else:
                 continue
             runtime.config.patch(sec, val)
@@ -1596,6 +1785,112 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         await runtime.config.save_async()
         await runtime.broadcast_json({"type": "config_sync", "config": public_config(runtime.config.data)})
         return web.json_response({"ok": True, "config": public_config(runtime.config.data)})
+
+    # ------------------------------------------------------------------ universal puppet library
+    def _truthy(v: Any, default: bool) -> bool:
+        if v is None:
+            return default
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+    async def api_models(_req):
+        models = await asyncio.to_thread(runtime.list_models)
+        return web.json_response({"ok": True, "activeModel": runtime.active_model_id,
+                                  "mintAvailable": await asyncio.to_thread(MINT_CLI.is_file), "models": models})
+
+    async def api_models_select(req):
+        try:
+            body = await req.json()
+        except Exception:
+            body = None
+        if not isinstance(body, dict):
+            return web.json_response({"ok": False, "error": "Expected a JSON object with an id"}, status=400)
+        mid = str(body.get("id") or "").strip()
+        if mid.lower() == HIKARI_ID:
+            mid = HIKARI_ID
+        if not mid or (mid != HIKARI_ID and not valid_model_id(mid)):
+            return web.json_response({"ok": False, "error": "Invalid model id"}, status=400)
+        try:
+            result = await runtime.select_model(mid, _truthy(body.get("autoFrame"), True))
+        except KeyError:
+            return web.json_response({"ok": False, "error": f"Model {mid!r} not found"}, status=404)
+        except PuppetFormatError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=415)
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": f"Could not load {mid}: {exc}",
+                                      "activeModel": runtime.active_model_id}, status=500)
+        return web.json_response(result)
+
+    async def api_models_import(req):
+        try:
+            reader = await req.multipart()
+        except Exception:
+            return web.json_response({"ok": False, "error": "Expected a multipart upload"}, status=400)
+        await asyncio.to_thread(TMP_DIR.mkdir, parents=True, exist_ok=True)
+        tmp: Path | None = None
+        filename = ""
+        opts: dict[str, str] = {}
+        try:
+            while True:
+                field = await reader.next()
+                if field is None:
+                    break
+                if field.name == "file" and tmp is None:
+                    filename = urllib.parse.unquote(field.filename or "")     # some clients percent-encode it
+                    tmp = TMP_DIR / f"puppet_{uuid.uuid4().hex}.part"
+                    await _save_upload(field, tmp, MAX_IMPORT_BYTES)
+                elif field.name in ("autoSelect", "autoFrame"):
+                    opts[field.name] = (await field.read(decode=True))[:16].decode("utf-8", errors="replace")
+            if tmp is None:
+                return web.json_response({"ok": False, "error": "No file field"}, status=400)
+            try:
+                dest = await asyncio.to_thread(import_puppet_file, tmp, filename, LIBRARY_DIR, MINT_CLI, TMP_DIR)
+            except (ImportError_, PuppetFormatError) as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=415)
+        finally:
+            if tmp is not None:
+                await asyncio.to_thread(tmp.unlink, True)
+        mid = dest.stem
+        try:
+            model = await asyncio.to_thread(runtime.model_entry, mid, dest)
+        except Exception as exc:
+            await asyncio.to_thread(dest.unlink, True)
+            return web.json_response({"ok": False, "error": f"Imported puppet is unreadable: {exc}"}, status=415)
+        out: dict[str, Any] = {"ok": True, "model": model, "activeModel": runtime.active_model_id,
+                               "camera": runtime._camera_now()}
+        if _truthy(opts.get("autoSelect"), True):
+            try:
+                res = await runtime.select_model(mid, _truthy(opts.get("autoFrame"), True))
+                out.update(activeModel=res["activeModel"], camera=res["camera"])
+                out["model"]["active"] = True
+            except Exception as exc:
+                out["selectError"] = str(exc)[:300]
+        return web.json_response(out)
+
+    async def api_models_delete(req):
+        mid = req.match_info.get("model_id", "")
+        if mid.lower() == HIKARI_ID:
+            return web.json_response({"ok": False, "error": "The built-in Hikari model cannot be deleted"}, status=400)
+        if not valid_model_id(mid):
+            return web.json_response({"ok": False, "error": "Invalid model id"}, status=400)
+        path = runtime.library_model_path(mid)
+        if path is None:
+            return web.json_response({"ok": False, "error": f"Model {mid!r} not found"}, status=404)
+        if runtime.active_model_id == mid:
+            try:
+                await runtime.select_model(HIKARI_ID, True)
+            except Exception as exc:
+                return web.json_response({"ok": False, "error": f"Could not switch back to Hikari: {exc}"}, status=500)
+        try:
+            await asyncio.to_thread(path.unlink)
+        except OSError as exc:
+            return web.json_response({"ok": False, "error": f"Could not delete: {exc}"}, status=500)
+        saved = runtime.config.data["stage"].get("savedModelCameras")
+        if isinstance(saved, dict) and saved.pop(mid, None) is not None:
+            await runtime.config.save_async()
+        return web.json_response({"ok": True, "deleted": mid, "activeModel": runtime.active_model_id,
+                                  "camera": runtime._camera_now()})
 
     async def api_customizer_apply(req):
         body = await req.json()
@@ -1939,6 +2234,10 @@ def build_app(runtime: StudioRuntime) -> web.Application:
     app.router.add_post("/api/hook/trigger", api_hook_trigger)
     app.router.add_post("/api/presets/save", api_save_preset)
     app.router.add_post("/api/presets/apply", api_apply_preset)
+    app.router.add_get("/api/models", api_models)
+    app.router.add_post("/api/models/select", api_models_select)
+    app.router.add_post("/api/models/import", api_models_import)
+    app.router.add_delete("/api/models/{model_id}", api_models_delete)
 
     app.router.add_static("/static/", WEB_DIR)
     app.router.add_static("/uploads/", UPLOADS_DIR)
