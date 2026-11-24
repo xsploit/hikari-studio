@@ -426,6 +426,8 @@ class VisionTests(unittest.TestCase):
         ai = AICompanion(tmp / "audio")
         rt = FakeRuntime(tmp, ai=ai)
         rt.config.data["ai"].update({"brainMode": "vercel_fish", "ttsEnabled": False})
+        # image straight to the answering model (the Vision Eye "describe" relay is covered by test_vision_model.py)
+        rt.config.data["vision"]["mode"] = "direct"
         ai.update_config(rt.config.data["ai"])
         ai.gateway.chat_request = lambda messages, stream=True, **kw: (   # type: ignore[method-assign]
             "https://ai-gateway.vercel.sh/v1/chat/completions", {}, {"model": "test", "messages": messages, "stream": stream})

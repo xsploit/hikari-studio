@@ -23,6 +23,20 @@ const PROVIDERS = [
   ['custom', 'Custom URL'],
 ];
 
+const DEFAULT_VISION_MODEL = 'openai/gpt-5-mini';
+// Keep the picker and custom field aligned with modules.vercel_gateway.is_vision_model_id.
+function isVisionModelId(id) {
+  if (typeof id !== 'string' || id.length > 160 || !/^[A-Za-z0-9][A-Za-z0-9._+-]*(?:\/[A-Za-z0-9._:@+-]+)+$/.test(id)) return false;
+  const parts = id.toLowerCase().split('/');
+  const leaf = parts.at(-1).replaceAll('_', '.');
+  return parts[0] !== 'openai' || !(/^o1(?:$|[.-]|pro)/.test(leaf) || /(^|[.-])pro([.-]|$)/.test(leaf));
+}
+
+const VISION_MODES = [
+  ['describe', 'Vision Eye → Chat Model (Recommended for DeepSeek / text models)'],
+  ['direct', 'Direct Multimodal Reply (Vision model answers directly)'],
+];
+
 const FISH_MODELS = [
   ['drama-3', 'Drama 3 · Hikari voice'],
   ['s2.1-pro-free', 'S2.1-Pro Free'],
@@ -91,7 +105,7 @@ async function loadDeciders(store, force = false) {
     deciders.loading = false;
     deciders.fetchedAt = Date.now();
     if (deciders.queued) { deciders.queued = false; loadDeciders(store, true); return; }
-    if (store.activeTab === 'voice') store.rerenderPanel();
+    softRerender(store);
   }
 }
 
@@ -101,7 +115,7 @@ function refreshDecidersSoon(store) {
 }
 
 /* ───────── Live Vercel AI Gateway models: GET /api/vercel/models (cached 60 s, no timers) ───────── */
-const gw = { data: null, fetchedAt: 0, loading: false, error: '', queued: false, filter: '' };
+const gw = { data: null, fetchedAt: 0, loading: false, error: '', queued: false, filter: '', vfilter: '' };
 async function loadVercelModels(store, force = false) {
   if (gw.loading) { if (force) gw.queued = true; return; }
   if (!force && Date.now() - gw.fetchedAt < 60000) return;
@@ -476,6 +490,112 @@ export function renderAiPanel(store) {
     }), 'provider pinning pin provider gateway upstream');
   };
 
+  /* Screen Vision — vision model (only gateway models tagged "vision", from the list already fetched above),
+     its own provider pin and the relay mode. Writes the `vision` section; zero extra network calls. */
+  const vcfg = store.config.vision || {};
+  const visionModels = chatModels.filter((m) => Array.isArray(m.tags) && m.tags.includes('vision') && isVisionModelId(m.id));
+  const curVModel = String(vcfg.model || '');
+  const curVInfo = gwModels.find((m) => m.id === (curVModel || DEFAULT_VISION_MODEL));
+  const setVision = (vals) => store.patch('vision', vals);
+
+  const fillVisionOptions = (select) => {
+    const f = (gw.vfilter || '').trim().toLowerCase();
+    const match = (m) => !f || `${m.id} ${m.name || ''} ${m.owner || ''}`.toLowerCase().includes(f);
+    const byOwner = new Map();
+    visionModels.filter(match).forEach((m) => {
+      const owner = String(m.owner || m.id.split('/')[0] || 'other');
+      if (!byOwner.has(owner)) byOwner.set(owner, []);
+      byOwner.get(owner).push(m);
+    });
+    const selectedModel = visionModels.find((m) => m.id === curVModel);
+    select.replaceChildren(...[
+      el('option', { value: '', text: `Auto (${DEFAULT_VISION_MODEL})`, selected: !curVModel }),
+      curVModel && (!selectedModel || !match(selectedModel))
+        ? el('option', { value: curVModel, text: `${selectedModel ? 'Current' : 'Custom'} · ${curVModel}`, selected: true }) : null,
+      ...[...byOwner.keys()].sort().map((owner) => el('optgroup', { label: owner },
+        byOwner.get(owner).sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)))
+          .map((m) => el('option', { value: m.id, text: m.name && m.name !== m.id ? `${m.name} · ${m.id}` : m.id, selected: m.id === curVModel })))),
+      f && !byOwner.size ? el('option', { value: '__none', disabled: true, text: `No vision models match “${gw.vfilter.trim()}”` }) : null,
+    ].filter(Boolean));
+  };
+
+  const visionModelRow = () => {
+    const select = el('select', {
+      class: 'pill-select wide', 'aria-label': 'Vision model',
+      onchange: (e) => { if (e.target.value === '__none') return; setVision({ model: e.target.value }); softRerender(store); },
+    });
+    fillVisionOptions(select);
+    const desc = gw.loading && !gw.data ? 'Loading vision-capable models from the gateway…'
+      : gw.error ? `Live list unavailable (${gw.error}) — paste a vision model ID below`
+        : gw.data ? `${visionModels.length} vision-capable gateway models · sees the screen for text-only chat models`
+          : 'Checking the gateway…';
+    const error = el('span', { class: 's-desc', role: 'status', hidden: true });
+    const validateModel = (input) => {
+      const id = input.value.trim();
+      const valid = !id || isVisionModelId(id);
+      error.textContent = valid ? '' : 'Use a routed provider/model ID up to 160 characters. OpenAI o1 and Pro models are unavailable.';
+      error.hidden = valid;
+      input.setAttribute('aria-invalid', String(!valid));
+      input.setCustomValidity(error.textContent);
+      return valid;
+    };
+    const control = el('div', { class: 'gw-picker' }, [
+      el('div', { class: 'fv-bar' }, [
+        textIn({
+          type: 'search', placeholder: 'Filter vision models…', value: gw.vfilter || '', 'aria-label': 'Filter vision models',
+          'data-focus-key': 'gw.vfilter', oninput: (e) => { gw.vfilter = e.target.value; fillVisionOptions(select); },
+        }),
+        btn(gw.loading ? 'Loading…' : 'Refresh', () => loadVercelModels(store, true), '', { disabled: gw.loading, title: 'Reload live gateway models' }),
+      ]),
+      select,
+      textIn({
+        placeholder: 'Or paste any vision model ID, e.g. google/gemini-2.5-flash',
+        value: curVModel && !visionModels.some((m) => m.id === curVModel) ? curVModel : '',
+        // Saved on change. Let softRerender defer while typing so a catalog refresh cannot commit a partial ID.
+        'aria-label': 'Custom vision model ID', spellcheck: 'false',
+        oninput: (e) => validateModel(e.target),
+        onchange: (e) => {
+          if (!validateModel(e.target)) return;
+          setVision({ model: e.target.value.trim() });
+          requestAnimationFrame(() => softRerender(store));
+        },
+      }),
+      error,
+    ]);
+    return tagged(row({ title: 'Vision model', desc, stack: true, control }), 'vision model screen vision multimodal image model');
+  };
+
+  const visionProviderRow = () => {
+    const vorder = orderList(vcfg.providerOrder);
+    const fromModel = Array.isArray(curVInfo?.providers) && (curVInfo.providersKnown || curVInfo.providers.length > 0);
+    const provs = (fromModel ? curVInfo.providers : (gw.data?.providers || [])).map(String);
+    const pin = vorder[0] || '';
+    const unlisted = Boolean(pin && (fromModel || provs.length) && !provs.includes(pin));
+    const items = [['', 'Auto (Gateway default)'], ...provs.map((p) => [p, p])];
+    if (pin && !provs.includes(pin)) items.push([pin, `${pin} · not listed for this model`]);
+    const vName = curVModel || DEFAULT_VISION_MODEL;
+    const desc = unlisted
+      ? `“${pin}” isn't listed for ${vName} — pick Auto or a listed provider`
+      : fromModel ? `${provs.length} upstream provider${provs.length === 1 ? '' : 's'} serve ${vName}`
+        : 'Showing every gateway provider';
+    return tagged(row({
+      title: 'Vision provider pinning', desc, cls: unlisted ? 'warn-row' : '',
+      control: selectEl(items, pin, (p) => {
+        setVision({ providerOrder: p ? [p, ...vorder.filter((x) => x !== p)].join(',') : '' });
+        softRerender(store);
+      }, { 'aria-label': 'Vision provider pinning', 'data-focus-key': 'gw.visionProvider', class: 'pill-select wide' }),
+    }), 'vision provider pinning screen vision upstream');
+  };
+
+  const visionModeRow = () => tagged(selectRow({
+    label: 'Vision mode',
+    desc: (vcfg.mode || 'describe') === 'direct'
+      ? 'The vision model answers screen turns itself (its own style, image attached)'
+      : 'The Vision Eye describes your screen; your chat model replies in character with its own voice tags',
+    items: withCurrent(VISION_MODES, vcfg.mode || 'describe'), value: vcfg.mode || 'describe',
+    onChange: (v) => { setVision({ mode: v }); softRerender(store); },
+  }), 'vision mode screen vision multimodal describe direct vision eye');
+
   /* Brain & voice mode */
   // A retired mode left in an old settings.json falls back to Fish duplex in the picker.
   const brainMode = BRAIN_MODES.some(([id]) => id === ai.brainMode) ? ai.brainMode : 'fish_duplex';
@@ -540,6 +660,9 @@ export function renderAiPanel(store) {
         checked: store.config.vision?.enabled ?? true,
         onChange: (v) => store.patch('vision', { enabled: v }),
       }), 'screen vision look at my screen screenshot'),
+      visionModelRow(),
+      visionProviderRow(),
+      visionModeRow(),
       row({ title: 'Sample voice take', desc: 'Play a test line through the lip-sync pipeline', control: btn('Play', () => store.playSample()) }),
     ]),
 

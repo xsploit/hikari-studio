@@ -47,11 +47,11 @@ export function softRerender(store) {
   if (typing && !a.dataset.focusKey) {
     if (!blurWait) {
       blurWait = true;
-      a.addEventListener('blur', () => { blurWait = false; softRerender(store); }, { once: true });
+      a.addEventListener('blur', () => { blurWait = false; requestAnimationFrame(() => softRerender(store)); }, { once: true });
     }
     return;
   }
-  const key = typing ? a.dataset.focusKey : '';
+  const key = body?.contains(a) ? a.dataset.focusKey : '';
   let s0 = null; let s1 = null;
   if (key) { try { s0 = a.selectionStart; s1 = a.selectionEnd; } catch { /* no selection API */ } }
   store.rerenderPanel();

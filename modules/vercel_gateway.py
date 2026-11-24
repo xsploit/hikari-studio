@@ -27,6 +27,8 @@ from modules import http_pool, server_keys
 VERCEL_AI_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh/v1"
 DEFAULT_AI_GATEWAY_MODEL = "openai/gpt-5-nano"
 DEFAULT_EMBEDDING_MODEL = "openai/text-embedding-3-small"
+# Screen Vision "Auto": the Vision Eye / direct vision model used when vision.model is blank.
+DEFAULT_VISION_MODEL = "openai/gpt-5-mini"
 # Gateway app-attribution headers (safe, non-secret)
 DEFAULT_GATEWAY_HEADERS = {"http-referer": "https://hikari.studio.local", "x-title": "Hikari Studio"}
 _BLOCKED_HEADERS = {"authorization", "content-type", "content-length", "host", "cookie"}
@@ -97,6 +99,36 @@ def _model_list(value: Any) -> list[str]:
         if "/" in s and not is_premium_cost_model_id(s) and s not in out:
             out.append(s)
     return out[:6]
+
+
+def is_vision_model_id(model_id: Any) -> bool:
+    """A routed, non-premium id usable as a one-off vision model override ('provider/model')."""
+    m = model_id.strip() if isinstance(model_id, str) else ""
+    return (0 < len(m) <= 160 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*(?:/[A-Za-z0-9._:@+-]+)+", m)
+            is not None and not is_premium_cost_model_id(m))
+
+
+def pick_vision_model(value: Any) -> str:
+    return value.strip() if is_vision_model_id(value) else DEFAULT_VISION_MODEL
+
+
+def override_cfg(cfg: dict[str, Any], model_override: str | None = None,
+                 provider_order_override: str | list[str] | None = None) -> dict[str, Any]:
+    """A per-request copy of the AI config for a one-off model (Vision Eye / direct vision turn). The chat model's
+    provider pins and fallback models belong to that model, so they are dropped when the model is overridden;
+    `provider_order_override` (comma string or list) becomes the new order. `cfg` itself is never mutated."""
+    if model_override is None and provider_order_override is None:
+        return cfg
+    out = dict(cfg)
+    if model_override is not None:
+        out["vercelModel"] = pick_vision_model(model_override)
+        out["vercelFallbackModels"] = []
+        out["vercelProviderOrder"] = []
+        out["vercelProviderOnly"] = False
+    if provider_order_override is not None:
+        out["vercelProviderOrder"] = _id_list(provider_order_override)
+        out["vercelProviderOnly"] = False
+    return out
 
 
 # --------------------------------------------------------------------------- payloads
@@ -256,9 +288,14 @@ class VercelGateway:
             return ""
         raise GatewayNotConfigured("Refusing to send gateway credentials to a non-official host.")
 
-    def chat_request(self, messages: list[dict[str, str]], *, stream: bool = True, **kw: Any) -> tuple[str, dict[str, str], dict[str, Any]]:
+    def chat_request(self, messages: list[dict[str, str]], *, stream: bool = True,
+                     model_override: str | None = None, provider_order_override: str | list[str] | None = None,
+                     **kw: Any) -> tuple[str, dict[str, str], dict[str, Any]]:
+        """(endpoint, headers, payload). `model_override` / `provider_order_override` target a one-off model (e.g.
+        vision.model + vision.providerOrder) without mutating self.cfg; None = the configured chat model."""
+        cfg = override_cfg(self.cfg, model_override, provider_order_override)
         return (f"{self.base_url}/chat/completions", gateway_headers(self.cfg, self._key()),
-                build_chat_payload(self.cfg, messages, stream=stream, byok_allowed=self.official, **kw))
+                build_chat_payload(cfg, messages, stream=stream, byok_allowed=self.official, **kw))
 
     async def stream_chat(self, messages: list[dict[str, str]], **kw: Any) -> AsyncIterator[str]:
         endpoint, headers, payload = self.chat_request(messages, stream=True, **kw)

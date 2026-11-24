@@ -31,7 +31,7 @@ from aiohttp.web_runner import GracefulExit
 from core.config import (
     FRAME_SECTIONS, ConfigStore, EXPRESSION_PRESETS, EYE_STYLE_PRESETS, ROOM_AMBIENT_MAP, SHADER_PRESETS, default_config,
     mask_secrets, public_config, sanitize_ai_brain_patch, sanitize_lipsync_patch, sanitize_memory_patch,
-    sanitize_section, secrets_set,
+    sanitize_section, sanitize_vision_patch, secrets_set,
 )
 from core.customizer import DEFAULT_CUSTOMIZER_CFG, CharacterCustomizer
 from core.engine_bridge import NativeEngineBridge
@@ -55,10 +55,11 @@ from modules.fish_tts_stream import FISH_TRANSPORTS, clean_for_speech
 from modules.lipsync import LiveLipSyncEngine
 from modules.memory_store import CATEGORIES, MemoryStore, PinLimitError, temporal_label
 from modules.profiles import ProfileStore
-from modules.screen_vision import capture_screen_jpeg, wants_screen_vision
+from modules.screen_vision import capture_screen_jpeg, describe_screen, wants_screen_vision
 from modules import fish_voices
 from modules.vercel_gateway import (
-    catalog_entries, evaluation_catalog, list_chat_models_and_providers, pick_gateway_model, resolve_gateway_key,
+    pick_vision_model, catalog_entries, evaluation_catalog, list_chat_models_and_providers, pick_gateway_model,
+    resolve_gateway_key,
 )
 from modules.video_retarget import extract_motion_from_video
 
@@ -1470,6 +1471,8 @@ def build_app(runtime: StudioRuntime) -> web.Application:
                 cap = await asyncio.to_thread(capture_screen_jpeg)
             except Exception as exc:
                 cap = {"ok": False, "error": f"capture failed ({exc.__class__.__name__})"}
+            if (runtime.config.data.get("vision") or {}).get("enabled", True) is not True:
+                return {"ok": False, "error": "Screen Vision is disabled"}, 403
             return cap, 200 if cap.get("ok") else 503
     framing_sync: dict[str, Any] = {"task": None, "sender": None}
 
@@ -1504,7 +1507,7 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         elif sec == "memory":
             vals = sanitize_memory_patch(raw)
         elif sec == "vision":
-            vals = {"enabled": raw["enabled"]} if isinstance(raw.get("enabled"), bool) else {}
+            vals = sanitize_vision_patch(raw)             # enabled / model / providerOrder / mode (enum)
         elif sec in FRAME_SECTIONS:
             # rig / camera / shader / stage / visemes feed the 60 FPS loop: type-checked against the defaults,
             # NaN / Inf / non-numeric dropped, numbers clamped, rig.overrides finite [x, y] pairs only.
@@ -1827,6 +1830,18 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         except Exception:
             return None
 
+    def _plan_vision(data_url: str, msg: str) -> tuple[str | None, dict[str, Any], dict[str, Any], Any]:
+        """Route pixels only to the selected vision model. A failed description leaves chat text-only."""
+        vcfg = runtime.config.data.get("vision") or {}
+        model = pick_vision_model(vcfg.get("model"))
+        order = vcfg.get("providerOrder") or ""
+        if vcfg.get("mode") == "direct":
+            return (data_url, {"visionModel": model, "visionMode": "direct"},
+                    {"model_override": model, "provider_order_override": order}, None)
+        eye = asyncio.create_task(describe_screen(data_url, msg, gateway=runtime.ai.gateway,
+                                                  model=model, provider_order=order))
+        return None, {"visionMode": "describe"}, {}, eye
+
     async def api_chat(req):
         body = await _json_body(req)
         if not isinstance(body, dict):
@@ -1846,6 +1861,9 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         greeting = classify_text(msg, "user").emotion == "greeting"
         runtime._last_user_activity = time.monotonic()
         image_data_url: str | None = None
+        vision: dict[str, Any] = {}                    # set only when Screen Vision actually ran this turn
+        gen_kw: dict[str, Any] = {}                    # vision "direct": one-off model / provider override
+        eye = None                                     # Vision Eye task (vision "describe")
         await runtime.ensure_memory()                  # history restored before the first reply
         runtime._chat_inflight = getattr(runtime, "_chat_inflight", 0) + 1
         runtime._ai_busy = True
@@ -1858,17 +1876,31 @@ def build_app(runtime: StudioRuntime) -> web.Application:
                 if include_screen and (runtime.ai.brain_mode == "vercel_fish" or
                                        runtime.config.data["ai"].get("provider", "offline") != "offline"):
                     cap, status = await capture_screen()
-                    if status == 200:
-                        image_data_url = cap.get("dataUrl")
-                ctx = await runtime.prompt_context(msg, greeting=greeting)
+                    if status == 200 and cap.get("dataUrl"):
+                        image_data_url, vision, gen_kw, eye = _plan_vision(cap["dataUrl"], msg)
+                try:
+                    ctx = await runtime.prompt_context(msg, greeting=greeting)   # (the Vision Eye runs meanwhile)
+                except BaseException:
+                    if eye is not None:
+                        eye.cancel()
+                    raise
+                if eye is not None:
+                    desc, used_vmodel = await eye
+                    gen_kw["screen_observation"] = desc
+                    if desc:
+                        vision["visionModel"] = used_vmodel
+                    else:
+                        vision = {}
+                if (runtime.config.data.get("vision") or {}).get("enabled", True) is not True:
+                    image_data_url, vision, gen_kw = None, {}, {}
                 if runtime.ai.voices_inline:
                     if runtime.config.data["ai"].get("segmentedPlayback", True):
                         player = runtime.new_segment_player()
                     reply, pre_voiced = await runtime.ai.generate_reply_with_voice(
                         msg, ctx or "", on_segment=player.push_pcm if player is not None else None,
-                        image_data_url=image_data_url)
+                        image_data_url=image_data_url, **gen_kw)
                 else:
-                    reply = await runtime.ai.generate_reply(msg, ctx or "", image_data_url=image_data_url)
+                    reply = await runtime.ai.generate_reply(msg, ctx or "", image_data_url=image_data_url, **gen_kw)
                 turn = dict(runtime.ai.last_turn) if pre_voiced or player is not None else {}
         except Exception:
             if player is not None:
@@ -1891,7 +1923,7 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             _cancel_wave()          # no reply is coming: an on_reply wave must not fire later
             return web.json_response({"ok": False, "error": err, "history": runtime.ai.history[-24:],
                                       "decisions": {"user": user_decision.to_dict()}, "brainMode": runtime.ai.brain_mode,
-                                      "usedVision": image_data_url is not None},
+                                      "usedVision": bool(vision), **vision},
                                      status=502)
         runtime.commit_context(ctx, reply, delivered=True)       # both turns were persisted inside AICompanion
         # Emotion decision runs alongside TTS / playback; it never delays her voice.
@@ -1911,7 +1943,7 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             "context": ctx.debug if ctx is not None else {},
             "recallMs": round(runtime.memory.last_recall_ms, 3),
             "turn": turn,
-            "usedVision": image_data_url is not None,
+            "usedVision": bool(vision), **vision,
         })
 
     async def api_memory_status(_req):

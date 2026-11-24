@@ -9,6 +9,7 @@ import { renderRigPanel, renderParamInspector } from './panels/rig_panel.js';
 import { renderCustomizerPanel } from './panels/customizer_panel.js';
 import { renderMotionPanel } from './panels/motion_panel.js';
 import { renderAiPanel } from './panels/ai_panel.js';
+import { softRerender } from './panels/voice_design.js';
 import { renderPluginsPanel } from './panels/plugins_panel.js';
 import { renderMemoryPanel } from './panels/memory_panel.js';
 import { EMOTES, emoteGrid, firePill, loadEmotes } from './panels/emotes.js';
@@ -247,11 +248,11 @@ async function boot() {
           const status = await resp.json();
           if (lastFishSession !== sessionId) return;
           store.fishStatus = status;
-          if (store.activeTab === 'voice') store.rerenderPanel();
+          softRerender(store);
         }).catch(() => {});
       }
       lastFishSession = sessionId;
-      if (store.activeTab === 'voice') store.rerenderPanel();
+      softRerender(store);
     },
     onMessage: async ({ role, text }) => {
       if (!text) return;

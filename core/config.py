@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from typing import Any
 from core.customizer import DEFAULT_CUSTOMIZER_CFG, EYE_STYLE_PRESETS
 from core.puppet_adapter import sanitize_model_cameras, valid_model_id
 from modules.ai_companion import BRAIN_MODES, DEFAULT_AI_CFG, LEGACY_AI_KEYS, LEGACY_BRAIN_MODES, upgrade_persona
+from modules.vercel_gateway import is_vision_model_id
 from modules.fish_tts_stream import FISH_TRANSPORTS
 from modules.memory_store import DEFAULT_MEMORY_CFG, LEGACY_MEMORY_KEYS
 from modules.lipsync import DEFAULT_LIPSYNC_CFG, DEFAULT_PARAM_MAP, DEFAULT_VISEMES, LIPSYNC_ENGINES, MFCC_SCORING
@@ -268,6 +270,46 @@ def sanitize_section(sec: str, values: Any, template: dict[str, Any] | None = No
 
 
 FRAME_SECTIONS = ("stage", "camera", "shader", "rig", "visemes")
+
+# Screen Vision. model "" = Auto (openai/gpt-5-mini Vision Eye); providerOrder = optional comma-separated upstream pin
+# for the vision model; mode "describe" = Vision Eye summarizes the screen into the turn context so the main chat
+# model (even a text-only one such as DeepSeek) replies in character; "direct" = the vision model answers the turn.
+VISION_MODES = ("describe", "direct")
+DEFAULT_VISION_CFG: dict[str, Any] = {"enabled": True, "model": "", "providerOrder": "", "mode": "describe"}
+_VISION_PROVIDER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def sanitize_vision_patch(values: Any) -> dict[str, Any]:
+    """`vision` section: bool enabled, bounded routed model id ("" = Auto), comma-separated provider ids,
+    mode in VISION_MODES (anything else -> "describe"). Unknown keys are dropped."""
+    if not isinstance(values, dict):
+        return {}
+    out: dict[str, Any] = {}
+    if isinstance(values.get("enabled"), bool):
+        out["enabled"] = values["enabled"]
+    m = values.get("model")
+    if isinstance(m, str):                              # non-strings are dropped; "" = Auto
+        m = m.strip()
+        if not m or is_vision_model_id(m):
+            out["model"] = m
+    if "providerOrder" in values:
+        raw = values.get("providerOrder")
+        items = raw if isinstance(raw, (list, tuple)) else re.split(r"[,\s]+", raw if isinstance(raw, str) else "")
+        provs: list[str] = []
+        for p in items:
+            if not isinstance(p, str):
+                continue
+            p = p.strip().lower()
+            if p and _VISION_PROVIDER_RE.fullmatch(p) and p not in provs:
+                provs.append(p)
+                if len(provs) == 8:
+                    break
+        out["providerOrder"] = ",".join(provs)
+    if "mode" in values:
+        mode = values.get("mode")
+        mode = mode.strip().lower() if isinstance(mode, str) else ""
+        out["mode"] = mode if mode in VISION_MODES else "describe"
+    return out
 
 
 def sanitize_memory_patch(values: dict[str, Any]) -> dict[str, Any]:
@@ -539,7 +581,7 @@ def default_config() -> dict[str, Any]:
         "lipsync": copy.deepcopy(DEFAULT_LIPSYNC_CFG),
         "visemes": copy.deepcopy(DEFAULT_VISEMES),
         "ai": {**copy.deepcopy(DEFAULT_AI_CFG), "fishVocalTags": DEFAULT_AI_CFG.get("fishVocalTags", True)},
-        "vision": {"enabled": True},
+        "vision": copy.deepcopy(DEFAULT_VISION_CFG),
         "customizer": copy.deepcopy(DEFAULT_CUSTOMIZER_CFG),
         "memory": copy.deepcopy(DEFAULT_MEMORY_CFG),
         "plugins": {},
@@ -571,6 +613,8 @@ class ConfigStore:
                     for sec in FRAME_SECTIONS:                # a bad value already on disk can't break frames
                         if isinstance(saved.get(sec), dict):
                             saved[sec] = sanitize_section(sec, saved[sec], self.data.get(sec) if sec != "visemes" else None)
+                    if "vision" in saved:              # bounded model / provider ids, mode enum
+                        saved["vision"] = sanitize_vision_patch(saved["vision"])
                     _deep_merge(self.data, saved)
             except Exception:
                 pass
