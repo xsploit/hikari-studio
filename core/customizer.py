@@ -1366,6 +1366,153 @@ def _clean_wave_arm_premul(img_path: Path, is_upper: bool = False, is_left: bool
     return buf.getvalue()
 
 
+# Ball-joint shaping for the raised wave arms (applied to the clean HD wave textures at build time; source art untouched).
+# Each joint end is trimmed to a disc centred on its pivot, so the part keeps the same outline at any rotation and
+# its corners can never swing out past the neighbouring part. Past the pivot line the trim radius grows by
+# WAVE_BALL_SLOPE units per unit, so the disc blends into the straight limb with no step or dent.
+#   wrist 16 = half the forearm/hand width at the wrist pivot
+#   elbow 28 = the closest the upper arm's outer contour comes to the elbow pivot below it
+WAVE_WRIST_BALL_R = 16.0
+WAVE_ELBOW_BALL_R = 28.0
+WAVE_BALL_SLOPE = 1.5
+WAVE_BALL_FEATHER = 0.8
+WAVE_LINE_RGB = (150.0, 99.0, 82.0)   # the wave art's warm-brown outline (measured from its edges)
+WAVE_LINE_W = 0.7                      # outline width in model units (~5.5 texture px)
+WaveTrim = dict[str, Any]
+
+
+def _wave_joint_masks(header: bytes) -> dict[int, list[WaveTrim]]:
+    """Per wave-arm texture id: the joint trims to apply (pivots read from the rig, in that part's uv space)."""
+    puppet = json.loads(header[12:])
+    nodes: dict[int, dict[str, Any]] = {}
+    stack = [puppet["nodes"]]
+    while stack:
+        n = stack.pop()
+        nodes[n["uuid"]] = n
+        stack.extend(n.get("children", ()))
+    out: dict[int, list[WaveTrim]] = {}
+
+    def trans(nid: int) -> tuple[float, float]:
+        t = nodes.get(nid, {}).get("transform", {}).get("trans", [0.0, 0.0])
+        return float(t[0]), float(t[1])
+
+    def add(part_id: int, pivot: tuple[float, float], **trim: Any) -> None:
+        part = nodes.get(part_id)
+        if not part or not part.get("mesh"):
+            return
+        m = part["mesh"]
+        verts = np.array(m["verts"], dtype=np.float64).reshape(-1, 2)
+        uvs = np.array(m["uvs"], dtype=np.float64).reshape(-1, 2)
+        ax = np.polyfit(verts[:, 0], uvs[:, 0], 1)
+        ay = np.polyfit(verts[:, 1], uvs[:, 1], 1)
+        trim.update(cu=float(np.polyval(ax, pivot[0])), cv=float(np.polyval(ay, pivot[1])),
+                    su=float(ax[0]), sv=float(ay[0]))
+        out.setdefault(int(part["textures"][0]), []).append(trim)
+
+    for upper, forearm, hand, elbow, wrist, inner in ((50001, 50002, 50003, 50005, 50004, +1.0),
+                                                       (50010, 50011, 50012, 50014, 50013, -1.0)):
+        if wrist not in nodes or elbow not in nodes:
+            continue
+        # dir = which side of the pivot is the joint end (texture y points down)
+        add(forearm, trans(wrist), kind="disc", r=0.0, dir=-1.0, start=1.5, line=True, center_row=True)   # distal cap, under the hand
+        # The hand's own wrist base stays untouched (full original outline): with the near-rigid wrist its base
+        # matches the forearm width and only tilts <= ~11.5 deg, and any cut there doubles the outline at the seam.
+        add(forearm, (0.0, 0.0), kind="disc", r=WAVE_ELBOW_BALL_R, dir=+1.0, start=3.0)     # elbow cap, over the upper arm
+        # Outer elbow of the upper arm (outer side only, y -14..+12 around the pivot): it bulges 29-32 units out,
+        # so when the forearm swung in it showed as a corner past the forearm's elbow disc. Trim it to an arc just
+        # outside the forearm's (+0.5) and re-draw the outline on it, since this arc is the visible silhouette.
+        add(upper, trans(elbow), kind="bulge", r=WAVE_ELBOW_BALL_R + 0.5, outer=-inner, y_lo=-14.0, y_hi=12.0,
+            line=True)
+        # The art fades the forearm's inner (crease) edge over ~5 units and kinks it outward ~3.5 units at the
+        # crease (y -52..-30) so it melts under the upper arm; when the elbow opens both swing into view as a ghost
+        # wedge + jog. Make that edge crisp and straight (the line the art follows above and below: 15.5 @ y-62 ->
+        # 25.2 @ y-22, elbow-pivot units).
+        add(forearm, (0.0, 0.0), kind="crisp", side=inner, y_from=-60.0, line=(15.5, -62.0, 0.2425))
+        # Same soft fade on the upper arm's crease edge (elbow-pivot y -52..-10): crisp it so the crease apex is a
+        # clean V instead of a fuzzy spike when the elbow opens.
+        add(upper, trans(elbow), kind="crisp", side=0.0, y_from=-58.0, y_to=-6.0)
+    return out
+
+
+def _round_wave_joint_premul(premul_png: bytes, trims: list[WaveTrim]) -> bytes:
+    """Apply ball-joint trims (and crease-edge hardening) to a premultiplied wave-arm texture."""
+    im = np.array(Image.open(io.BytesIO(premul_png)).convert("RGBA"), dtype=np.float32)
+    h, w = im.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    a0 = im[..., 3] / 255.0
+    a = a0.copy()
+    line_w = np.zeros((h, w), dtype=np.float32)
+    d_in = cv2.distanceTransform((a0 > 0.5).astype(np.uint8), cv2.DIST_L2, 5)   # px inside the original outline
+
+    def add_line(e: np.ndarray, wgt: np.ndarray | float = 1.0, edge_only: bool = False, px_per_unit: float = 1.0) -> None:
+        """Outline colour along a new trimmed edge (e = distance inside it, model units), including its
+        half-transparent fringe so no pale skin pixels show where the cut crosses the original outline.
+        edge_only: just where the cut meets the original outline (for parts drawn OVER another part)."""
+        lw = np.clip((WAVE_LINE_W - e) / 0.25, 0.0, 1.0) * (e > -WAVE_BALL_FEATHER) * (a0 > 0.02)
+        if edge_only:
+            lw = lw * np.clip((2.0 - d_in / px_per_unit) / 0.6, 0.0, 1.0)
+        np.maximum(line_w, lw * wgt, out=line_w)
+
+    for tr in trims:
+        ux = (xx / w - tr["cu"]) / tr["su"]          # model units relative to the pivot
+        uy = (yy / h - tr["cv"]) / tr["sv"]
+        if tr["kind"] == "disc" and tr.get("center_row"):
+            # Wrist: the pivot sits ~0.7 units off the limb's centreline, so centre the disc on the limb itself
+            # (measured on the pivot row) with r = its half-width + r. Wrist bends stay <= ~11.5 deg, so the
+            # off-pivot centre drifts < 0.2 units - far less than the dent a pivot-centred disc leaves.
+            row = int(np.clip(round(tr["cv"] * h), 0, h - 1))
+            xs = np.where(a0[row] > 0.5)[0]
+            if len(xs):
+                lo, hi = (xs[0] / w - tr["cu"]) / tr["su"], (xs[-1] / w - tr["cu"]) / tr["su"]
+                ux = ux - 0.5 * (lo + hi)
+                tr = {**tr, "r": 0.5 * abs(hi - lo) + tr["r"]}
+        if tr["kind"] == "disc":
+            t = tr["dir"] * uy                        # distance past the pivot line, toward the joint end
+            r_eff = tr["r"] + WAVE_BALL_SLOPE * np.maximum(0.0, tr.get("start", 0.0) - t)
+            d = np.sqrt(ux * ux + uy * uy)
+            a = a * np.clip((r_eff - d) / WAVE_BALL_FEATHER + 0.5, 0.0, 1.0)
+            if tr.get("line"):
+                add_line(r_eff - d, edge_only=tr["line"] == "edge", px_per_unit=tr["su"] * w)
+        elif tr["kind"] == "fringe":
+            row = int(np.clip(round(tr["cv"] * h), 0, h - 1))
+            xs = np.where(a0[row] > 0.5)[0]
+            if not len(xs):
+                continue
+            lo, hi = (xs[0] / w - tr["cu"]) / tr["su"], (xs[-1] / w - tr["cu"]) / tr["su"]
+            off = np.abs(ux - 0.5 * (lo + hi)) - (0.5 * (hi - lo) - tr["edge_units"])
+            near_side = np.clip(off / 0.5, 0.0, 1.0)              # only the two side corners, not the bottom
+            soft = (a0 > 0.02) & (a0 < 0.97)
+            wgt = np.clip((uy - tr["y_from"]) / 1.0, 0.0, 1.0) * near_side * soft
+            np.maximum(line_w, wgt.astype(np.float32), out=line_w)
+        elif tr["kind"] == "bulge":
+            r_eff = tr["r"] + WAVE_BALL_SLOPE * (np.maximum(0.0, uy - tr["y_hi"]) + np.maximum(0.0, tr["y_lo"] - uy))
+            d = np.sqrt(ux * ux + uy * uy)
+            wgt = np.clip(tr["outer"] * ux / 4.0, 0.0, 1.0)
+            a = a * (1.0 - wgt * (1.0 - np.clip((r_eff - d) / WAVE_BALL_FEATHER + 0.5, 0.0, 1.0)))
+            if tr.get("line"):
+                add_line(r_eff - d, wgt)
+        else:
+            wgt = np.clip((uy - tr["y_from"]) / 4.0, 0.0, 1.0) * np.clip((tr.get("y_to", 1e9) - uy) / 4.0, 0.0, 1.0)
+            if tr["side"]:
+                wgt = wgt * np.clip(tr["side"] * ux / 2.0, 0.0, 1.0)
+            crisp = np.clip((a - 0.5) / 0.12 + 0.5, 0.0, 1.0)
+            crisp = crisp * crisp * (3.0 - 2.0 * crisp)
+            if "line" in tr:
+                x0, y0, slope = tr["line"]
+                crisp = crisp * np.clip((x0 + slope * (uy - y0) - tr["side"] * ux) / WAVE_BALL_FEATHER + 0.5, 0.0, 1.0)
+            a = a * (1.0 - wgt) + np.minimum(a, crisp) * wgt
+    rgb = im[..., :3] / np.maximum(a0, 1e-4)[..., None]          # straight colour
+    lw3 = line_w[..., None]
+    rgb = rgb * (1.0 - lw3) + np.array(WAVE_LINE_RGB, dtype=np.float32) * lw3
+    im[..., :3] = rgb * a[..., None]
+    im[..., 3] = a * 255.0
+    out = np.clip(np.rint(im), 0, 255).astype(np.uint8)
+    out[out[..., 3] == 0] = 0
+    buf = io.BytesIO()
+    Image.fromarray(out).save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
 def _load_wraparound_collar_asset() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]], bytes] | None:
     """Extract the rigged wraparound halter collar node (51001), its deform bindings, and tex[61]
     from assets/collar_preview/Hikari-v28-CollarPreview.inp."""
@@ -1545,6 +1692,7 @@ def _attach_wraparound_collar(
 # Rig tuning post-pass: wider (safe) raised wave-arm ranges + Mouth Spring anchor. The original seamless resting
 # arms (#1046 / #1000, deformed with the torso) are left untouched.
 # ---------------------------------------------------------------------------------------------------------------
+WAVE_FOREARM_OUT = 20.0   # deg the raised forearm rests tilted outward from vertical
 RAISED_ARM_PARAMS = {"Arm R Elbow": 53110, "Arm R Wrist": 53111, "Arm L Elbow": 53112, "Arm L Wrist": 53113}
 
 
@@ -1570,16 +1718,20 @@ def _new_param_1d(name: str, uid: int) -> dict[str, Any]:
 
 def _tune_arm_and_mouth_rig(header: bytes) -> bytes:
     """- Raised wave arms: lock Arm R/L Lift tightly to -5.5..+6.5 deg so shoulders NEVER separate or notch on
-      any emote/slider, while Arm R/L Gesture (elbow +-24 / wrist +-22 deg) and separate Arm R/L Elbow/Wrist
-      carry the lively motion cleanly inside the wave art's closed joint overlap.
+      any emote/slider. The forearm rests tilted WAVE_FOREARM_OUT deg outward (a wave, not hands-up) and the
+      waving comes from the elbow: Gesture elbow +-16, Elbow slider -14..+26 (+ = fold). The hand art already
+      contains the wrist, so it rides almost rigidly on the forearm (Gesture +-4, Wrist slider +-6, Swing +-1.5
+      deg) - any real wrist bend reads as a broken hand. Stacked extremes (elbow -50..+32 incl. rest tilt)
+      stay inside the wave art's rounded ball joints (see _wave_joint_masks).
     - Mouth Spring physics anchor follows the live VB Mouth / Jaw Open (the legacy 'Mouth' param is never driven)."""
     puppet = json.loads(header[12:])
-    nodes: set[int] = set()
+    node_by_id: dict[int, dict[str, Any]] = {}
     stack = [puppet["nodes"]]
     while stack:
         n = stack.pop()
-        nodes.add(n["uuid"])
+        node_by_id[n["uuid"]] = n
         stack.extend(n.get("children", ()))
+    nodes = set(node_by_id)
     params = puppet.setdefault("param", [])
     by_name = {str(p.get("name")): p for p in params}
 
@@ -1590,13 +1742,19 @@ def _tune_arm_and_mouth_rig(header: bytes) -> bytes:
         lift = by_name.get(f"Arm {side} Lift")
         if lift is not None:
             _bind_1d(lift, sh, "transform.r.z", sg * _deg(-5.5), 0.0, sg * _deg(6.5))
+        # Rest pose: forearm (and the hand riding on it) tilted outward. r.z > 0 = clockwise on screen, and the
+        # right arm is on screen-left, so outward is negative for R.
+        rot = node_by_id[el].setdefault("transform", {}).setdefault("rot", [0.0, 0.0, 0.0])
+        rot[2] = sg * _deg(-WAVE_FOREARM_OUT)
         gest = by_name.get(f"Arm {side} Gesture")
         if gest is not None:
-            _bind_1d(gest, el, "transform.r.z", sg * _deg(24.0), 0.0, sg * _deg(-24.0))
-            _bind_1d(gest, wr, "transform.r.z", sg * _deg(22.0), 0.0, sg * _deg(-22.0))
-        # Beyond about -35 / +30 deg the wave art's elbow overlap opens up, so the extra range stops there.
-        for pname, nid, v_neg, v_pos in ((f"Arm {side} Elbow", el, sg * _deg(-35.0), sg * _deg(30.0)),   # + = fold
-                                         (f"Arm {side} Wrist", wr, sg * _deg(-30.0), sg * _deg(30.0))):
+            _bind_1d(gest, el, "transform.r.z", sg * _deg(16.0), 0.0, sg * _deg(-16.0))
+            _bind_1d(gest, wr, "transform.r.z", sg * _deg(4.0), 0.0, sg * _deg(-4.0))
+        swing = by_name.get(f"Arm {side} Swing")
+        if swing is not None:
+            _bind_1d(swing, wr, "transform.r.z", sg * _deg(1.5), 0.0, sg * _deg(-1.5))
+        for pname, nid, v_neg, v_pos in ((f"Arm {side} Elbow", el, sg * _deg(-14.0), sg * _deg(26.0)),   # + = fold
+                                         (f"Arm {side} Wrist", wr, sg * _deg(-6.0), sg * _deg(6.0))):
             prm = by_name.get(pname)
             if prm is None:
                 prm = _new_param_1d(pname, RAISED_ARM_PARAMS[pname])
@@ -1640,6 +1798,7 @@ class CharacterCustomizer:
         self._header_seethrough = header
         self._header_solid = _sweep_front_bangs(header)
         self._header_json = self._header_solid
+        self._wave_joints = _wave_joint_masks(header)
         self.wardrobe_seethrough = Wardrobe(self._header_seethrough)
         self.wardrobe = Wardrobe(self._header_solid)
         self._base_hd_textures: list[tuple[int, bytes]] | None = None
@@ -1884,7 +2043,11 @@ class CharacterCustomizer:
                             self._smooth_wardrobe_cache[ckey] = _clean_wave_arm_premul(wpath, is_upper=is_up, is_left=is_l)
                         else:
                             self._smooth_wardrobe_cache[ckey] = _straight_png_to_premul(wpath)
-                    out_texs[tid_w] = (0, self._smooth_wardrobe_cache[ckey])
+                    jkey = f"{ckey}_joint_v14_{WAVE_WRIST_BALL_R}_{WAVE_ELBOW_BALL_R}_{WAVE_BALL_SLOPE}"
+                    trims = self._wave_joints.get(tid_w)
+                    if trims and jkey not in self._smooth_wardrobe_cache:
+                        self._smooth_wardrobe_cache[jkey] = _round_wave_joint_premul(self._smooth_wardrobe_cache[ckey], trims)
+                    out_texs[tid_w] = (0, self._smooth_wardrobe_cache[jkey if trims else ckey])
                 elif tid_w in (53, 54):
                     ckey = f"raised_{tid_w}"
                     if ckey not in self._smooth_wardrobe_cache:

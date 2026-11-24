@@ -23,7 +23,7 @@ const TABS = {
               render: (s) => [...renderRigPanel(s), ...renderMotionPanel(s)] },
   voice:    { title: 'Voice & Brain',      sub: 'Brain & voice mode, gateway pinning, live call, speech and personality.',
               render: (s) => renderAiPanel(s) },
-  memory:   { title: 'Memory',             sub: 'SLEEP memory, dreaming and the Colab 4B LoRA export.',
+  memory:   { title: 'Memory & Context',   sub: 'Conversation continuity across restarts, saved memories, notes and chat history.',
               render: (s) => renderMemoryPanel(s) },
   lipsync:  { title: 'Lip-Sync',           sub: 'Microphone, mouth physics and the Viseme Studio.',
               render: (s) => renderLipSyncPanel(s) },
@@ -219,7 +219,7 @@ async function boot() {
     onMessage: async ({ role, text }) => {
       if (!text) return;
       if (role === 'agent') {
-        // Let the viewer's line land first so the backend pairs both sides into SLEEP memory (bounded wait).
+        // Let the viewer's line land first so the backend pairs both sides into one saved turn (bounded wait).
         await Promise.race([fishUserPost, new Promise((r) => setTimeout(r, 1500))]);
         const r = await fetch('/api/fish/emote', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -228,7 +228,7 @@ async function boot() {
         showSubtitle(r.tag || 'drama-3', r.clean || text, 7.0);
       } else {
         showSubtitle('you', text, 3.5);
-        // Fire-and-forget: viewer emotion/wave decisions + pending viewer turn for SLEEP memory.
+        // Fire-and-forget: viewer emotion/wave decisions + pending viewer turn for conversation memory.
         fishUserPost = fetch('/api/fish/emote', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ role: 'user', text }),

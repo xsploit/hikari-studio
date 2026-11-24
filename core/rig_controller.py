@@ -1102,8 +1102,8 @@ class RigController:
         if self._has_raised_joints:
             p["Arm R Elbow"] = (_clamp(0.10 * arm_r_pose * math.sin(t_now * 1.3), -1.0, 1.0), 0.0)
             p["Arm L Elbow"] = (_clamp(0.10 * arm_l_pose * math.sin(t_now * 1.1 + 0.7), -1.0, 1.0), 0.0)
-            p["Arm R Wrist"] = (_clamp(1.4 * (lag_r - arm_r_gest) * arm_r_pose, -1.0, 1.0), 0.0)
-            p["Arm L Wrist"] = (_clamp(1.4 * (lag_l - arm_l_gest) * arm_l_pose, -1.0, 1.0), 0.0)
+            p["Arm R Wrist"] = (_clamp(1.1 * (lag_r - arm_r_gest) * arm_r_pose, -0.7, 0.7), 0.0)
+            p["Arm L Wrist"] = (_clamp(1.1 * (lag_l - arm_l_gest) * arm_l_pose, -0.7, 0.7), 0.0)
         p["Sparkle Eyes"] = (sparkle, 0.0)
         p["Anime Blush Lines"] = (blush, 0.0)
 

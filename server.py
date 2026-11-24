@@ -48,10 +48,8 @@ from modules.decision_engine import (
 from modules.fish_duplex import FishDuplexController, compose_session_prompt
 from modules.fish_tts_stream import FISH_TRANSPORTS, clean_for_speech
 from modules.lipsync import LiveLipSyncEngine
-from modules.sleep_memory import COLAB_BASE_MODELS, MEMORY_KINDS, SleepMemory
-from modules.vercel_gateway import (
-    catalog_entries, complete_openai_compat, evaluation_catalog, local_backend_hint, local_chat_request,
-)
+from modules.memory_store import CATEGORIES, MemoryStore, PinLimitError
+from modules.vercel_gateway import catalog_entries, evaluation_catalog
 from modules.video_retarget import extract_motion_from_video
 
 HERE = Path(__file__).resolve().parent
@@ -62,7 +60,6 @@ MOTIONS_DIR = HERE / "motions"
 UPLOADS_DIR = HERE / "uploads"
 AUDIO_DIR = UPLOADS_DIR / "audio"
 MEMORY_DIR = HERE / "data" / "memory"
-COLAB_NOTEBOOK = HERE / "tools" / "hikari_sleep_colab_lora.ipynb"
 CONFIG_SECTIONS = ("stage", "camera", "shader", "rig", "lipsync", "visemes", "ai", "memory")
 TMP_DIR = HERE / "data" / "tmp"                      # private (never served)
 CUSTOM_ASSETS_DIR = HERE / "data" / "custom_assets"  # validated eye / hair images (never served)
@@ -396,11 +393,12 @@ class StudioRuntime:
         self.fish_duplex.set_persona(self.ai.persona)
         self.decisions = DecisionEngine(self.config.data["ai"])
         self._idle_task: asyncio.Task | None = None
-        self.memory = SleepMemory(MEMORY_DIR, self.config.data.get("memory") or {}, gateway=self.ai.gateway,
+        # Real-time memory: every chat / voice turn persisted to SQLite immediately + Waifu Studio-style facts.
+        self.memory = MemoryStore(MEMORY_DIR, self.config.data.get("memory") or {}, gateway=self.ai.gateway,
                                   persona=self.ai.persona, decision_cfg=lambda: self.config.data["ai"])
-        self._sleep_task: asyncio.Task | None = None
+        self.ai.attach_memory(self.memory, self.memory.history_turns)
+        self._memory_task: asyncio.Task | None = None
         self._last_user_activity = time.monotonic()
-        self._fish_pending_user = ""
         self._bg_tasks: set[asyncio.Task] = set()
 
         self.rig = RigController(self.param_defaults, self.lipsync, self.hooks)
@@ -484,7 +482,41 @@ class StudioRuntime:
         self._render_thread = threading.Thread(target=self._render_worker, daemon=True, name="hikari-render")
         self._render_thread.start()
         self._idle_task = loop.create_task(self._idle_decision_loop())
-        self.spawn(self.memory.init())
+        self._memory_task = self.spawn(self._init_memory())
+
+    async def _init_memory(self) -> None:
+        """Open the memory DB and reload the last N conversation turns into the companion's history, so a restart
+        never forgets where you left off."""
+        await self.memory.init()
+        n = await self.ai.restore_history()
+        if n or self.memory.imported_legacy_turns:
+            print(f"[Hikari Studio] Memory: restored {n} conversation messages"
+                  + (f" (imported {self.memory.imported_legacy_turns} legacy turns)" if self.memory.imported_legacy_turns else ""),
+                  flush=True)
+
+    async def ensure_memory(self) -> None:
+        """Chat / calls wait for the history restore (normally done long before the first message)."""
+        task = self._memory_task
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), 5.0)
+            except Exception:
+                pass
+
+    async def record_turn(self, role: str, text: str, channel: str = "voice") -> None:
+        """A Fish Live 3 / Drama 3 transcript line: into the companion history AND SQLite right now (plus
+        immediate memory extraction for the viewer's lines). Never raises."""
+        try:
+            await self.ensure_memory()
+            await self.ai.add_external_turn(role, text, channel)
+        except Exception as exc:
+            print(f"[Hikari Studio] Voice turn persist error: {exc.__class__.__name__}", flush=True)
+
+    async def clear_conversation(self) -> int:
+        """Clear the persisted transcript + in-memory history. Long-term facts / pinned notes are kept."""
+        await self.ensure_memory()
+        self.ai.clear_history()
+        return await self.memory.clear_turns()
 
     def spawn(self, coro: Any) -> asyncio.Task:
         """Fire-and-forget background work that is kept alive and never raises into the loop."""
@@ -509,6 +541,10 @@ class StudioRuntime:
         self.decisions.update_config(self.config.data["ai"])
         self.memory.persona = self.ai.persona
 
+    def apply_memory_config(self) -> None:
+        self.memory.update_config(self.config.data["memory"])
+        self.ai.set_history_turns(self.memory.history_turns)
+
     async def apply_decision(self, d: Decision, *, temp_action: bool = False, hold: float = 4.2) -> Decision:
         """Play a decided emote (already cooldown-gated) and tell connected clients."""
         if d.emote:
@@ -528,21 +564,9 @@ class StudioRuntime:
             d = Decision(source=source, skipped="error", note=exc.__class__.__name__)
         return await self.apply_decision(d, temp_action=temp_action, hold=hold)
 
-    def _auto_sleep_check(self, busy: bool) -> bool:
-        """SLEEP auto-consolidation after a long quiet stretch (background task). Runs whether or not a viewer
-        tab is connected: the desktop app can sit minimised / closed-to-tray for hours."""
-        if busy or self._shutting_down:
-            return False
-        if not self.memory.should_auto_sleep(time.monotonic() - self._last_user_activity):
-            return False
-        if self._sleep_task is not None and not self._sleep_task.done():
-            return False
-        self._sleep_task = self.spawn(self.run_sleep(reason="idle"))
-        return True
-
     async def _idle_decision_loop(self) -> None:
         """Gentle autonomous idle moments; postponed while she is speaking, thinking or in a call turn.
-        Lightweight 4 s timer: idle emotes only while someone is watching; mood push + auto-sleep always."""
+        Lightweight 4 s timer: idle emotes only while someone is watching; mood push always."""
         while not self._stop_evt.is_set():
             await asyncio.sleep(4.0)
             try:
@@ -550,15 +574,12 @@ class StudioRuntime:
                 self._push_mood(st["valence"], st["arousal"])
                 if not self.ws_clients:
                     self.decisions.note_activity()   # nobody watching: don't bank idle-emote time
-                    busy = self._ai_busy or self.lipsync.is_speaking() or bool(self.lipsync.fish_duplex_active)
-                    self._auto_sleep_check(busy)
                     continue
                 busy = self._ai_busy or self.lipsync.is_speaking() or bool(self.lipsync.fish_duplex_active) \
                     or bool(self.rig.emote_status()["active"]) or bool(self.rig.motion_status().get("playing"))
                 d = self.decisions.idle_tick(busy=busy)
                 if d is not None:
                     await self.apply_decision(d, temp_action=bool(d.emote), hold=3.4)
-                self._auto_sleep_check(busy)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -583,7 +604,7 @@ class StudioRuntime:
 
     async def graceful_shutdown(self, exit_cb: Any = None) -> dict[str, Any]:
         """POST /api/shutdown (hikari-desktop.exe on quit). Best effort, bounded (~2 s total), never raises:
-        end a live Fish call, flush the call's last viewer line, save config + plugin settings, stop the
+        end a live Fish call, let in-flight memory writes land, save config + plugin settings, stop the
         render thread and engine cleanly, close memory, then ask aiohttp for a clean exit."""
         report: dict[str, Any] = {}
         self._shutting_down = True
@@ -594,11 +615,8 @@ class StudioRuntime:
         except Exception:
             pass
         try:
-            pending = self._fish_pending_user
-            self._fish_pending_user = ""
-            if pending:
-                await asyncio.wait_for(self.memory.wake(pending, "", "fish"), 0.6)
-        except Exception:
+            await asyncio.wait_for(self.memory.drain(0.5), 0.6)   # turns are already saved; this only lets
+        except Exception:                                          # a running fact extraction finish
             pass
         try:
             if self.fish_duplex.active_session_id:
@@ -914,16 +932,13 @@ class StudioRuntime:
             "vercelConfigured": self.ai.gateway.configured,
             "fishTtsConfigured": self.ai.fish_tts.configured,
             "lastTurn": self.ai.last_turn,
-            "local": local_backend_hint(ai),
-            "colabNotebook": str(COLAB_NOTEBOOK),
-            "colabBaseModels": list(COLAB_BASE_MODELS),
         }
 
-    # ------------------------------------------------------------------ SLEEP memory
+    # ------------------------------------------------------------------ memory
     async def prompt_context(self, query: str, *, session_start: bool | None = None, greeting: bool = False) -> Any:
-        """Safe dynamic context (pinned core facts + now line + recalled notes + one optional session hook).
-        Building it changes NOTHING (no dream / recap is used up): commit_context() does that once the reply
-        or call really happened. None when memory is off or failed (chat never breaks on memory)."""
+        """Safe dynamic context (pinned core notes + Now line + session-continuity cue + recalled facts).
+        Building it changes NOTHING: commit_context() bumps access counts once the reply / call really happened.
+        None when memory is off or failed (chat never breaks on memory)."""
         if not self.memory.cfg.get("enabled", True):
             return None
         try:
@@ -941,38 +956,6 @@ class StudioRuntime:
         """Compatibility for plugins: the dynamic block only (no state change)."""
         ctx = await self.prompt_context(query)
         return ctx.dynamic if ctx is not None else ""
-
-    def _sleep_llm(self):
-        """Consolidator: Vercel Gateway if configured, else local 4B in local mode, else deterministic."""
-        if self.ai.gateway.configured:
-            async def via_gateway(msgs):
-                return await self.ai.gateway.complete(msgs, json_mode=True, max_tokens=900, temperature=0.3)
-            return via_gateway, "vercel"
-        if self.ai.brain_mode == "local_4b_fish":
-            async def via_local(msgs):
-                endpoint, headers, payload = local_chat_request({**self.config.data["ai"], "maxTokens": 900, "temperature": 0.3}, msgs)
-                payload.pop("lora", None)
-                return await complete_openai_compat(endpoint, headers, payload, timeout=90.0)
-            return via_local, "local_4b"
-        return None, "deterministic"
-
-    async def run_sleep(self, reason: str = "manual") -> dict[str, Any]:
-        self.rig.trigger_emote("sleepy_yawn")
-        self.decisions.note_manual_emote("sleepy_yawn")
-        await self.broadcast_json({"type": "memory_sleep", "phase": "start", "reason": reason})
-        llm, label = self._sleep_llm()
-        report = await self.memory.sleep(llm, label)
-        report["reason"] = reason
-        await self.broadcast_json({"type": "memory_sleep", "phase": "done",
-                                   "report": {k: v for k, v in report.items() if k != "newCards"}})
-        return report
-
-    def flush_fish_pending(self) -> None:
-        """Log an unanswered viewer line from a live call so the viewer's side of memory is never lost."""
-        pending = getattr(self, "_fish_pending_user", "")
-        if pending:
-            self._fish_pending_user = ""
-            self.spawn(self.memory.wake(pending, "", "fish"))
 
     def lipsync_status(self) -> dict[str, Any]:
         st = self.lipsync.status()
@@ -1130,7 +1113,7 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         elif sec == "ai":
             runtime.apply_ai_config(vals)
         elif sec == "memory":
-            runtime.memory.update_config(runtime.config.data["memory"])
+            runtime.apply_memory_config()
 
     async def index(_req):
         return web.FileResponse(WEB_DIR / "index.html")
@@ -1162,7 +1145,7 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             "decision": runtime.decisions.status(),
             "persona": runtime.persona_info(),
             "brain": runtime.brain_status(),
-            "memoryKinds": list(MEMORY_KINDS),
+            "memoryKinds": list(CATEGORIES),
         })
 
     async def api_emotes(_req):
@@ -1264,6 +1247,7 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         user_task = asyncio.create_task(runtime.decide_and_apply(msg, "user"))
         greeting = classify_text(msg, "user").emotion == "greeting"
         runtime._last_user_activity = time.monotonic()
+        await runtime.ensure_memory()                  # history restored before the first reply
         runtime._chat_inflight = getattr(runtime, "_chat_inflight", 0) + 1
         runtime._ai_busy = True
         runtime.set_interaction("thinking")
@@ -1289,12 +1273,11 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             runtime._chat_inflight -= 1
             runtime._ai_busy = runtime._chat_inflight > 0
         if not reply:
-            # The turn failed: nothing is spoken or remembered as her line; no dream / recap is used up.
+            # The turn failed: nothing is spoken or remembered as her line (the viewer's line is already saved).
             if player is not None:
                 player.cancel()
             runtime.set_interaction("idle")
             err = runtime.ai.last_error or "No reply"
-            runtime.spawn(runtime.memory.wake(msg, "", "chat"))
             await runtime.broadcast_json({"type": "chat_error", "error": err})
             await runtime.broadcast_json({"type": "speech", "text": f"({err})", "tag": "error", "audioUrl": "",
                                           "duration": 4.0})
@@ -1302,8 +1285,7 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             return web.json_response({"ok": False, "error": err, "history": runtime.ai.history[-24:],
                                       "decisions": {"user": user_decision.to_dict()}, "brainMode": runtime.ai.brain_mode},
                                      status=502)
-        runtime.spawn(runtime.memory.wake(msg, reply, "chat"))
-        runtime.commit_context(ctx, reply, delivered=True)
+        runtime.commit_context(ctx, reply, delivered=True)       # both turns were persisted inside AICompanion
         # Emotion decision runs alongside TTS / playback; it never delays her voice.
         decision_task = asyncio.create_task(runtime.decisions.decide(reply, "reply"))
         evt, reply_decision = await runtime.deliver_reply(reply, decision_task, wav_path=pre_voiced, player=player)
@@ -1324,58 +1306,74 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         })
 
     async def api_memory_status(_req):
-        st = await runtime.memory.status(str(runtime.config.data["ai"].get("localLoraPath") or ""))
-        st["colabNotebook"] = str(COLAB_NOTEBOOK)
-        st["mood"] = runtime.decisions.get_mood_state()
+        st = await runtime.memory.status()
+        mood = runtime.decisions.get_mood_state() or {}
+        st["mood"] = {"label": mood.get("label", ""), "valence": mood.get("valence", 0.0),
+                      "arousal": mood.get("arousal", 0.0), "offBaseline": bool(mood.get("offBaseline"))}
         st["interactionState"] = runtime._interaction_state
+        st["restoredMessages"] = runtime.ai.restored_turns
         return web.json_response({"ok": True, **st})
+
+    async def api_memory_facts(_req):
+        return web.json_response({"ok": True, "facts": await runtime.memory.list_facts(), "categories": list(CATEGORIES)})
+
+    async def api_memory_fact_add(req):
+        body = await _json_body(req)
+        if not isinstance(body, dict):
+            return web.json_response({"ok": False, "error": "Expected a JSON object"}, status=400)
+        text = str(body.get("text") or "").strip()
+        if not text:
+            return web.json_response({"ok": False, "error": "Memory text is empty"}, status=400)
+        category = str(body.get("category") or body.get("kind") or "note")
+        try:
+            fact = await runtime.memory.add_fact(text[:240], category=category, pinned=body.get("pinned") is True)
+        except PinLimitError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=409)
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        return web.json_response({"ok": True, "fact": fact})
 
     async def api_memory_fact_pin(req):
         fid = req.match_info["fact_id"]
         body = await _json_body(req)
         if not isinstance(body, dict) or not isinstance(body.get("pinned"), bool):
             return web.json_response({"ok": False, "error": 'Expected {"pinned": true|false}'}, status=400)
-        ok = await runtime.memory.set_pinned(fid, body["pinned"])
-        return web.json_response({"ok": ok, "id": fid, "pinned": body["pinned"]}, status=200 if ok else 404)
-
-    async def api_memory_recall_debug(_req):
-        """Recall inspector: why each card was included / excluded last time, plus the last prompt context."""
-        await runtime.memory.init()
-        return web.json_response({"ok": True, **runtime.memory.recall_debug(),
-                                  "stageEvents": runtime.memory.recent_stage_events(include_used=True),
-                                  "mood": runtime.decisions.get_mood_state()})
-
-    async def api_memory_sleep(_req):
-        if runtime.memory.sleeping:
-            return web.json_response({"ok": False, "error": "Hikari is already asleep"}, status=409)
-        task = runtime.spawn(runtime.run_sleep(reason="manual"))
-        runtime._sleep_task = task
-        report = await task
-        return web.json_response(report, status=200 if report.get("ok") else 409)
-
-    async def api_memory_facts(_req):
-        return web.json_response({"ok": True, "facts": await runtime.memory.list_facts(), "kinds": list(MEMORY_KINDS)})
-
-    async def api_memory_fact_add(req):
-        body = await req.json()
         try:
-            fact = await runtime.memory.add_fact(str(body.get("kind") or "fact"), str(body.get("text") or "")[:240])
-        except ValueError as exc:
-            return web.json_response({"ok": False, "error": str(exc)}, status=400)
-        return web.json_response({"ok": True, "fact": fact})
+            ok = await runtime.memory.set_pinned(fid, body["pinned"])
+        except PinLimitError as exc:
+            return web.json_response({"ok": False, "id": fid, "pinned": False, "error": str(exc)}, status=409)
+        return web.json_response({"ok": ok, "id": fid, "pinned": body["pinned"]}, status=200 if ok else 404)
 
     async def api_memory_fact_delete(req):
         fid = req.match_info["fact_id"]
         ok = await runtime.memory.delete_fact(fid)
-        return web.json_response({"ok": ok, "id": fid}, status=200 if ok else 404)
+        return web.json_response({"ok": ok, "deleted": ok, "id": fid}, status=200 if ok else 404)
 
-    async def api_memory_export_colab(_req):
-        res = await runtime.memory.export_batch()
-        return web.json_response({
-            "ok": True, **res, "notebook": str(COLAB_NOTEBOOK),
-            "baseModel": runtime.config.data["memory"].get("colabBaseModel"),
-            "instructions": "Upload sleep_batch.jsonl to MyDrive/HikariSleep/, open the notebook in Colab (T4 GPU), Run all.",
-        })
+    async def api_memory_recall_debug(req):
+        """Recall inspector: ?q=... runs a recall now and explains every candidate (included / excluded, why)."""
+        await runtime.memory.init()
+        q = str(req.query.get("q") or "").strip()[:2000]
+        hits = await runtime.memory.recall(q) if q else []
+        return web.json_response({"ok": True, "query": q, "hits": hits,
+                                  "candidates": list(runtime.memory.last_recall_debug) if q else [],
+                                  **{k: v for k, v in runtime.memory.recall_debug().items() if k != "lastQueryCandidates"},
+                                  "stageEvents": runtime.memory.recent_stage_events(include_used=True),
+                                  "mood": runtime.decisions.get_mood_state()})
+
+    async def api_chat_history(req):
+        try:
+            limit = max(1, min(500, int(req.query.get("limit") or 40)))
+        except ValueError:
+            limit = 40
+        await runtime.ensure_memory()
+        turns = await runtime.memory.display_turns(limit)
+        out = [{"id": t["id"], "role": t["role"], "text": t["text"], "channel": t["channel"], "ts": t["ts"]} for t in turns]
+        return web.json_response({"ok": True, "turns": out, "count": len(out)})
+
+    async def api_chat_clear(_req):
+        n = await runtime.clear_conversation()
+        await runtime.broadcast_json({"type": "chat_cleared", "cleared": n})
+        return web.json_response({"ok": True, "cleared": n})
 
     def _request_exit() -> None:
         """Clean aiohttp exit: GracefulExit raised from a loop callback unwinds web.run_app, which then runs
@@ -1401,9 +1399,9 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         await runtime.broadcast_json({"type": "interrupt"})
         return web.json_response({"ok": True})
 
-    async def api_clear_memory(_req):
-        runtime.ai.clear_history()
-        return web.json_response({"ok": True})
+    async def api_clear_memory(req):
+        """Legacy name for /api/chat/clear (clears the conversation, keeps long-term facts)."""
+        return await api_chat_clear(req)
 
     async def api_play_sample(_req):
         if not await asyncio.to_thread(SAMPLE_WAV.exists):
@@ -1639,12 +1637,18 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         ctx = None
         try:
             # Hikari's verbatim personality rides along as the per-session system prompt override, followed
-            # by pinned core facts + the dynamic context as quoted DATA blocks (compose_session_prompt).
-            runtime.flush_fish_pending()
-            # Recall keyed on what the viewer said last (not a fixed sentence); none yet -> pinned + hook only.
+            # by pinned core notes, the dynamic context (Now + session-continuity cue + recalled facts) and a recap
+            # of the last persisted turns (chat or earlier calls) as quoted DATA blocks (compose_session_prompt).
+            await runtime.ensure_memory()
+            # Recall keyed on what the viewer said last (not a fixed sentence); none yet -> pinned notes only.
             last_user = next((m.get("content", "") for m in reversed(runtime.ai.history) if m.get("role") == "user"), "")
             ctx = await runtime.prompt_context(str(last_user)[-500:], session_start=True)
-            prompt = compose_session_prompt(runtime.ai.persona, ctx.pinned if ctx else "", ctx.dynamic if ctx else "")
+            try:
+                recap = await runtime.memory.continuity_recap(8)
+            except Exception:
+                recap = ""
+            prompt = compose_session_prompt(runtime.ai.persona, ctx.pinned if ctx else "", ctx.dynamic if ctx else "",
+                                            recap)
             try:
                 session = await runtime.fish_duplex.start_session(
                     mode=mode, persona=prompt,
@@ -1652,8 +1656,7 @@ def build_app(runtime: StudioRuntime) -> web.Application:
                 )
             finally:
                 runtime.fish_duplex.set_persona(runtime.ai.persona)   # the per-call context never sticks
-            # The call really started. The dream / recap counts as offered ONLY if Fish accepted the prompt
-            # override (a rejected override means she never saw it); "mentioned" is checked on her transcript.
+            # The call really started; injected facts count as used ONLY if Fish accepted the prompt override.
             runtime.commit_context(ctx, delivered=bool(runtime.fish_duplex.persona_synced))
             runtime.decisions.note_activity()
             runtime.set_interaction("listening")
@@ -1684,7 +1687,6 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         except Exception:
             body = {}
         sid = str((body or {}).get("sessionId") or req.query.get("sessionId") or "").strip() or None
-        runtime.flush_fish_pending()
         try:
             res = await runtime.fish_duplex.end_session(sid)
         except Exception as exc:
@@ -1726,17 +1728,11 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             if source == "fish_agent":
                 runtime.rig.trigger_temp_action(act, duration=4.2)
             await runtime.apply_decision(d)
-            # SLEEP wake log: viewer lines accumulate until Hikari answers, then the pair is logged
-            # (viewer triage runs inside wake). Unanswered viewer lines are flushed on call start/end.
+            # Every call transcript line is saved to conversation_turns right now (and the viewer's lines go
+            # through immediate memory extraction), so chat and the next call continue from here.
             if source == "fish_user":
-                prev = runtime._fish_pending_user
-                runtime._fish_pending_user = (f"{prev} {clean}".strip() if prev else clean)[-2000:]
                 runtime._last_user_activity = time.monotonic()
-            else:
-                runtime.spawn(runtime.memory.wake(runtime._fish_pending_user, clean, "fish"))
-                runtime._fish_pending_user = ""
-                # Dream lifecycle: an offered dream becomes "mentioned" only once she actually talks about it.
-                runtime.spawn(runtime.memory.check_dream_mentioned(clean))
+            await runtime.record_turn("user" if source == "fish_user" else "assistant", clean, "voice")
             return web.json_response({"ok": True, "tag": tag, "clean": clean, "emote": d.emote or "", "decision": d.to_dict()})
         return web.json_response({"ok": True, "tag": "happy", "clean": "", "emote": ""})
 
@@ -1866,14 +1862,14 @@ def build_app(runtime: StudioRuntime) -> web.Application:
     app.router.add_post("/api/interrupt", api_interrupt)
     app.router.add_post("/api/memory/clear", api_clear_memory)
     app.router.add_get("/api/memory/status", api_memory_status)
-    app.router.add_post("/api/memory/sleep", api_memory_sleep)
+    app.router.add_get("/api/chat/history", api_chat_history)
+    app.router.add_post("/api/chat/clear", api_chat_clear)
     app.router.add_get("/api/memory/facts", api_memory_facts)
     app.router.add_post("/api/memory/facts", api_memory_fact_add)
     app.router.add_delete("/api/memory/facts/{fact_id}", api_memory_fact_delete)
     app.router.add_post("/api/memory/facts/{fact_id}/pin", api_memory_fact_pin)
     app.router.add_get("/api/memory/recall-debug", api_memory_recall_debug)
     app.router.add_post("/api/shutdown", api_shutdown)
-    app.router.add_post("/api/memory/export-colab", api_memory_export_colab)
     app.router.add_post("/api/audio/sample", api_play_sample)
     app.router.add_get("/api/sample.wav", api_sample_wav)
     app.router.add_post("/api/upload/room", api_upload_room)

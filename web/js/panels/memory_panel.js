@@ -1,92 +1,88 @@
-/** MEMORY — SLEEP memory settings, live status (facts, pinned, wake log, last sleep, mood, recap, pending dreams),
- *  Sleep & Consolidate, Colab 4B LoRA export, saved memories with pin/unpin + delete.
+/** MEMORY & CONTEXT — persistent conversation continuity across restarts, immediate long-term memories
+ *  (add / pin / forget), recent saved turns and clear-chat-history.
  *  Network: fetches only when this tab renders (cached 8 s). No timers — nothing runs while Settings is closed. */
-import { btn, el, group, more, noteRow, row, selectRow, slider, toggle, withCurrent } from '../ui.js';
+import { btn, el, group, more, noteRow, row, selectRow, slider, switchEl, textIn, toggle, withCurrent } from '../ui.js';
 
-const EMBEDDERS = [['vercel', 'Vercel Gateway (Cheap)'], ['local_hash', 'Local Lightweight Fallback']];
-const COLAB_MODELS = [['unsloth/gemma-3-4b-it', 'Gemma 3 4B (Unsloth)'], ['unsloth/Qwen3-4B', 'Qwen 3 4B (Unsloth)']];
+const EMBEDDERS = [['vercel', 'Vercel AI Gateway'], ['local_hash', 'Local lightweight (offline)']];
+const CATEGORY_LABELS = {
+  fact: 'Fact', preference: 'Preference', project: 'Project', inside_joke: 'Inside joke', viewer: 'Viewer', note: 'Note',
+};
 const CACHE_MS = 8000;
 const MAX_FACTS_SHOWN = 60;
-const MAX_DREAMS_SHOWN = 5;
+const HISTORY_LIMIT = 12;
 
 const state = {
   status: null,        // normalized status or null
   statusErr: '',
   facts: null,         // array or null
   factsErr: '',
+  history: null,       // array or null
+  historyErr: '',
   fetchedAt: 0,
   loading: false,
-  actionMsg: '',
-  actionKind: '',
-  busy: '',            // 'sleep' | 'export' | ''
-  exportUrl: '',
+  msg: '',             // feedback line under "Add a memory note"
+  msgKind: '',         // 'pending' | 'ok' | 'error' | ''
+  draft: '',           // unsaved note text (survives re-renders)
+  draftPinned: false,
+  saving: false,
+  clearArmed: false,   // two-step confirm for Clear chat history
+  clearing: false,
+  historyMsg: '',
+  historyMsgKind: '',
 };
 
 const pick = (o, ...keys) => { for (const k of keys) if (o && o[k] !== undefined && o[k] !== null) return o[k]; return undefined; };
-
 const numOrNull = (v) => (v === undefined || v === null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
-
-/** lastSleep may be an object ({ ts, cards, dreams, turns, … }), a timestamp, an ISO string, or null. */
-function sleepTs(v) {
-  if (v === undefined || v === null || v === '') return null;
-  if (typeof v === 'object') return sleepTs(pick(v, 'ts', 'time', 'at', 'timestamp') ?? null);
-  return v;
-}
-
-function normDream(d) {
-  if (typeof d === 'string') return d.trim() ? { text: d.trim(), offered: false } : null;
-  if (!d || typeof d !== 'object') return null;
-  const text = String(pick(d, 'text', 'quote', 'content', 'dream') ?? '').trim();
-  return text ? { text, offered: Boolean(pick(d, 'offered', 'used', 'shared')) } : null;
-}
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
 function normStatus(d) {
-  const s = d?.status && typeof d.status === 'object' ? { ...d, ...d.status } : (d || {});
-  const factsRaw = pick(s, 'factCount', 'factsCount', 'facts_saved', 'factsSaved', 'facts');
-  const lastSleepRaw = pick(s, 'lastSleep', 'last_sleep', 'lastSleepAt', 'lastSleepTime');
-  const lastObj = lastSleepRaw && typeof lastSleepRaw === 'object' ? lastSleepRaw : null;
-  const dreamsRaw = pick(s, 'pendingDreams', 'pending_dreams');
-  const legacyDream = pick(s, 'pendingDream', 'latestDream', 'dream');
-  const dreams = (Array.isArray(dreamsRaw) ? dreamsRaw : (legacyDream ? [legacyDream] : [])).map(normDream).filter(Boolean);
+  const s = d || {};
   const moodRaw = s.mood && typeof s.mood === 'object' ? s.mood : null;
-  const recapRaw = pick(s, 'recap', 'lastRecap', 'sessionRecap');
   return {
-    facts: Array.isArray(factsRaw) ? factsRaw.length : numOrNull(factsRaw),
-    pinned: numOrNull(pick(s, 'pinnedCount', 'pinned_count')),
-    wake: numOrNull(pick(s, 'wakeLogCount', 'wake_log_count', 'wakeBufferTurns')) ?? 0,
-    lastSleepTs: sleepTs(lastSleepRaw),
-    lastSleepInfo: lastObj ? {
-      cards: numOrNull(lastObj.cards), dreams: numOrNull(lastObj.dreams), turns: numOrNull(lastObj.turns),
-    } : null,
-    dreams,
-    recap: typeof recapRaw === 'string' ? recapRaw.trim() : String(recapRaw?.text || recapRaw?.summary || '').trim(),
+    enabled: s.enabled !== false,
+    facts: numOrNull(s.factCount),
+    pinned: numOrNull(s.pinnedCount) ?? 0,
+    turns: numOrNull(s.conversationTurns),
+    lastTs: numOrNull(s.lastInteractionTs),
     mood: moodRaw ? {
       label: String(moodRaw.label || '').trim(),
       valence: numOrNull(moodRaw.valence),
       arousal: numOrNull(moodRaw.arousal),
     } : null,
-    sleeping: Boolean(pick(s, 'sleeping', 'isSleeping')),
   };
 }
 
-function normFacts(d) {
-  const list = Array.isArray(d) ? d : (pick(d, 'facts', 'memories', 'items') || []);
-  const facts = (Array.isArray(list) ? list : []).map((f, i) => (typeof f === 'string'
-    ? { id: String(i), text: f, kind: '', pinned: false, order: i }
-    : {
-        id: String(pick(f, 'id', 'uuid', 'key') ?? i),
-        text: String(pick(f, 'text', 'fact', 'content', 'memory') ?? ''),
-        kind: pick(f, 'category', 'kind', 'type') || '',
-        pinned: Boolean(pick(f, 'pinned', 'pin', 'isPinned')),
-        order: i,
-      }))
-    .filter((f) => f.text);
-  return sortFacts(facts);
+function normFact(f, i = 0) {
+  return {
+    id: String(pick(f, 'id') ?? i),
+    text: String(pick(f, 'text') ?? '').trim(),
+    category: String(pick(f, 'category') || 'note'),
+    evidence: String(pick(f, 'evidence') || '').trim(),
+    pinned: Boolean(f?.pinned),
+    updatedAt: numOrNull(pick(f, 'updatedAt', 'createdAt')) ?? 0,
+  };
 }
 
-/** Pinned first; otherwise keep the server's order (most recently updated first). */
+/** Pinned first, then most recently updated. */
 function sortFacts(facts) {
-  return facts.sort((a, b) => (Number(b.pinned) - Number(a.pinned)) || (a.order - b.order));
+  return facts.sort((a, b) => (Number(b.pinned) - Number(a.pinned)) || (b.updatedAt - a.updatedAt));
+}
+
+function normFacts(d) {
+  const list = Array.isArray(d?.facts) ? d.facts : [];
+  return sortFacts(list.map(normFact).filter((f) => f.text));
+}
+
+function normHistory(d) {
+  const list = Array.isArray(d?.turns) ? d.turns : [];
+  return list
+    .map((t) => ({
+      role: t?.role === 'assistant' ? 'assistant' : 'user',
+      text: String(t?.text || '').trim(),
+      channel: t?.channel === 'voice' ? 'voice' : 'chat',
+      ts: numOrNull(t?.ts),
+    }))
+    .filter((t) => t.text);
 }
 
 function moodText(m) {
@@ -96,13 +92,19 @@ function moodText(m) {
   return m.valence > 0.25 ? 'Upbeat' : (m.valence < -0.25 ? 'Low' : 'Calm');
 }
 
-function relTime(v) {
-  if (v === undefined || v === null || v === '') return 'Never';
+function toMs(v) {
+  if (v === undefined || v === null || v === '') return null;
   let t = typeof v === 'number' ? v : Date.parse(v);
-  if (!Number.isFinite(t)) return String(v);
+  if (!Number.isFinite(t)) return null;
   if (t < 1e12) t *= 1000; // epoch seconds
+  return t;
+}
+
+function relTime(v) {
+  const t = toMs(v);
+  if (t === null) return 'Never';
   const s = Math.round((Date.now() - t) / 1000);
-  if (s < 0) return 'Just now';
+  if (s < 5) return 'Just now';
   if (s < 60) return `${s}s ago`;
   if (s < 3600) return `${Math.round(s / 60)}m ago`;
   if (s < 86400) return `${Math.round(s / 3600)}h ago`;
@@ -110,11 +112,9 @@ function relTime(v) {
 }
 
 function absTime(v) {
-  if (v === undefined || v === null || v === '') return '';
-  let t = typeof v === 'number' ? v : Date.parse(v);
-  if (!Number.isFinite(t)) return '';
-  if (t < 1e12) t *= 1000;
-  return new Date(t).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+  const t = toMs(v);
+  if (t === null) return '';
+  return new Date(t).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short', hour12: true });
 }
 
 async function getJson(url, opts) {
@@ -125,121 +125,153 @@ async function getJson(url, opts) {
   return d;
 }
 
+const postJson = (url, body) => getJson(url, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body ?? {}),
+});
+
 async function refresh(store, force = false) {
   if (state.loading || (!force && Date.now() - state.fetchedAt < CACHE_MS)) return;
   state.loading = true;
-  const [st, fa] = await Promise.allSettled([getJson('/api/memory/status'), getJson('/api/memory/facts')]);
+  const [st, fa, hi] = await Promise.allSettled([
+    getJson('/api/memory/status'),
+    getJson('/api/memory/facts'),
+    getJson(`/api/chat/history?limit=${HISTORY_LIMIT}`),
+  ]);
   state.loading = false;
   state.fetchedAt = Date.now();
   if (st.status === 'fulfilled') { state.status = normStatus(st.value); state.statusErr = ''; } else { state.statusErr = st.reason?.message || 'Unavailable'; }
   if (fa.status === 'fulfilled') { state.facts = normFacts(fa.value); state.factsErr = ''; } else { state.factsErr = fa.reason?.message || 'Unavailable'; }
+  if (hi.status === 'fulfilled') { state.history = normHistory(hi.value); state.historyErr = ''; } else { state.historyErr = hi.reason?.message || 'Unavailable'; }
   if (store.activeTab === 'memory') store.rerenderPanel();
 }
+
+function bumpCounts({ facts = 0, pinned = 0 }) {
+  const s = state.status;
+  if (!s) return;
+  if (s.facts !== null) s.facts = Math.max(0, s.facts + facts);
+  s.pinned = Math.max(0, s.pinned + pinned);
+}
+
+const PIN_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6l-1 6 4 4H6l4-4-1-6Z"/><path d="M12 13v8"/></svg>';
 
 export function renderMemoryPanel(store) {
   const mem = store.config.memory || {};
   const set = (vals) => store.patch('memory', vals);
+  // Re-renders replace the DOM; keep the note field focused if the user was typing in it.
+  const noteWasFocused = Boolean(document.activeElement?.classList?.contains('mem-note-in'));
   refresh(store); // cached; re-renders this tab when fresh data arrives
 
+  /* ── Live status tiles ── */
   const st = state.status;
-  const stat = (value, label, title = '') => el('div', { class: 'stat', title: title || undefined }, [el('b', { text: String(value) }), el('span', { text: label })]);
+  const stat = (value, label, title = '') => el('div', { class: 'stat', title: title || undefined }, [
+    el('b', { text: String(value) }), el('span', { text: label }),
+  ]);
   let statusRows;
   if (st) {
-    const ls = st.lastSleepInfo;
-    const sleepDetail = ls ? [ls.cards !== null ? `${ls.cards} card${ls.cards === 1 ? '' : 's'}` : '', ls.dreams !== null ? `${ls.dreams} dream${ls.dreams === 1 ? '' : 's'}` : '', ls.turns !== null ? `${ls.turns} turns` : ''].filter(Boolean).join(' · ') : '';
     const mood = moodText(st.mood);
-    const tiles = [
-      stat(st.facts ?? '—', st.pinned ? `Facts saved · ${st.pinned} pinned` : 'Facts saved'),
-      stat(st.wake, 'Wake log turns', 'Turns waiting to be consolidated at the next sleep'),
-      stat(st.lastSleepTs === null ? 'Never' : relTime(st.lastSleepTs), 'Last sleep', [absTime(st.lastSleepTs), sleepDetail].filter(Boolean).join(' — ')),
-      mood ? stat(mood, 'Mood', st.mood.valence !== null ? `valence ${st.mood.valence.toFixed(2)}${st.mood.arousal !== null ? ` · arousal ${st.mood.arousal.toFixed(2)}` : ''}` : '') : null,
-    ].filter(Boolean);
-    const dreams = st.dreams.slice(0, MAX_DREAMS_SHOWN);
+    const moodTip = st.mood && st.mood.valence !== null
+      ? `valence ${st.mood.valence.toFixed(2)}${st.mood.arousal !== null ? ` · arousal ${st.mood.arousal.toFixed(2)}` : ''}` : '';
     statusRows = [
       row({
         title: 'Status',
-        desc: st.sleeping ? 'Sleeping — consolidating memories…' : (sleepDetail ? `Awake · last sleep made ${sleepDetail}` : 'Awake'),
-        stack: true, control: el('div', { class: 'stat-grid' }, tiles),
-      }),
-      st.recap ? row({ title: 'Last session recap', desc: 'What she remembers about your last session', stack: true,
-        control: el('p', { class: 'recap-text', text: st.recap }) }) : null,
-      dreams.length ? row({
-        title: dreams.length === 1 ? 'Pending dream' : `Pending dreams · ${st.dreams.length}`,
-        desc: 'Reflections from sleep she may bring up next time you talk', stack: true,
-        control: el('div', { class: 'dream-list' }, [
-          ...dreams.map((dr) => el('blockquote', { class: `dream-quote${dr.offered ? ' offered' : ''}` }, [
-            `“${dr.text}”`,
-            dr.offered ? el('span', { class: 'badge', text: 'Offered' }) : null,
-          ])),
-          st.dreams.length > dreams.length ? el('div', { class: 's-desc', text: `+${st.dreams.length - dreams.length} more` }) : null,
+        desc: st.enabled ? 'Memory is on · context reloads automatically after a restart' : 'Memory is off — Hikari won’t remember new things',
+        stack: true,
+        control: el('div', { class: 'stat-grid' }, [
+          stat(st.facts ?? '—', st.pinned > 0 ? `Saved memories · ${st.pinned} pinned` : 'Saved memories'),
+          stat(st.turns ?? '—', 'Saved chat turns', 'Reloaded automatically after restart'),
+          stat(relTime(st.lastTs), 'Last talked', absTime(st.lastTs)),
+          mood ? stat(mood, 'Mood', moodTip) : null,
         ]),
-      }) : null,
+      }),
     ];
   } else {
     statusRows = [noteRow(state.loading || !state.fetchedAt ? 'Loading memory status…' : `Memory status: ${state.statusErr || 'unavailable'}`)];
   }
 
-  const msg = el('div', { class: `apply-status ${state.actionKind}`.trim(), role: 'status',
-    text: state.actionMsg || 'Sleep consolidates the wake buffer into long-term facts and a dream.' });
-
-  const runAction = async (kind, url, okText) => {
-    if (state.busy) return;
-    state.busy = kind;
-    state.actionMsg = kind === 'sleep' ? 'Hikari is falling asleep and consolidating…' : 'Building the Colab LoRA training batch…';
-    state.actionKind = 'pending';
+  /* ── Add a memory note ── */
+  const saveNote = async () => {
+    const text = state.draft.trim();
+    if (!text || state.saving) return;
+    state.saving = true;
+    state.msg = 'Saving…';
+    state.msgKind = 'pending';
     store.rerenderPanel();
     try {
-      const d = await getJson(url, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(kind === 'export' ? { baseModel: mem.colabBaseModel || COLAB_MODELS[0][0] } : {}),
-      });
-      state.exportUrl = kind === 'export' ? (pick(d, 'url', 'downloadUrl', 'href') || '') : state.exportUrl;
-      const extra = kind === 'export'
-        ? [pick(d, 'count', 'examples', 'rows') !== undefined ? `${pick(d, 'count', 'examples', 'rows')} examples` : '', pick(d, 'path', 'file') || ''].filter(Boolean).join(' · ')
-        : (pick(d, 'summary', 'message') || '');
-      state.actionMsg = `${okText}${extra ? ` — ${extra}` : ''}`;
-      state.actionKind = 'ok';
+      const d = await postJson('/api/memory/facts', { text, category: 'note', pinned: state.draftPinned });
+      const fact = normFact(d?.fact || { text, category: 'note', pinned: state.draftPinned, updatedAt: Date.now() / 1000 });
+      if (fact.text && state.facts) state.facts = sortFacts([fact, ...state.facts.filter((f) => f.id !== fact.id)]);
+      bumpCounts({ facts: 1, pinned: fact.pinned ? 1 : 0 });
+      state.msg = fact.pinned ? 'Saved & pinned ✓ — Hikari will always keep this in mind' : 'Saved ✓ — Hikari will remember this';
+      state.msgKind = 'ok';
+      state.draft = '';
+      state.draftPinned = false;
     } catch (err) {
-      state.actionMsg = err.message;
-      state.actionKind = 'error';
+      state.msg = `Could not save: ${err.message}`;
+      state.msgKind = 'error';
     } finally {
-      state.busy = '';
-      await refresh(store, true);
+      state.saving = false;
       store.rerenderPanel();
     }
   };
+  const noteInput = textIn({
+    class: 'text-in mem-note-in', value: state.draft, placeholder: 'e.g. My cat is called Mochi', 'aria-label': 'Memory note', maxlength: 500,
+    oninput: (e) => { state.draft = e.target.value; },
+    onkeydown: (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); saveNote(); } },
+  });
+  if (noteWasFocused) {
+    requestAnimationFrame(() => {
+      if (!noteInput.isConnected) return;
+      noteInput.focus({ preventScroll: true });
+      noteInput.setSelectionRange(noteInput.value.length, noteInput.value.length);
+    });
+  }
+  const addRow = el('div', { class: 's-row stack mem-add' }, [
+    el('div', { class: 's-row-text' }, [
+      el('div', { class: 's-title', text: 'Add a memory note' }),
+      el('div', { class: 's-desc', text: 'Saved immediately and recalled whenever it’s relevant' }),
+    ]),
+    el('div', { class: 's-ctrl mem-add-ctrl' }, [
+      noteInput,
+      el('span', { class: 'mem-pin-toggle', title: 'Pinned memories are always in Hikari’s context' }, [
+        switchEl({ checked: state.draftPinned, label: 'Pin this note', onChange: (v) => { state.draftPinned = v; } }),
+        el('span', { text: 'Pin' }),
+      ]),
+      btn(state.saving ? 'Saving…' : 'Save', saveNote, 'primary', { disabled: state.saving }),
+    ]),
+  ]);
+  const addMsg = state.msg
+    ? el('div', { class: 's-row note' }, [el('div', { class: `apply-status ${state.msgKind}`.trim(), role: 'status', text: state.msg })])
+    : null;
 
+  /* ── Saved memories ── */
   const facts = state.facts || [];
-  const pinIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6l-1 6 4 4H6l4-4-1-6Z"/><path d="M12 13v8"/></svg>';
+  const pinnedFacts = facts.filter((f) => f.pinned).length;
   const factRows = state.facts
     ? (facts.length
         ? facts.slice(0, MAX_FACTS_SHOWN).map((f) => row({
-            title: f.text, desc: [f.pinned ? 'Pinned — always remembered' : '', f.kind].filter(Boolean).join(' · '),
+            title: f.text,
+            desc: [f.pinned ? 'Pinned — always in context' : '', f.evidence ? `“${f.evidence}”` : ''].filter(Boolean).join(' · '),
             cls: `fact-row${f.pinned ? ' pinned' : ''}`,
             control: [
-              f.pinned ? el('span', { class: 'badge pin', text: 'Pinned' }) : null,
+              el('span', { class: `badge cat cat-${f.category}`, text: CATEGORY_LABELS[f.category] || f.category }),
               el('button', {
-                type: 'button', class: `icon-pin${f.pinned ? ' on' : ''}`, html: pinIcon,
-                title: f.pinned ? 'Unpin' : 'Pin — keep this memory first and never let it fade',
+                type: 'button', class: `icon-pin${f.pinned ? ' on' : ''}`, html: PIN_ICON,
+                title: f.pinned ? 'Unpin' : 'Pin — always keep this in Hikari’s context',
                 'aria-label': `${f.pinned ? 'Unpin' : 'Pin'}: ${f.text}`, 'aria-pressed': String(f.pinned),
                 onclick: async (e) => {
                   const b = e.currentTarget;
                   const next = !f.pinned;
                   b.disabled = true;
                   try {
-                    await getJson(`/api/memory/facts/${encodeURIComponent(f.id)}/pin`, {
-                      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pinned: next }),
-                    });
-                    f.pinned = next;
+                    const d = await postJson(`/api/memory/facts/${encodeURIComponent(f.id)}/pin`, { pinned: next });
+                    f.pinned = typeof d?.pinned === 'boolean' ? d.pinned : next;
                     sortFacts(state.facts);
-                    if (state.status && state.status.pinned !== null) state.status.pinned = Math.max(0, state.status.pinned + (next ? 1 : -1));
-                    store.rerenderPanel();
+                    bumpCounts({ pinned: f.pinned ? 1 : -1 });
                   } catch (err) {
-                    b.disabled = false;
-                    b.title = `Could not ${next ? 'pin' : 'unpin'}: ${err.message}`;
-                    state.actionMsg = b.title;
-                    state.actionKind = 'error';
+                    state.msg = `Could not ${next ? 'pin' : 'unpin'}: ${err.message}`;
+                    state.msgKind = 'error';
                   }
+                  store.rerenderPanel();
                 },
               }),
               el('button', {
@@ -250,57 +282,107 @@ export function renderMemoryPanel(store) {
                   try {
                     await getJson(`/api/memory/facts/${encodeURIComponent(f.id)}`, { method: 'DELETE' });
                     state.facts = state.facts.filter((x) => x.id !== f.id);
-                    if (state.status && Number.isFinite(state.status.facts)) state.status.facts = Math.max(0, state.status.facts - 1);
-                    if (f.pinned && state.status && state.status.pinned !== null) state.status.pinned = Math.max(0, state.status.pinned - 1);
-                    store.rerenderPanel();
+                    bumpCounts({ facts: -1, pinned: f.pinned ? -1 : 0 });
+                    state.msg = 'Forgotten ✓';
+                    state.msgKind = 'ok';
                   } catch (err) {
-                    b.disabled = false;
-                    b.title = err.message;
+                    state.msg = `Could not forget: ${err.message}`;
+                    state.msgKind = 'error';
                   }
+                  store.rerenderPanel();
                 },
               }),
             ],
           }))
-        : [noteRow('No saved memories yet — they appear after Hikari sleeps.')])
+        : [noteRow('No saved memories yet — add a note above, or just chat and Hikari will remember the important bits.')])
     : [noteRow(state.factsErr ? `Saved memories: ${state.factsErr}` : 'Loading…')];
   if (facts.length > MAX_FACTS_SHOWN) factRows.push(noteRow(`Showing ${MAX_FACTS_SHOWN} of ${facts.length}.`));
 
-  return [
-    group('SLEEP Memory', [
-      toggle({ label: 'SLEEP memory enabled', desc: 'Remember facts about you across sessions',
-        checked: mem.enabled ?? true, onChange: (v) => set({ enabled: v }) }),
-      selectRow({ label: 'Embedding provider', desc: 'How memories are indexed for recall',
-        items: withCurrent(EMBEDDERS, mem.embeddingProvider), value: mem.embeddingProvider || 'vercel',
-        onChange: (v) => set({ embeddingProvider: v }) }),
-      slider({ label: 'Auto-sleep after idle', desc: '0 = manual only', min: 0, max: 120, step: 5,
-        value: mem.autoSleepIdleMin ?? 0, def: 0, suffix: ' min', onInput: (v) => set({ autoSleepIdleMin: v }) }),
-    ], { desc: 'Wake buffer → sleep → long-term facts & dreams' }),
+  /* ── Recent saved turns + clear chat history ── */
+  const history = state.history || [];
+  const historyRows = state.history
+    ? (history.length
+        ? [el('div', { class: 's-row stack' }, [
+            el('div', { class: 'turn-list' }, history.map((t) => el('div', { class: `turn ${t.role}` }, [
+              el('div', { class: 'turn-meta' }, [
+                el('b', { text: t.role === 'assistant' ? 'Hikari' : 'You' }),
+                el('span', { class: `badge ch-${t.channel}`, text: t.channel }),
+                el('span', { class: 'turn-time', text: relTime(t.ts), title: absTime(t.ts) || undefined }),
+              ]),
+              el('div', { class: 'turn-text', text: t.text }),
+            ]))),
+          ])]
+        : [noteRow('No saved turns yet — chat or call and they’ll show up here.')])
+    : [noteRow(state.historyErr ? `Recent turns: ${state.historyErr}` : 'Loading…')];
 
-    group('Memory Status', [
+  const clearChat = async () => {
+    if (state.clearing) return;
+    if (!state.clearArmed) { state.clearArmed = true; store.rerenderPanel(); return; }
+    state.clearArmed = false;
+    state.clearing = true;
+    store.rerenderPanel();
+    try {
+      const d = await postJson('/api/chat/clear');
+      const n = numOrNull(d?.cleared);
+      state.history = [];
+      if (state.status) state.status.turns = 0;
+      state.historyMsg = `Chat history cleared${n !== null ? ` (${plural(n, 'turn')})` : ''} ✓ — saved memories kept`;
+      state.historyMsgKind = 'ok';
+    } catch (err) {
+      state.historyMsg = `Could not clear: ${err.message}`;
+      state.historyMsgKind = 'error';
+    } finally {
+      state.clearing = false;
+      store.rerenderPanel();
+    }
+  };
+  historyRows.push(row({
+    title: 'Clear chat history',
+    desc: state.clearArmed ? 'Click again to confirm — saved long-term memories stay intact' : 'Forgets recent turns only — saved long-term memories stay intact',
+    control: [
+      state.clearArmed ? btn('Cancel', () => { state.clearArmed = false; store.rerenderPanel(); }) : null,
+      btn(state.clearing ? 'Clearing…' : (state.clearArmed ? 'Confirm clear' : 'Clear history'), clearChat, 'danger', { disabled: state.clearing }),
+    ],
+  }));
+  if (state.historyMsg) {
+    historyRows.push(el('div', { class: 's-row note' }, [
+      el('div', { class: `apply-status ${state.historyMsgKind}`.trim(), role: 'status', text: state.historyMsg }),
+    ]));
+  }
+
+  return [
+    group('Memory & Context', [
+      toggle({ label: 'Memory enabled', desc: 'Remember you and your conversations across sessions',
+        checked: mem.enabled ?? true, onChange: (v) => set({ enabled: v }) }),
+      toggle({ label: 'Persist conversation across restarts', desc: 'Save chat & voice turns to disk so Hikari picks up right where you left off',
+        checked: mem.persistHistory ?? true, onChange: (v) => set({ persistHistory: v }) }),
+      toggle({ label: 'Auto-remember facts', desc: 'Extract preferences, projects, and details immediately — no sleep cycle needed',
+        checked: mem.autoExtract ?? true, onChange: (v) => set({ autoExtract: v }) }),
+      slider({ label: 'Context window', desc: 'Recent turns reloaded when Hikari starts', min: 4, max: 60, step: 2,
+        value: mem.historyTurns ?? 24, def: 24, suffix: ' turns', onInput: (v) => set({ historyTurns: v }) }),
+      more({ id: 'memory.advanced', title: 'Advanced', desc: 'Embedding provider and recall depth' }, [
+        selectRow({ label: 'Embedding provider', desc: 'How memories are indexed for recall',
+          items: withCurrent(EMBEDDERS, mem.embeddingProvider), value: mem.embeddingProvider || 'vercel',
+          onChange: (v) => set({ embeddingProvider: v }) }),
+        slider({ label: 'Recall top-K facts', desc: 'Most relevant memories added to each reply', min: 2, max: 15, step: 1,
+          value: mem.recallTopK ?? 6, def: 6, onInput: (v) => set({ recallTopK: v }) }),
+      ]),
+    ], { desc: 'Persistent chat continuity & long-term memory across restarts' }),
+
+    group('Live Context & Status', [
       ...statusRows,
-      row({
-        title: 'Sleep & consolidate now', desc: 'Turn the wake buffer into facts and a dream',
-        control: btn(state.busy === 'sleep' ? 'Sleeping…' : 'Sleep now', () => runAction('sleep', '/api/memory/sleep', 'Sleep complete ✓'),
-          'primary', { disabled: Boolean(state.busy) }),
-      }),
-      selectRow({ label: 'Colab 4B base model', desc: 'Base model the LoRA batch targets',
-        items: withCurrent(COLAB_MODELS, mem.colabBaseModel), value: mem.colabBaseModel || COLAB_MODELS[0][0],
-        onChange: (v) => set({ colabBaseModel: v }) }),
-      row({
-        title: 'Export Colab LoRA batch', desc: 'Training data for the local 4B adapter',
-        control: [
-          state.exportUrl ? el('a', { class: 'btn', href: state.exportUrl, download: '', text: 'Download' }) : null,
-          btn(state.busy === 'export' ? 'Exporting…' : 'Export', () => runAction('export', '/api/memory/export-colab', 'Colab batch exported ✓'),
-            '', { disabled: Boolean(state.busy) }),
-        ],
-      }),
-      el('div', { class: 's-row note' }, [msg]),
+      addRow,
+      addMsg,
       more({
-        id: 'memory.facts', title: 'Saved memories',
-        desc: state.facts ? `${facts.length} fact${facts.length === 1 ? '' : 's'}${facts.some((f) => f.pinned) ? ` · ${facts.filter((f) => f.pinned).length} pinned` : ''}` : 'Long-term facts',
+        id: 'memory.facts', title: 'Saved memories', open: facts.length > 0,
+        desc: state.facts ? `${facts.length} ${facts.length === 1 ? 'memory' : 'memories'}${pinnedFacts ? ` · ${pinnedFacts} pinned` : ''}` : 'Long-term notes & facts',
       }, factRows),
+      more({
+        id: 'memory.history', title: 'Recent saved turns',
+        desc: state.history ? `Last ${plural(history.length, 'turn')} · chat & voice` : 'What gets reloaded after a restart',
+      }, historyRows),
       row({ title: 'Refresh', desc: state.fetchedAt ? `Updated ${relTime(state.fetchedAt)}` : 'Not loaded yet',
-        control: btn('Refresh', () => refresh(store, true), '', { disabled: state.loading }) }),
-    ], { desc: 'Live from the studio' }),
+        control: btn(state.loading ? 'Refreshing…' : 'Refresh', () => refresh(store, true), '', { disabled: state.loading }) }),
+    ], { desc: 'Saved automatically on every turn' }),
   ];
 }

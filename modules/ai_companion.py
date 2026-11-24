@@ -3,7 +3,9 @@ Brain modes (config ai.brainMode):
   fish_duplex    Fish's own real-time LLM + voice duplex for calls (modules/fish_duplex.py); typed chat
                  keeps the classic provider path below (offline / OpenAI / LM Studio / Ollama / ...).
   vercel_fish    Vercel AI Gateway LLM (WebWaifu4 provider pinning) + Fish Speech TTS (sse | ws | http).
-  local_4b_fish  Local 4B (Ollama / llama-server, optional SLEEP LoRA) + Fish Speech TTS.
+  (legacy local_4b_fish configs are migrated to vercel_fish on load)
+Conversation continuity: with a memory store attached (attach_memory) every user / assistant turn is
+persisted to SQLite the moment it happens and the last N turns are reloaded on startup (restore_history).
 - Auto-loads keys server-side (modules/server_keys: env or %USERPROFILE%/Documents/treblo/.env.local)
 - Defaults to REAL Fish Audio TTS (https://api.fish.audio/v1/tts) with Hikari's trained 'Playful Young Voice'
 - Supports Fish Drama 3, S2.1-Pro-Free, S2.1-Pro, Local Fish Speech (:8080), OpenAI TTS, and offline fallback
@@ -26,12 +28,14 @@ from modules import http_pool, server_keys
 from modules.decision_engine import DECISION_DEFAULTS
 from modules.fish_tts_stream import FishTtsStreamer, clean_for_speech
 from modules.vercel_gateway import (
-    VercelGateway, complete_openai_compat, find_overlapping_suffix, local_chat_request, stream_openai_compat,
+    VercelGateway, complete_openai_compat, find_overlapping_suffix, stream_openai_compat,
 )
 
-BRAIN_MODES = ("fish_duplex", "vercel_fish", "local_4b_fish")
-HISTORY_MAX_MESSAGES = 24
-HISTORY_MAX_CHARS = 16_000          # chat history budget by size, not just message count
+BRAIN_MODES = ("fish_duplex", "vercel_fish")
+LEGACY_BRAIN_MODES = {"local_4b_fish": "vercel_fish"}   # removed modes -> their replacement
+LEGACY_AI_KEYS = ("localBackend", "localBaseUrl", "localModel", "localLoraPath", "localLoraScale")
+HISTORY_MAX_MESSAGES = 24          # default; memory.historyTurns overrides
+HISTORY_MAX_CHARS = 14_000          # chat history budget by size (~14 KB), not just message count
 MAX_CHAT_CHARS = 4000               # longest accepted chat message
 
 # Hikari-chan's original personality, copied byte-for-byte from Waifu Studio
@@ -91,7 +95,7 @@ DEFAULT_AI_CFG: dict = {
     "openaiTtsVoice": "nova",
     "fishPersonaOverride": True,    # pass Hikari's persona as overrides.system_prompt on Fish sessions
     # --- Brain & voice modes ---
-    "brainMode": "fish_duplex",     # fish_duplex | vercel_fish | local_4b_fish
+    "brainMode": "fish_duplex",     # fish_duplex | vercel_fish
     "vercelApiKey": "",             # optional; AI_GATEWAY_API_KEY is used server-side when empty (never echoed)
     "vercelModel": "",              # routed id, e.g. openai/gpt-5-nano (empty -> AI_GATEWAY_MODEL -> default)
     "vercelProviderOrder": [],      # providerOptions.gateway.order, e.g. ["groq", "cerebras"]
@@ -103,11 +107,6 @@ DEFAULT_AI_CFG: dict = {
     "fishTtsTransport": "sse",      # sse | ws | http
     "fishLatency": "balanced",      # normal | balanced | low
     "fishChunkLength": 160,
-    "localBackend": "ollama",       # ollama | llama-server
-    "localBaseUrl": "",             # empty -> http://127.0.0.1:11434/v1 (ollama) / :8081/v1 (llama-server)
-    "localModel": "hikari-sleep-4b",
-    "localLoraPath": "",            # hikari-sleep-lora.gguf (llama-server --lora / Ollama ADAPTER)
-    "localLoraScale": 1.0,
     # Decision Model (modules/decision_engine.py): decisionMode, decisionModel, autonomousGestures,
     # autoWaveOnGreeting, autoIdleEmotes, cooldowns...
     **DECISION_DEFAULTS,
@@ -215,6 +214,9 @@ class AICompanion:
         self.fish_tts = FishTtsStreamer(self.cfg, audio_dir)
         self.last_turn: dict = {}
         self.last_error: str = ""
+        self.memory: Any = None             # MemoryStore (modules/memory_store.py) once attached
+        self.history_turns: int = HISTORY_MAX_MESSAGES
+        self.restored_turns: int = 0
 
     @property
     def fish_key_ready(self) -> bool:
@@ -238,15 +240,79 @@ class AICompanion:
     @property
     def brain_mode(self) -> str:
         m = str(self.cfg.get("brainMode") or "fish_duplex").lower()
+        m = LEGACY_BRAIN_MODES.get(m, m)
         return m if m in BRAIN_MODES else "fish_duplex"
 
     @property
     def voices_inline(self) -> bool:
-        """True when replies are voiced while the LLM streams (Vercel / local 4B + Fish TTS)."""
-        return self.brain_mode in ("vercel_fish", "local_4b_fish")
+        """True when replies are voiced while the LLM streams (Vercel + Fish TTS)."""
+        return self.brain_mode == "vercel_fish"
 
     def clear_history(self) -> None:
         self.history.clear()
+
+    # ------------------------------------------------------------------ persistent conversation continuity
+    def attach_memory(self, store: Any, history_turns: int | None = None) -> None:
+        """Persist every turn through `store` (MemoryStore.add_turn) and size history by memory.historyTurns."""
+        self.memory = store
+        if history_turns:
+            self.set_history_turns(history_turns)
+
+    def set_history_turns(self, n: Any) -> None:
+        try:
+            self.history_turns = max(2, min(200, int(n)))
+        except (TypeError, ValueError):
+            self.history_turns = HISTORY_MAX_MESSAGES
+        self._trim_history()
+
+    async def restore_history(self) -> int:
+        """Reload the last N persisted turns into self.history (startup). Returns the number of messages."""
+        if self.memory is None:
+            return 0
+        try:
+            msgs = await self.memory.history_messages(self.history_turns, HISTORY_MAX_CHARS)
+        except Exception as exc:
+            print(f"[Hikari Studio] History restore failed: {exc.__class__.__name__}", flush=True)
+            return 0
+        if msgs:
+            # anything said since startup (rare race) stays after the restored transcript
+            self.history = [*msgs, *self.history]
+            self._trim_history()
+        self.restored_turns = len(msgs)
+        return len(msgs)
+
+    async def _persist(self, role: str, text: str, channel: str = "chat") -> None:
+        """Write one turn to SQLite right now. Memory problems never break chat."""
+        if self.memory is None or not text:
+            return
+        try:
+            await self.memory.add_turn(role, text, channel)
+        except Exception as exc:
+            print(f"[Hikari Studio] Turn persist failed: {exc.__class__.__name__}", flush=True)
+
+    async def add_external_turn(self, role: str, text: str, channel: str = "voice") -> None:
+        """A turn that happened outside typed chat (Fish Live 3 / Drama 3 call transcript): appended to history
+        (consecutive same-role lines merged) and persisted immediately, so typed chat continues the call."""
+        role = "assistant" if role == "assistant" else "user"
+        text = (text or "").strip()[:MAX_CHAT_CHARS]
+        if not text:
+            return
+        if self.history and self.history[-1].get("role") == role:
+            self.history[-1] = {"role": role, "content": f"{self.history[-1]['content']} {text}"[-MAX_CHAT_CHARS:]}
+        else:
+            self.history.append({"role": role, "content": text})
+        self._trim_history()
+        await self._persist(role, text, channel)
+
+    async def _begin_turn(self, user_message: str) -> None:
+        self._push_user(user_message)
+        await self._persist("user", user_message)
+
+    async def _finish(self, reply: str) -> str:
+        self.history.append({"role": "assistant", "content": reply})
+        self._trim_history()
+        await self._persist("assistant", reply)
+        return reply
 
     def _push_user(self, user_message: str) -> None:
         self.history.append({"role": "user", "content": user_message})
@@ -254,8 +320,9 @@ class AICompanion:
 
     def _trim_history(self) -> None:
         """Keep <= HISTORY_MAX_MESSAGES and <= HISTORY_MAX_CHARS (oldest dropped first; latest always kept)."""
-        if len(self.history) > HISTORY_MAX_MESSAGES:
-            self.history = self.history[-HISTORY_MAX_MESSAGES:]
+        limit = getattr(self, "history_turns", HISTORY_MAX_MESSAGES)
+        if len(self.history) > limit:
+            self.history = self.history[-limit:]
         total = sum(len(m.get("content") or "") for m in self.history)
         while len(self.history) > 1 and total > HISTORY_MAX_CHARS:
             total -= len(self.history[0].get("content") or "")
@@ -263,7 +330,8 @@ class AICompanion:
 
     def _fail(self, message: str) -> str:
         """A turn that could not be generated: nothing is spoken or remembered (no 'Couldn't reach...' line in
-        history / wake log); the unanswered user line is dropped so the next turn stays well-formed."""
+        history); the unanswered user line is dropped so the next turn stays well-formed (it stays in the
+        persisted transcript, where it is merged with the next line on reload)."""
         self.last_error = message
         if self.history and self.history[-1].get("role") == "user":
             self.history.pop()
@@ -278,17 +346,12 @@ class AICompanion:
             return "", context
         return str(getattr(context, "pinned", "") or ""), str(getattr(context, "dynamic", "") or "")
 
-    def _messages(self, context: Any = "", merge_system: bool = False) -> list[dict[str, str]]:
-        """Persona (verbatim) in the system role; pinned core facts as a separate quoted DATA block; the dynamic
-        context (now line, recalled notes, session hook) placed right before the latest user message, so
-        user-derived text never sits in the system role at the top. Local models get it prepended to the turn."""
+    def _messages(self, context: Any = "") -> list[dict[str, str]]:
+        """Persona (verbatim) in the system role; pinned core notes as a separate quoted DATA block; the dynamic
+        context (Now line, session-continuity cue, recalled facts) placed right before the latest user message, so
+        user-derived text never sits in the system role at the top."""
         pinned, dynamic = self._split_context(context)
-        hist = list(self.history[-16:])
-        if merge_system:
-            msgs = [{"role": "system", "content": self.persona + (f"\n\n{pinned}" if pinned else "")}, *hist]
-            if dynamic and msgs[-1]["role"] == "user":
-                msgs[-1] = {"role": "user", "content": f"{dynamic}\n\n{msgs[-1]['content']}"}
-            return msgs
+        hist = list(self.history[-self.history_turns:])
         msgs = [{"role": "system", "content": self.persona}]
         if pinned:
             msgs.append({"role": "system", "content": pinned})
@@ -297,17 +360,15 @@ class AICompanion:
         return [*msgs, *([{"role": "system", "content": dynamic}] if dynamic else []), *hist]
 
     def _llm_request(self, context: Any) -> tuple[str, dict, dict]:
-        if self.brain_mode == "local_4b_fish":
-            return local_chat_request(self.cfg, self._messages(context, merge_system=True))
         return self.gateway.chat_request(self._messages(context), stream=True)
 
     async def generate_reply(self, user_message: str, context: Any = "") -> str:
         """Text-only reply (TTS happens later in speak_text). Returns "" (and sets last_error) on failure."""
         mode = self.brain_mode
         self.last_error = ""
-        self._push_user(user_message)
-        if mode in ("vercel_fish", "local_4b_fish"):
-            where = "Vercel AI Gateway" if mode == "vercel_fish" else "the local 4B model"
+        await self._begin_turn(user_message)
+        if mode == "vercel_fish":
+            where = "Vercel AI Gateway"
             try:
                 endpoint, headers, payload = self._llm_request(context)
                 reply = (await complete_openai_compat(endpoint, headers, dict(payload, stream=False))).strip()
@@ -315,23 +376,21 @@ class AICompanion:
                 return self._fail(f"Couldn't reach {where} ({exc.__class__.__name__}). Check AI & Voice settings!")
             if not reply:
                 return self._fail(f"{where} returned an empty reply.")
-            self.history.append({"role": "assistant", "content": reply})
-            self._trim_history()
-            return reply
+            return await self._finish(reply)
         return await self._generate_legacy(user_message, context)
 
     async def generate_reply_with_voice(self, user_message: str, context: Any = "",
                                         on_segment: Any = None) -> tuple[str, Path | None]:
-        """Vercel / local 4B LLM streamed straight into Fish Speech TTS (sentence overlap).
+        """Vercel LLM streamed straight into Fish Speech TTS (sentence overlap).
         With `on_segment(pcm, rate, text, index)` each sentence is handed over IN ORDER as soon as it is
         synthesized (playback starts while later sentences are still being written); otherwise one WAV.
         Returns (reply_text, wav_path or None). reply "" + last_error set = the turn failed (nothing to speak).
         If the voice breaks mid-stream the LLM is still read to the end, so the reply is never cut off, and
         last_turn["unvoiced"] holds the part that still needs speaking."""
         self.last_error = ""
-        self._push_user(user_message)
+        await self._begin_turn(user_message)
         mode = self.brain_mode
-        where = "Vercel AI Gateway" if mode == "vercel_fish" else "the local 4B model"
+        where = "Vercel AI Gateway"
         t0 = time.perf_counter()
         streamed: list[str] = []
         voiced: list[str] = []
@@ -380,8 +439,7 @@ class AICompanion:
                 return self._fail(f"Couldn't reach {where} ({exc.__class__.__name__}). Check AI & Voice settings!"), None
             if not reply:
                 return self._fail(f"{where} returned an empty reply."), None
-        self.history.append({"role": "assistant", "content": reply})
-        self._trim_history()
+        await self._finish(reply)
         voiced_text = " ".join(voiced).strip()
         unvoiced = ""
         if on_segment is not None:
@@ -401,10 +459,7 @@ class AICompanion:
 
         if provider == "offline":
             await asyncio.sleep(0.10)
-            reply = offline_hikari_reply(user_message)
-            self.history.append({"role": "assistant", "content": reply})
-            self._trim_history()
-            return reply
+            return await self._finish(offline_hikari_reply(user_message))
 
         base_url = str(self.cfg.get("baseUrl") or "").rstrip("/")
         if provider == "lmstudio" and not base_url:
@@ -441,9 +496,7 @@ class AICompanion:
             return self._fail(f"Couldn't reach {provider} at {base_url} ({exc.__class__.__name__}). Check AI & Voice settings!")
         if not reply:
             return self._fail(f"{provider} returned an empty reply.")
-        self.history.append({"role": "assistant", "content": reply})
-        self._trim_history()
-        return reply
+        return await self._finish(reply)
 
     # ------------------------------------------------------------------ TTS (classic path)
     @staticmethod

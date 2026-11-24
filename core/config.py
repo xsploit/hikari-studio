@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import Any
 
 from core.customizer import DEFAULT_CUSTOMIZER_CFG, EYE_STYLE_PRESETS
-from modules.ai_companion import BRAIN_MODES, DEFAULT_AI_CFG, upgrade_persona
+from modules.ai_companion import BRAIN_MODES, DEFAULT_AI_CFG, LEGACY_AI_KEYS, LEGACY_BRAIN_MODES, upgrade_persona
 from modules.fish_tts_stream import FISH_TRANSPORTS
-from modules.sleep_memory import COLAB_BASE_MODELS, DEFAULT_MEMORY_CFG
+from modules.memory_store import DEFAULT_MEMORY_CFG, LEGACY_MEMORY_KEYS
 from modules.lipsync import DEFAULT_LIPSYNC_CFG, DEFAULT_PARAM_MAP, DEFAULT_VISEMES, LIPSYNC_ENGINES, MFCC_SCORING
 
 PARAM_MAP_FIELDS = ("inMin", "inMax", "outMin", "outMax", "smooth", "curve")
@@ -44,14 +44,13 @@ def sanitize_ai_brain_patch(values: dict[str, Any]) -> dict[str, Any]:
     out = dict(values)
     if "brainMode" in out:
         m = str(out["brainMode"] or "").lower()
+        m = LEGACY_BRAIN_MODES.get(m, m)
         out["brainMode"] = m if m in BRAIN_MODES else "fish_duplex"
     if "fishTtsTransport" in out:
         t = str(out["fishTtsTransport"] or "").lower()
         out["fishTtsTransport"] = t if t in FISH_TRANSPORTS else "sse"
     if "fishLatency" in out and out["fishLatency"] not in ("normal", "balanced", "low"):
         out["fishLatency"] = "balanced"
-    if "localBackend" in out and out["localBackend"] not in ("ollama", "llama-server"):
-        out["localBackend"] = "ollama"
     for k in ("vercelProviderOrder", "vercelFallbackModels"):
         if k in out:
             out[k] = _id_list(out[k], 6 if k == "vercelFallbackModels" else 12)
@@ -76,7 +75,9 @@ def sanitize_ai_brain_patch(values: dict[str, Any]) -> dict[str, Any]:
             out["gatewayModelSource"] = "decisionModel"
     if "gatewayModelSource" in out and out["gatewayModelSource"] not in ("gatewayEvalModel", "decisionModel"):
         out["gatewayModelSource"] = "gatewayEvalModel"
-    for k in ("vercelModel", "vercelEmbeddingModel", "localModel", "localBaseUrl", "localLoraPath",
+    for k in LEGACY_AI_KEYS:
+        out.pop(k, None)                  # the local 4B brain is gone
+    for k in ("vercelModel", "vercelEmbeddingModel",
               "clefModel", "pplxModel", "jevModel", "lunaModel", "decisionModel"):
         if k in out:
             out[k] = str(out[k] or "").strip()[:300]
@@ -265,26 +266,55 @@ def sanitize_memory_patch(values: dict[str, Any]) -> dict[str, Any]:
     if "enabled" in values:
         out["enabled"] = bool(values["enabled"])
     if "embeddingProvider" in values:
-        out["embeddingProvider"] = values["embeddingProvider"] if values["embeddingProvider"] in ("vercel", "local_hash") else "vercel"
-    if "autoSleepIdleMin" in values:
+        out["embeddingProvider"] = "local" if values["embeddingProvider"] in ("local", "local_hash") else "vercel"
+    for k in ("persistHistory", "autoExtract"):
+        if k in values:
+            out[k] = bool(values[k])
+    if "historyTurns" in values:
         try:
-            out["autoSleepIdleMin"] = max(0.0, min(24 * 60.0, float(values["autoSleepIdleMin"])))
+            out["historyTurns"] = max(2, min(200, int(values["historyTurns"])))
         except (TypeError, ValueError):
-            out["autoSleepIdleMin"] = 30
-    if "colabBaseModel" in values:
-        m = str(values["colabBaseModel"] or "").strip()
-        out["colabBaseModel"] = m if m in COLAB_BASE_MODELS or (m.startswith("unsloth/") and len(m) < 120) else COLAB_BASE_MODELS[0]
+            out["historyTurns"] = DEFAULT_MEMORY_CFG["historyTurns"]
     if "triage" in values:
         t = str(values["triage"] or "").lower()
-        out["triage"] = t if t in ("auto", "off", "gateway", "jev", "clef", "pplx", "luna") else "auto"
+        out["triage"] = "off" if t == "off" else "auto"
     if "triageModel" in values:
         out["triageModel"] = str(values["triageModel"] or "").strip()[:200]
     if "recallTopK" in values:
         try:
             out["recallTopK"] = max(1, min(12, int(values["recallTopK"])))
         except (TypeError, ValueError):
-            out["recallTopK"] = 5
+            out["recallTopK"] = DEFAULT_MEMORY_CFG["recallTopK"]
     return out
+
+
+def migrate_legacy(data: dict[str, Any]) -> bool:
+    """SLEEP-era settings -> current ones, in place. True when something changed (then saved once):
+    brainMode local_4b_fish -> vercel_fish, local 4B keys and autoSleepIdleMin / colabBaseModel dropped."""
+    changed = False
+    ai = data.get("ai")
+    if isinstance(ai, dict):
+        m = str(ai.get("brainMode") or "").lower()
+        if m in LEGACY_BRAIN_MODES:
+            ai["brainMode"] = LEGACY_BRAIN_MODES[m]
+            changed = True
+        for k in LEGACY_AI_KEYS:
+            if k in ai:
+                ai.pop(k)
+                changed = True
+    mem = data.get("memory")
+    if isinstance(mem, dict):
+        for k in LEGACY_MEMORY_KEYS:
+            if k in mem:
+                mem.pop(k)
+                changed = True
+        if mem.get("embeddingProvider") == "local_hash":
+            mem["embeddingProvider"] = "local"
+            changed = True
+    elif mem is not None:
+        data["memory"] = copy.deepcopy(DEFAULT_MEMORY_CFG)
+        changed = True
+    return changed
 
 
 def mask_secrets(section: dict[str, Any]) -> dict[str, Any]:
@@ -520,9 +550,11 @@ class ConfigStore:
                     _deep_merge(self.data, saved)
             except Exception:
                 pass
+        migrated = migrate_legacy(self.data)
         # Upgrade a saved legacy generic persona to Hikari-chan's verbatim personality
         # (custom user personas are left untouched) and persist it once.
-        if isinstance(self.data.get("ai"), dict) and upgrade_persona(self.data["ai"]) and self.path.exists():
+        upgraded = isinstance(self.data.get("ai"), dict) and upgrade_persona(self.data["ai"])
+        if (migrated or upgraded) and self.path.exists():
             try:
                 self.save()
             except Exception:

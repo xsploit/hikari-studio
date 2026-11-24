@@ -551,10 +551,6 @@ kbd {
 .stat { padding: 10px 12px; border-radius: 10px; background: var(--field); border: 1px solid var(--line); min-width: 0; }
 .stat b { display: block; font-size: 16px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .stat span { font-size: 11.5px; color: var(--muted); }
-.dream-quote {
-  margin: 0; padding: 10px 14px; border-left: 2px solid var(--accent); border-radius: 0 8px 8px 0;
-  background: var(--accent-soft); color: var(--text-2); font-size: 13px; line-height: 1.5; font-style: italic;
-}
 .fact-row { min-height: 48px; }
 .fact-row .s-title { font-weight: 400; font-size: 13px; color: var(--text-2); }
 .icon-x {
@@ -575,12 +571,28 @@ kbd {
   .pill-select.wide { width: 100%; }
 }
 
-/* ───────────── Memory pins / dreams / recap, active decider ───────────── */
+/* ───────────── Memory & Context: pins, notes, saved turns, active decider ───────────── */
 .stat-grid { grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); }
-.dream-list { display: flex; flex-direction: column; gap: 8px; }
-.dream-quote.offered { opacity: .72; }
-.dream-quote .badge { margin-left: 8px; font-style: normal; vertical-align: 1px; }
-.recap-text { margin: 0; padding: 10px 12px; border-radius: 10px; background: var(--field); border: 1px solid var(--line); color: var(--text-2); font-size: 13px; line-height: 1.55; white-space: pre-wrap; }
+.s-row.stack .mem-add-ctrl { display: flex; align-items: center; gap: 10px; width: 100%; }
+.s-row.stack .mem-add-ctrl .text-in { flex: 1; min-width: 0; }
+.mem-pin-toggle { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+@container (max-width: 420px) { .s-row.stack .mem-add-ctrl { flex-wrap: wrap; } .s-row.stack .mem-add-ctrl .text-in { flex-basis: 100%; } }
+.fact-row .s-desc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.badge.cat { padding: 2px 8px; font-size: 11px; white-space: nowrap; }
+.badge.cat-preference { color: var(--accent-2); border-color: rgba(123, 228, 255, 0.3); }
+.badge.cat-project { color: var(--ok); border-color: rgba(79, 209, 139, 0.3); }
+.badge.cat-inside_joke { color: var(--warn); border-color: rgba(243, 191, 90, 0.3); }
+.badge.cat-note { color: var(--accent); border-color: rgba(255, 106, 158, 0.3); }
+.turn-list { display: flex; flex-direction: column; gap: 6px; width: 100%; max-height: 320px; overflow-y: auto; }
+.turn { padding: 8px 12px; border-radius: 10px; background: var(--field); border: 1px solid var(--line); min-width: 0; }
+.turn.assistant { border-left: 2px solid var(--accent); }
+.turn-meta { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--muted); margin-bottom: 3px; }
+.turn-meta b { color: var(--text); font-weight: 600; font-size: 12px; }
+.turn-meta .badge { padding: 1px 7px; font-size: 10.5px; }
+.turn-meta .badge.ch-voice { color: var(--accent-2); border-color: rgba(123, 228, 255, 0.3); }
+.turn-time { margin-left: auto; color: var(--faint); font-variant-numeric: tabular-nums; }
+.turn-text { font-size: 13px; line-height: 1.5; color: var(--text-2); white-space: pre-wrap; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 .icon-pin {
   width: 28px; height: 28px; border-radius: 8px; border: 0; background: none; color: var(--faint); cursor: pointer;
   display: grid; place-items: center;

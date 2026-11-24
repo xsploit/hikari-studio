@@ -1,11 +1,10 @@
-/** VOICE & BRAIN — brain/voice mode (Fish duplex · Vercel AI Gateway · local 4B LoRA), Fish TTS transport,
+/** VOICE & BRAIN — brain/voice mode (Fish duplex · Vercel AI Gateway + Fish Speech), Fish TTS transport,
  *  gateway provider pinning, live call, speech & ASR, custom LLM, decision engine, body language, personality. */
 import { btn, choiceRows, el, group, more, row, selectEl, selectRow, slider, textIn, toggle, withCurrent } from '../ui.js';
 
 const BRAIN_MODES = [
   ['fish_duplex', 'Fish Real-Time Duplex', 'Fish LLM + live full-duplex voice — lowest latency'],
   ['vercel_fish', 'Vercel AI Gateway + Fish Speech', 'Any gateway model with provider pinning, voiced by Fish'],
-  ['local_4b_fish', 'Experimental: Local 4B SLEEP LoRA', 'Google SLEEP continual-learning test — keep Vercel/Fish for live streaming'],
 ];
 
 const FISH_TRANSPORTS = [
@@ -204,7 +203,8 @@ export function renderAiPanel(store) {
   });
 
   /* Brain & voice mode */
-  const brainMode = ai.brainMode || 'fish_duplex';
+  // A retired mode left in an old settings.json falls back to Fish duplex in the picker.
+  const brainMode = BRAIN_MODES.some(([id]) => id === ai.brainMode) ? ai.brainMode : 'fish_duplex';
   const vercelRows = [
     row({ title: 'Vercel model', desc: 'Gateway model ID, e.g. google/gemini-2.5-flash', cls: 'wide-ctrl',
       control: textIn({ placeholder: 'google/gemini-2.5-flash', value: ai.vercelModel || '', 'aria-label': 'Vercel model',
@@ -216,7 +216,7 @@ export function renderAiPanel(store) {
       // Backend may store a provider list ([] = off) or a boolean; an empty list must never read as "on".
       checked: Array.isArray(ai.vercelProviderOnly) ? ai.vercelProviderOnly.length > 0 : Boolean(ai.vercelProviderOnly),
       onChange: (v) => set({ vercelProviderOnly: v === true }) }),
-    row({ title: 'Vercel embedding model', desc: 'Used by SLEEP memory when the Vercel embedder is on', cls: 'wide-ctrl',
+    row({ title: 'Vercel embedding model', desc: 'Indexes saved memories when Memory & Context uses the Vercel embedder', cls: 'wide-ctrl',
       control: textIn({ placeholder: 'openai/text-embedding-3-small', value: ai.vercelEmbeddingModel || '', 'aria-label': 'Vercel embedding model',
         onchange: (e) => set({ vercelEmbeddingModel: e.target.value.trim() }) }) }),
     row({ title: 'AI Gateway key', desc: 'AI_GATEWAY_API_KEY — auto-loaded server-side from .env.local if left blank', cls: 'wide-ctrl',
@@ -241,12 +241,6 @@ export function renderAiPanel(store) {
       : group('Vercel AI Gateway', [
           more({ id: 'voice.vercel.more', title: 'Gateway settings', desc: 'Model, provider pinning, embeddings, key' }, vercelRows),
         ]),
-
-    brainMode === 'local_4b_fish' ? group('Local 4B LoRA', [
-      row({ title: 'SLEEP LoRA adapter path', desc: 'Folder or .safetensors from your Colab export', cls: 'wide-ctrl',
-        control: textIn({ placeholder: 'models/hikari-sleep-lora', value: ai.localLoraPath || '', 'aria-label': 'SLEEP LoRA adapter path',
-          onchange: (e) => set({ localLoraPath: e.target.value.trim() }) }) }),
-    ]) : null,
 
     group('Live Call', [
       callRow,
@@ -351,18 +345,14 @@ export function renderAiPanel(store) {
       slider({ label: 'Talking gesture intensity', desc: 'How much speech moves her arms', min: 0, max: 1.5, step: 0.05, value: ls.speechToArmGesture ?? 0.85, def: 0.85, onInput: (v) => store.patch('lipsync', { speechToArmGesture: v }) }),
     ]),
 
-    group('Personality & Memory', [
+    group('Personality', [
       row({
         title: 'Persona', desc: 'Who Hikari is — saved when you click away', stack: true,
         control: el('textarea', { rows: 6, text: ai.persona || '', 'aria-label': 'Persona', onchange: (e) => set({ persona: e.target.value }) }),
       }),
       row({
-        title: 'Conversation memory', desc: 'Forget the chat history',
-        control: btn('Clear memory', async (e) => {
-          const b = e.currentTarget;
-          await fetch('/api/memory/clear', { method: 'POST' });
-          b.textContent = 'Cleared ✓';
-        }, 'danger'),
+        title: 'Memory & Context', desc: 'Saved memories, conversation continuity and chat history',
+        control: btn('Open', () => document.querySelector('.nav-item[data-tab="memory"]')?.click()),
       }),
     ]),
   ];
