@@ -32,7 +32,8 @@ from typing import Any
 
 from core.config import EXPRESSION_PRESETS, ROOM_AMBIENT_MAP
 from core.events import HookRegistry
-from core.puppet_adapter import HIKARI_ID, UniversalParamMapper, build_param_inspector
+from core.puppet_adapter import (HIKARI_ID, AbilityTrack, RigAbility, UniversalParamMapper, build_param_inspector,
+                                 discover_abilities_from_meta, hikari_builtin_abilities)
 from modules.lipsync import DEFAULT_PARAM_MAP, LiveLipSyncEngine, Spring2nd
 
 log = logging.getLogger("hikari.rig")
@@ -135,6 +136,47 @@ MOUTH_CORNER_DUCK_OPEN = 0.35       # mouth corners ease toward neutral while th
 def _smooth(x: float) -> float:
     x = max(0.0, min(1.0, x))
     return x * x * (3.0 - 2.0 * x)
+
+
+def _smoother(x: float) -> float:
+    x = max(0.0, min(1.0, x))
+    return x * x * x * (x * (6.0 * x - 15.0) + 10.0)
+
+
+ABILITY_FADE_IN = 0.2               # toggle / show params: 0 -> 1 ease
+ABILITY_FADE_OUT = 0.35             # ... and 1 -> 0 at the end
+CHARGE_END = 0.55                   # two-stage abilities: charge plays over [0, 55 %], burst over [45 %, 100 %]
+BURST_START = 0.45
+
+
+def ability_track_frame(track: AbilityTrack, t: float, dur: float) -> tuple[float, float]:
+    """(value, weight) of one ability track `t` seconds into an ability of length `dur`. The output param is
+    blended `current + weight * (value - current)`, so weight 0 = untouched (start / end are exact defaults)."""
+    if dur <= 0.0 or t < 0.0 or t > dur:
+        return track.default, 0.0
+    d, tgt = track.default, track.target
+    if track.stage == 1:
+        t0, t1 = 0.0, CHARGE_END * dur
+        w = _smooth(t / ABILITY_FADE_IN) * _smooth((t1 - t) / 0.25)
+    elif track.stage == 2:
+        t0, t1 = BURST_START * dur, dur
+        w = _smooth((t - t0) / 0.12) * _smooth((dur - t) / ABILITY_FADE_OUT)
+    else:
+        t0, t1 = 0.0, dur
+        fin, fout = (0.35, 0.45) if track.role == "pose" else (ABILITY_FADE_IN, ABILITY_FADE_OUT)
+        if track.role == "sweep":                       # timelines rewind gently (their show toggle is already fading)
+            fout = max(ABILITY_FADE_OUT, 0.2 * dur)
+        w = _smooth(t / fin) * _smooth((dur - t) / fout)
+    if t < t0 or t > t1:
+        return d, 0.0
+    if track.role == "sweep":
+        span = max(1e-3, (t1 - t0) * (0.9 if track.stage else 0.75))
+        v = d + _smoother((t - t0) / span) * (tgt - d)
+    elif track.role == "osc":
+        v = d + (tgt - d) * math.sin(2.0 * math.pi * 0.55 * (t - t0))
+    else:                                               # toggle / pose: ease to the held target
+        v = tgt
+    return v, _clamp(w, 0.0, 1.0)
 
 
 # paramMap channel -> (Inochi2D parameter, axis index, hard clamp range)
@@ -467,16 +509,31 @@ class RigController:
         # 1-click mouth flap test: a synthetic syllable track fed through the real lip-sync mouth path
         self._mouth_test_start = 0.0
         self._mouth_test_dur = 0.0
+        # Universal rig abilities (auto-discovered props / effects of the live puppet) + their running playbacks
+        self.rig_abilities: list[RigAbility] = hikari_builtin_abilities(self._known)
+        self._ability_runs: dict[str, tuple[float, float]] = {}      # id -> (start perf_counter, duration)
 
     def reload_puppet_meta(self, param_meta: list[dict[str, Any]] | None, active_model_id: str,
-                           physics_settings: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+                           physics_settings: dict[str, dict[str, Any]] | None = None,
+                           abilities: list[RigAbility] | None = None) -> dict[str, Any]:
         """Hot-swap the output puppet. "hikari" (or no meta) = native output, byte-for-byte the old behaviour.
-        A different puppet starts with fresh spring physics and no manual inspector overrides."""
+        A different puppet starts with fresh spring physics and no manual inspector overrides.
+        `abilities`: the puppet's discovered abilities (core.puppet_adapter.discover_rig_abilities, which also flags
+        off-stage effects); None = discover them from `param_meta` alone."""
         mid = str(active_model_id or HIKARI_ID)
         mapper = None if mid == HIKARI_ID or not param_meta else UniversalParamMapper(param_meta, mid, physics_settings)
+        if abilities is None:
+            if mapper is None:
+                abilities = hikari_builtin_abilities(self._known)
+            else:
+                abilities = discover_abilities_from_meta(param_meta or [], mid, physics_settings=physics_settings)
+        out_names = frozenset(mapper.defaults) if mapper is not None else self._known
+        abilities = [a for a in abilities if a.tracks and all(t.param in out_names for t in a.tracks)]
         with self.lock:
             if mid != self.active_model_id:
                 self.rig_param_overrides.clear()
+            self.rig_abilities = abilities
+            self._ability_runs.clear()                   # never play a previous puppet's ability on this one
             self._mapper = mapper
             self.active_model_id = mid
         if mapper is None:
@@ -604,10 +661,84 @@ class RigController:
             self._temp_action = dict(action)
             self._temp_until = time.perf_counter() + _clamp(_ff(duration, 4.5), 1.0, 60.0)
 
+    # ------------------------------------------------------------------ universal rig abilities
+    def _ability(self, ability_id: str) -> RigAbility | None:
+        aid = str(ability_id or "").strip()
+        for a in self.rig_abilities:
+            if a.id == aid or a.id.lower() == aid.lower():
+                return a
+        return None
+
+    def trigger_rig_ability(self, ability_id: str, duration: float | None = None) -> dict[str, Any] | None:
+        """Play one discovered ability of the live puppet (restarts it if already playing). None = unknown id."""
+        a = self._ability(ability_id)
+        if a is None:
+            return None
+        dur = _ff(duration, a.duration) if duration is not None else a.duration
+        dur = _clamp(dur if dur > 0 else a.duration, 0.6, 30.0)
+        with self.lock:
+            self._ability_runs[a.id] = (time.perf_counter(), dur)
+        return {"ok": True, "id": a.id, "emote": a.id, "label": a.label, "playing": True, "duration": round(dur, 3),
+                "rigAbility": True}
+
+    def stop_rig_abilities(self) -> None:
+        with self.lock:
+            self._ability_runs.clear()
+
+    def active_rig_abilities(self, t_now: float | None = None) -> dict[str, float]:
+        """{id: seconds elapsed} of the abilities playing right now."""
+        t = time.perf_counter() if t_now is None else t_now
+        with self.lock:
+            return {k: t - s for k, (s, d) in self._ability_runs.items() if 0.0 <= t - s <= d}
+
+    def get_rig_abilities(self) -> list[dict[str, Any]]:
+        live = self.active_rig_abilities()
+        out = []
+        for a in self.rig_abilities:
+            d = a.public()
+            d["active"] = a.id in live
+            out.append(d)
+        return out
+
+    def _apply_rig_abilities(self, p: dict[str, tuple[float, float]], t_now: float) -> dict[str, tuple[float, float]]:
+        with self.lock:
+            if not self._ability_runs:
+                return p
+            runs = dict(self._ability_runs)
+            for k, (s, d) in runs.items():
+                if t_now - s > d:
+                    self._ability_runs.pop(k, None)
+        by_id = {a.id: a for a in self.rig_abilities}
+        out = None
+        for aid, (start, dur) in runs.items():
+            a = by_id.get(aid)
+            el = t_now - start
+            if a is None or not (0.0 <= el <= dur):
+                continue
+            for tr in a.tracks:
+                cur = p.get(tr.param)
+                if cur is None:
+                    continue
+                v, w = ability_track_frame(tr, el, dur)
+                if w <= 0.0 or not math.isfinite(v):
+                    continue
+                if out is None:
+                    out = dict(p)                        # never mutate the canonical telemetry frame
+                x = float(cur[0]) + w * (v - float(cur[0]))
+                if math.isfinite(x):
+                    out[tr.param] = (_clamp(x, tr.lo, tr.hi), cur[1])
+        return p if out is None else out
+
     def trigger_emote(self, emote_id: str, duration: float = 2.6) -> dict[str, Any]:
-        """Trigger a smooth cubic/spring tweened emote clip with a coupled body bounce."""
+        """Trigger a smooth cubic/spring tweened emote clip with a coupled body bounce. A `rig_*` id plays the live
+        puppet's discovered ability instead (so decisions, /api/emote and /api/models/ability share one path)."""
         eid = str(emote_id or "").strip().lower()
         meta = EMOTE_CATALOG.get(eid)
+        if meta is None and self._ability(eid) is not None:
+            dur = _ff(duration, 2.6)
+            res = self.trigger_rig_ability(eid, None if dur == 2.6 else dur)
+            if res is not None:
+                return res
         if meta is None:
             return {"ok": False, "error": f"Unknown emote: {eid}", "available": sorted(EMOTE_CATALOG.keys())}
         dur = _ff(duration, 2.6)
@@ -673,6 +804,11 @@ class RigController:
         with self.lock:
             el = time.perf_counter() - self._emote_start
             active = bool(self._emote_id) and 0.0 <= el <= self._emote_dur
+            if not active and self._ability_runs:        # a rig ability counts as the playing emote
+                now = time.perf_counter()
+                for aid, (s, d) in self._ability_runs.items():
+                    if 0.0 <= now - s <= d:
+                        return {"active": aid, "elapsed": round(now - s, 2), "duration": round(d, 2)}
             return {"active": self._emote_id if active else "", "elapsed": round(el, 2) if active else 0.0,
                     "duration": round(self._emote_dur, 2) if active else 0.0}
 
@@ -1856,6 +1992,9 @@ class RigController:
                             p[pname] = (_clamp(ox, -1000.0, 1000.0), _clamp(oy, -1000.0, 1000.0))
         else:
             self.last_canonical = p
+
+        # 14b. Universal rig abilities (discovered props / effects): after mapping, below the manual sliders
+        p = self._apply_rig_abilities(p, t_now)
 
         # 15. Live Parameter Inspector overrides (any param of the live puppet, after everything else)
         with self.lock:

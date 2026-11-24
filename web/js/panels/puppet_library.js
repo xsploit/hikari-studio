@@ -1,8 +1,11 @@
 /** PUPPET LIBRARY — switch between Hikari (Custom), bundled rigs (Hiyori, Mao…) and imported .inp / .inx / Live2D rigs.
  *  Fetches GET /api/models lazily while Look & Props is open (cached 8 s, no background timers).
  *  Below the cards: live rig hookup badges + 1-click mouth-flap test, and an "Extra Rig Controls" inspector
- *  (GET/POST /api/models/params) cached per active puppet and refetched whenever the puppet switches. */
+ *  (GET/POST /api/models/params) cached per active puppet and refetched whenever the puppet switches.
+ *  Between them: "Rig Abilities & Props" — auto-discovered 1-click ability pills (GET /api/models/abilities,
+ *  shared cache in emotes.js, fetched alongside params for the same puppet). */
 import { btn, el, group, more, row, segmented, switchEl } from '../ui.js';
+import { abilities, abilityFoot, abilityGrid, invalidateAbilities, loadAbilities, syncAbilityUi } from './emotes.js';
 
 const CACHE_MS = 8000;
 const HIKARI_ID = 'hikari';
@@ -10,6 +13,7 @@ const SEARCH_KW = 'puppet puppets model models avatar avatars rig rigs character
 const CAPS_KW = 'capabilities capability hookups hooked auto hooked mapped mouth flap flaps test mouth lip lips head eyes arms physics springs extras';
 const PARAMS_KW = 'extra rig controls rig params parameters params extras extra controls toggles props effects fx aura bunny ears hidden physics springs arms hands auto mapped override reset';
 const IMPORT_KW = 'import rig inp inx inochi live2d zip mint convert';
+const ABIL_KW = 'rig abilities ability props prop spells spell magic starlight explosion aura heart burst moments cast ai trigger autonomous';
 
 const lib = {
   data: null,          // last GET /api/models payload
@@ -99,6 +103,7 @@ async function run(store, pending, task, success) {
   } finally {
     lib.busy = false;
     rig.key = null;                      // re-read rig params/capabilities for whatever is on stage now
+    invalidateAbilities();               // …and its auto-discovered abilities
     await refreshModels(store, true);   // immediate refresh after switch / import / delete
   }
 }
@@ -312,6 +317,32 @@ function renderCapsRow(store, active) {
     ]),
   });
   r.dataset.searchKw = CAPS_KW;
+  return r;
+}
+
+/* ---- Rig Abilities & Props (shared client in emotes.js) ---- */
+
+/** Fetch abilities once per puppet, alongside the params read (no timers; switching clears the cache). */
+function ensureAbilities(store, active) {
+  if (abilities.loading || lib.busy || !visible(store)) return;
+  if (abilities.forKey === active && abilities.fetchedAt) return;
+  loadAbilities({ forKey: active }).then(() => store.rerenderPanel());
+}
+
+function renderAbilitiesRow() {
+  const list = abilities.list;
+  if (!list.length) return null;
+  const n = list.length;
+  const r = row({
+    title: 'Rig Abilities & Props', stack: true,
+    desc: abilities.aiEnabled
+      ? 'Auto-discovered from this rig · AI decision models can trigger these live'
+      : `Auto-discovered from this rig · ${n} ${n === 1 ? 'ability' : 'abilities'} — click to play`,
+    control: el('div', { class: 'abil-wrap' }, [abilityGrid(), abilityFoot()]),
+    cls: 'abil-row',
+  });
+  r.dataset.searchKw = ABIL_KW;
+  queueMicrotask(syncAbilityUi);
   return r;
 }
 
@@ -569,11 +600,13 @@ export function renderPuppetLibrary(store) {
     : null;
 
   ensureRig(store, active);
+  ensureAbilities(store, active);
   const capsRow = renderCapsRow(store, active);
+  const abilRow = renderAbilitiesRow();
   const paramsMore = renderParamsMore(store);
 
-  const g = group('Puppet Library', [libRow, capsRow, paramsMore, importRow, statusRow], { desc: 'Switch avatars or import any rig' });
-  g.dataset.searchKw = `${SEARCH_KW} ${IMPORT_KW} ${CAPS_KW} ${PARAMS_KW}`;
+  const g = group('Puppet Library', [libRow, capsRow, abilRow, paramsMore, importRow, statusRow], { desc: 'Switch avatars or import any rig' });
+  g.dataset.searchKw = `${SEARCH_KW} ${IMPORT_KW} ${CAPS_KW} ${ABIL_KW} ${PARAMS_KW}`;
   return g;
 }
 

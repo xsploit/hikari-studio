@@ -1048,6 +1048,434 @@ def inspect_puppet(path: Path, model_id: str = "", width: int = FRAME_W, height:
     return info
 
 
+# ----------------------------------------------------------------------------- universal rig abilities / props / VFX
+# Every bound "extras" param of ANY puppet (prop / effect toggles, effect timelines, hand-pose swaps) becomes a playable
+# ability. Paired toggle + driver params that share a stem (Mao: オーラ　表示 + オーラ) merge into ONE animated ability.
+# Core face / body / arm params (the mapper drives those) and spring physics are never abilities.
+
+AI_ABILITY_CAP = 12                  # abilities offered to the decision models per rig (keeps prompts small and fast)
+SWEEP_PEAK = 0.8                     # timeline drivers (0..30 effect clips) sweep default -> 80 % of their range
+VIEW_MARGIN = 0.15                   # off-stage test: recommended camera view grown by 15 % on every side
+POSE_VIEW_DROP = 0.35                # hand / arm poses: + 35 % below the frame (every arm gesture lifts the hands in)
+
+
+@dataclass
+class AbilityTrack:
+    """One param an ability animates. role: toggle (ease 0 -> 1, hold, ease out) | sweep (timeline default -> peak)
+    | osc (bipolar shimmer about the default) | pose (ease to a held shape). stage: 0 whole ability, 1 charge, 2 burst."""
+    param: str
+    role: str
+    default: float
+    lo: float
+    hi: float
+    target: float
+    stage: int = 0
+
+    def public(self) -> dict[str, Any]:
+        return {"param": self.param, "role": self.role, "default": round(self.default, 4),
+                "target": round(self.target, 4), "min": round(self.lo, 4), "max": round(self.hi, 4), "stage": self.stage}
+
+
+@dataclass
+class RigAbility:
+    id: str
+    label: str
+    desc: str
+    kind: str                         # moment | toggle | pose
+    duration: float
+    moods: list[str]
+    tracks: list[AbilityTrack]
+    builtin: bool = False             # Hikari's own VFX blend shapes (already covered by her 21 emotes)
+    on_stage: bool = True             # meshes sit inside / near the visible framing
+    ai: bool = True                   # offered to DecisionEngine (on stage, not builtin, inside the cap)
+    score: float = 0.0
+    emote: str = ""                   # builtin: the emote that already plays this effect
+
+    @property
+    def params(self) -> list[str]:
+        return [t.param for t in self.tracks]
+
+    def public(self) -> dict[str, Any]:
+        return {"id": self.id, "label": self.label, "desc": self.desc, "description": self.desc, "kind": self.kind,
+                "duration": round(self.duration, 2), "moods": list(self.moods), "params": self.params,
+                "tracks": [t.public() for t in self.tracks], "builtin": self.builtin, "onStage": self.on_stage,
+                "aiEnabled": self.ai, "emote": self.emote}
+
+
+# (match tokens on the NFKC / lowercase / separator-free names, id slug, label, description, moods, duration or None)
+# Ordered: the FIRST entry whose token appears in a group's joined names wins (specific before generic).
+_ABILITY_DICT: list[tuple[tuple[str, ...], str, str, str, tuple[str, ...], float | None]] = [
+    (("回復魔法", "heal", "cure"), "healing_light", "Healing Light", "Glowing healing magic light",
+     ("caring", "grateful", "love"), 3.2),
+    (("ハート回復", "heartmagic", "healheart"), "heart_magic", "Heart Magic", "Floating glowing heart magic",
+     ("love", "grateful", "shy"), 3.0),
+    (("ハート失敗", "brokenheart", "heartbreak", "heartfail"), "heart_fail", "Broken Heart",
+     "Comedic rainbow broken heart fail", ("gloomy", "amused", "nervous"), 2.8),
+    (("爆発", "explos", "boom", "blast"), "explosion", "Magic Explosion", "Dramatic anime magic explosion",
+     ("excited", "angry", "surprised"), 3.0),
+    (("顔インク", "faceink", "facepaint"), "face_ink", "Paint Splashes", "Playful colorful paint splashes on face",
+     ("playful", "amused", "smug"), 5.5),
+    (("杖インク", "wandink", "wandpaint", "staffink"), "wand_ink", "Wand Paint", "Glowing paint on magic wand",
+     ("playful", "curious", "smug"), 5.0),
+    (("目エフェクト", "eyeeffect", "eyestar", "stareye", "sparkleeye", "eyesparkle"), "eye_effect", "Star Pupils",
+     "Sparkling star eye effect", ("excited", "awe"), 5.0),
+    (("光星", "starlight", "starburst"), "starlight", "Starlight Burst", "Sparkling starlight burst",
+     ("excited", "awe", "singing"), 3.0),
+    (("オーラ", "aura"), "aura", "Magic Aura", "Glowing magical aura", ("excited", "awe", "angry"), 3.2),
+    (("煙", "smoke", "poof"), "smoke", "Smoke Puff", "Cartoon poof of smoke", ("surprised", "nervous", "amused"), 2.6),
+    (("玉", "orb", "crystalball"), "orb", "Floating Orb", "Glowing floating magic orb", ("curious", "awe"), 3.0),
+    (("うさぎ", "ウサギ", "bunny", "rabbit"), "bunny", "Magic Bunny", "A magic bunny pops out", ("playful", "amused"), None),
+    (("猫耳", "ネコミミ", "neko", "catear", "cat"), "cat_ears", "Cat Ears", "Perky cat ears pop up",
+     ("playful", "smug", "amused"), None),
+    (("涙", "tear", "cry"), "tears", "Crying Tears", "Anime tears streaming down", ("gloomy", "grateful"), None),
+    (("汗", "sweat"), "sweat", "Sweatdrop", "Nervous anime sweatdrop", ("nervous", "flustered"), None),
+    (("怒", "anger", "angry", "vein"), "anger", "Anger Mark", "Throbbing anime anger mark", ("angry", "pout"), None),
+    (("翼", "wing"), "wings", "Wings", "Wings spread out", ("excited", "awe"), None),
+    (("眼鏡", "メガネ", "めがね", "glass", "specs"), "glasses", "Glasses", "Puts on glasses", ("curious", "smug"), None),
+    (("マイク", "mic"), "microphone", "Microphone", "Holds up a microphone", ("singing", "excited"), None),
+    (("剣", "sword", "blade"), "sword", "Sword", "Draws a sword", ("excited", "angry"), None),
+    (("帽子", "hat", "cap"), "hat", "Hat", "Hat bounce", ("playful", "amused"), None),
+    (("音符", "music", "note"), "music_notes", "Music Notes", "Floating music notes", ("singing",), None),
+    (("青ざめ", "縦線", "shock", "gloom", "pale"), "shock_gloom", "Shock Gloom", "Pale gloom lines of shock",
+     ("gloomy", "surprised"), None),
+    (("照れ", "blush"), "extra_blush", "Extra Blush", "Extra deep blush", ("shy", "flustered", "love"), None),
+    (("炎", "fire", "flame"), "fire", "Fire Effect", "Blazing fire effect", ("angry", "excited"), None),
+    (("氷", "ice", "frost"), "ice", "Ice Effect", "Frosty ice effect", ("gloomy", "surprised"), None),
+    (("杖", "wand", "staff"), "magic_wand", "Magic Wand", "Magic wand flourish", ("playful", "excited"), None),
+    (("本", "book"), "book", "Book", "Opens a book", ("curious",), None),
+    (("ゲーム", "controller", "gamepad"), "controller", "Controller", "Holds a game controller",
+     ("excited", "playful"), None),
+    (("角", "horn"), "horns", "Horns", "Little horns pop out", ("smug", "angry"), None),
+    (("ハート", "heart"), "hearts", "Hearts", "Floating hearts", ("love", "shy"), None),
+    (("星", "star", "sparkle"), "star", "Star Effect", "Twinkling star effect", ("excited", "awe"), None),
+    (("光", "glow", "light"), "glow", "Glowing Light", "Soft glowing light", ("awe", "excited"), None),
+    (("インク", "ink", "paint"), "paint", "Paint Splash", "Colorful paint splash", ("playful", "amused"), None),
+    (("腕b", "armb"), "arm_pose_b", "Alternate Arm Pose", "Switches to the alternate arm pose",
+     ("curious", "playful"), None),
+    (("手", "hand"), "hand_pose", "Hand Pose", "Changes the hand pose", ("playful", "curious"), None),
+]
+_ABILITY_TOKENS = [(tuple(norm_name(t) for t in toks), *rest) for toks, *rest in _ABILITY_DICT]
+_FALLBACK_MOODS = ("excited", "playful", "amused")
+
+# Hikari's 11 expression VFX / blend shapes (core.rig_controller.VFX_PARAMS): builtin abilities for a uniform API.
+HIKARI_VFX_ABILITIES: tuple[tuple[str, str, str, str, tuple[str, ...], str], ...] = (
+    ("VFX Sparkles", "rig_sparkles", "Sparkles", "Twinkling sparkles around her", ("excited", "awe"), "starry_eyes"),
+    ("VFX Hearts", "rig_hearts", "Floating Hearts", "Floating hearts", ("love", "shy"), "heart_crush"),
+    ("VFX Sweat", "rig_sweat", "Sweatdrop", "Glossy anime sweatdrop", ("nervous",), "anime_sweat"),
+    ("VFX Anger", "rig_anger", "Anger Vein", "Throbbing anger vein", ("angry",), "anger_vein"),
+    ("VFX Shock", "rig_shock", "Shock Lines", "Startled shock lines", ("surprised",), "chibi_pop"),
+    ("VFX Music", "rig_music", "Music Notes", "Floating music notes", ("singing",), "vibe_music"),
+    ("Eye Star", "rig_eye_star", "Star Pupils", "Sparkling star pupils", ("excited", "awe"), "starry_eyes"),
+    ("Eye Heart", "rig_eye_heart", "Heart Eyes", "Heart-shaped pupils", ("love",), "heart_crush"),
+    ("Cheek Puff", "rig_cheek_puff", "Cheek Puff", "Puffed pouty cheeks", ("pout", "angry"), "pout_puff"),
+    ("Cat Mouth", "rig_cat_mouth", ":3 Cat Mouth", "Smug :3 cat mouth", ("playful", "smug"), "cat_smug"),
+    ("Pupil Shrink", "rig_pupil_shrink", "Shocked Pupils", "Tiny shocked pupils", ("surprised",), "chibi_pop"),
+)
+
+_ABIL_TOGGLE_RE = re.compile(r"表示|出現|show|toggle|visible|visibility|enable|(?:^|[^a-z])(?:on|off)(?:$|[^a-z])", re.I)
+_ABIL_SIDE_RE = re.compile(r"^[左右]|(?:^|[\s_\-])(?:left|right|l|r)(?=$|[\s_\-])", re.I)
+_ABIL_CORE_RE = re.compile(r"目|眉|口|角度|体の回転|呼吸|頬|全体|位置|"
+                           r"(?:^|[^a-z])(?:eye(?!\s*(?:effect|star|heart|patch))|brow|mouth|lips?|jaw|angle|breath"
+                           r"|blink|pupil|iris|gaze|position|body)(?:$|[^a-z])", re.I)
+_ABIL_APPEAR_RE = re.compile(r"出現|登場|appear|spawn|summon", re.I)
+_ABIL_CHARGE_RE = re.compile(r"溜め|チャージ|charge|build|ready", re.I)
+_ABIL_POSE_RE = re.compile(r"手|腕|hand|arm(?!or)|finger|pose", re.I)
+_SPLIT_RE = re.compile(r"[\s　_\-:./()\[\]|]+")
+
+
+def _nfkc(s: str) -> str:
+    return unicodedata.normalize("NFKC", str(s))
+
+
+def _ability_stem(name: str) -> str:
+    """Toggle words + side markers removed, normalized: 'オーラ　表示' -> 'オーラ', 'Tears Show' -> 'tears'."""
+    raw = _ABIL_TOGGLE_RE.sub(" ", _nfkc(name))
+    raw = _ABIL_SIDE_RE.sub(" ", raw.strip())
+    return norm_name(raw)
+
+
+def _tokens(name: str) -> list[str]:
+    raw = _ABIL_SIDE_RE.sub(" ", _nfkc(name).strip())
+    return [t for t in _SPLIT_RE.split(raw) if t]
+
+
+def _part_geometry(model: dict[str, Any]) -> tuple[dict[int, dict[str, Any]], dict[int, list[int]]]:
+    """Every Part (hidden ones too): world matrix, local verts, reveal state; + node -> descendant Part uuids."""
+    parts: dict[int, dict[str, Any]] = {}
+    desc: dict[int, list[int]] = {}
+
+    def walk(node: Any, parent_m: tuple[float, ...], enabled: bool, opac: float, anc: list[int], depth: int) -> None:
+        if not isinstance(node, dict) or depth > 64:
+            return
+        tr = node.get("transform") or {}
+        t = tr.get("trans") or [0.0, 0.0, 0.0]
+        r = tr.get("rot") or [0.0, 0.0, 0.0]
+        s = tr.get("scale") or [1.0, 1.0]
+        local = _mat((_f(t[0]) if len(t) > 0 else 0.0, _f(t[1]) if len(t) > 1 else 0.0),
+                     _f(r[2]) if len(r) > 2 else 0.0,
+                     (_f(s[0], 1.0) if len(s) > 0 else 1.0, _f(s[1], 1.0) if len(s) > 1 else 1.0))
+        world = local if node.get("lockToRoot") else _mul(parent_m, local)
+        en = enabled and node.get("enabled", True) is not False
+        op = opac * _f(node.get("opacity", 1.0), 1.0)
+        uid = node.get("uuid")
+        if node.get("type") in ("Part", "AnimatedPart") and isinstance(uid, int):
+            verts = (node.get("mesh") or {}).get("verts") or []
+            if len(verts) >= 6:
+                parts[uid] = {"m": world, "v": [(_f(verts[2 * k]), _f(verts[2 * k + 1])) for k in range(len(verts) // 2)],
+                              "enabled": en, "opacity": op, "anc": list(anc)}
+                for a in anc:
+                    desc.setdefault(a, []).append(uid)
+        nxt = anc + [uid] if isinstance(uid, int) else anc
+        for ch in node.get("children") or []:
+            walk(ch, world, en, op, nxt, depth + 1)
+
+    walk(model.get("nodes"), _IDENT, True, 1.0, [], 0)
+    return parts, desc
+
+
+def _group_on_stage(params: list[dict[str, Any]], parts: dict[int, dict[str, Any]], desc: dict[int, list[int]],
+                    view: tuple[float, float, float, float]) -> bool:
+    """True when any revealable mesh the group drives (rest pose or any deform keyframe) overlaps the view."""
+    deforms: dict[int, list[Any]] = {}
+    revealed: set[int] = set()
+    nodes: set[int] = set()
+    for p in params:
+        for b in p.get("bindings") or []:
+            node = b.get("node")
+            if not isinstance(node, int):
+                continue
+            targets = [node] if node in parts else desc.get(node, [])
+            nodes.update(targets)
+            kind = b.get("param_name")
+            if kind == "opacity":
+                revealed.update(targets)
+            elif kind == "deform" and node in parts and isinstance(b.get("values"), list):
+                deforms.setdefault(node, []).append(b["values"])
+    if not nodes:
+        return True                                     # nothing measurable: do not hide it
+    vx0, vx1, vy0, vy1 = view
+    for uid in nodes:
+        g = parts[uid]
+        if not g["enabled"]:
+            continue
+        if g["opacity"] <= 0.05 and uid not in revealed and not any(a in revealed for a in g["anc"]):
+            continue                                    # stays invisible whatever the group does
+        offsets: list[list[Any]] = [[]]
+        for vals in deforms.get(uid, []):
+            for col in vals:
+                for cell in (col if isinstance(col, list) else []):
+                    if isinstance(cell, list):
+                        offsets.append(cell)
+        a, b_, c, d, tx, ty = g["m"]
+        for offs in offsets:
+            xs, ys = [], []
+            for k, (x, y) in enumerate(g["v"]):
+                if k < len(offs) and isinstance(offs[k], (list, tuple)) and len(offs[k]) >= 2:
+                    x += _f(offs[k][0])
+                    y += _f(offs[k][1])
+                xs.append(a * x + c * y + tx)
+                ys.append(b_ * x + d * y + ty)
+            if min(xs) <= vx1 and max(xs) >= vx0 and min(ys) <= vy1 and max(ys) >= vy0:
+                return True
+    return False
+
+
+def _view_rect(camera: dict[str, float] | None, width: int = FRAME_W, height: int = FRAME_H
+               ) -> tuple[float, float, float, float] | None:
+    if not camera:
+        return None
+    s = max(1e-3, _f(camera.get("scale"), 1.0))
+    cx, cy = -_f(camera.get("x")), -_f(camera.get("y"))
+    hw, hh = (0.5 + VIEW_MARGIN) * width / s, (0.5 + VIEW_MARGIN) * height / s
+    return cx - hw, cx + hw, cy - hh, cy + hh
+
+
+def _label_for(names: list[str]) -> tuple[str, str, str, tuple[str, ...], float | None, bool]:
+    joined = "|".join(norm_name(n) for n in names)
+    for toks, slug, label, desc_, moods, dur in _ABILITY_TOKENS:
+        if any(t and t in joined for t in toks):
+            return slug, label, desc_, moods, dur, True
+    # clean fallback: the param's own cleaned name -> literally any prop becomes a real ability
+    base = _ABIL_TOGGLE_RE.sub(" ", _nfkc(names[0]))
+    base = re.sub(r"[\s　_\-:./()\[\]|]+", " ", base).strip() or _nfkc(names[0]).strip()
+    label = " ".join(w[:1].upper() + w[1:] for w in base.split(" ")) if base.isascii() else base
+    slug = re.sub(r"[^a-z0-9]+", "_", base.lower()).strip("_")
+    if not slug:
+        import hashlib
+        slug = "fx_" + hashlib.sha1(base.encode("utf-8")).hexdigest()[:6]
+    return slug, label[:48], f"{label[:48]} effect", _FALLBACK_MOODS, None, False
+
+
+def hikari_builtin_abilities(param_names: Any) -> list[RigAbility]:
+    """Hikari's VFX blend shapes as builtin abilities (only those her loaded rig actually has)."""
+    names = set(param_names)
+    out = []
+    for pname, aid, label, desc_, moods, emote in HIKARI_VFX_ABILITIES:
+        if pname in names:
+            out.append(RigAbility(aid, label, desc_, "toggle", 3.0, list(moods),
+                                  [AbilityTrack(pname, "toggle", 0.0, 0.0, 1.0, 1.0)], builtin=True, ai=False,
+                                  score=0.0, emote=emote))
+    return out
+
+
+def discover_abilities_from_meta(param_meta: list[dict[str, Any]], model_id: str = "",
+                                 model: dict[str, Any] | None = None, camera: dict[str, float] | None = None,
+                                 physics_settings: dict[str, dict[str, Any]] | None = None) -> list[RigAbility]:
+    """Abilities of a puppet from its param meta (+ the puppet JSON and camera for the off-stage filter)."""
+    meta = [m for m in param_meta if isinstance(m, dict) and m.get("name")]
+    mapper = UniversalParamMapper(meta, model_id, physics_settings)
+    if mapper.passthrough:
+        return hikari_builtin_abilities(m["name"] for m in meta)
+    phys = set(mapper.physics_names) | set(physics_settings or {})
+    cands: list[dict[str, Any]] = []
+    for m in meta:
+        name = m["name"]
+        if not m.get("bound") or m.get("isVec2") or name in phys:
+            continue
+        rule = match_rule(name)
+        if rule is not None and rule[2] != "vfx":
+            continue                                    # head / eyes / mouth / blush ...: the mapper's job
+        if rule is None and (arm_rule(name) is not None or is_physics_param(name) or _ABIL_CORE_RE.search(_nfkc(name))):
+            continue
+        lo, hi = float(m["min"][0]), float(m["max"][0])
+        if not (math.isfinite(lo) and math.isfinite(hi)) or abs(hi - lo) < 1e-6:
+            continue
+        cands.append(m)
+
+    # ---- smart grouping: toggles define stems; drivers join the toggle group of their stem (or a shared prefix)
+    groups: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+
+    def group(key: str) -> dict[str, Any]:
+        if key not in groups:
+            groups[key] = {"toggles": [], "drivers": []}
+            order.append(key)
+        return groups[key]
+
+    toggles = [m for m in cands if _ABIL_TOGGLE_RE.search(_nfkc(m["name"])) and _ability_stem(m["name"])
+               and abs(float(m["max"][0]) - float(m["min"][0])) <= 1.5]     # 0..30 'appear' clips are timelines
+    for m in toggles:
+        group(_ability_stem(m["name"]))["toggles"].append(m)
+    stems = [k for k in order]
+    for m in cands:
+        if m in toggles:
+            continue
+        toks = _tokens(m["name"])
+        joined_to: list[str] = []
+        for k in range(len(toks), 0, -1):
+            pre = norm_name("".join(toks[:k]))
+            if pre in groups and groups[pre]["toggles"]:
+                joined_to = [pre]
+                break
+        if not joined_to and toks:
+            first = norm_name(toks[0])
+            joined_to = [s for s in stems if len(first) >= 1 and s.startswith(first) and s != first]
+        if not joined_to:
+            # driver-only groups: CJK names merge on their first word (うさぎ　出現 + うさぎ　消滅), others stay whole
+            key = norm_name(toks[0]) if len(toks) >= 2 and not toks[0].isascii() else norm_name("".join(toks))
+            joined_to = [key or norm_name(m["name"])]
+        for key in joined_to:
+            group(key)["drivers"].append(m)
+
+    view = _view_rect(camera)
+    geo = _part_geometry(model) if (model is not None and view is not None) else None
+    raw_params = {str(p.get("name")): p for p in (model or {}).get("param") or [] if isinstance(p, dict)}
+    out: list[RigAbility] = []
+    used: set[str] = set()
+    for idx, key in enumerate(order):
+        g = groups[key]
+        tg, dv = g["toggles"], g["drivers"]
+        if not tg and not dv:
+            continue
+        names = [m["name"] for m in tg + dv]
+        slug, label, desc_, moods, dur, known = _label_for(names)
+        is_pose = not tg and all(_ABIL_POSE_RE.search(_nfkc(n)) for n in names)
+        charge_names = [m["name"] for m in dv if _ABIL_CHARGE_RE.search(_nfkc(m["name"]))
+                        and abs(float(m["max"][0]) - float(m["min"][0])) > 1.5]
+        sweeps = [m for m in dv if abs(float(m["max"][0]) - float(m["min"][0])) > 1.5]
+        two_stage = bool(charge_names) and len(sweeps) >= 2
+        tracks: list[AbilityTrack] = []
+        for m in tg:
+            d, lo, hi = float(m["defaults"][0]), float(m["min"][0]), float(m["max"][0])
+            far = hi if abs(hi - d) >= abs(d - lo) else lo
+            # show toggles stay up through BOTH stages (Mao's burst meshes are revealed by the charge toggle)
+            tracks.append(AbilityTrack(m["name"], "toggle", d, min(lo, hi), max(lo, hi), far, 0))
+        for m in dv:
+            d, lo, hi = float(m["defaults"][0]), float(m["min"][0]), float(m["max"][0])
+            lo, hi = min(lo, hi), max(lo, hi)
+            far = hi if abs(hi - d) >= abs(d - lo) else lo
+            span = hi - lo
+            st = 0
+            if two_stage:
+                st = 1 if m["name"] in charge_names else 2
+            if is_pose:
+                tracks.append(AbilityTrack(m["name"], "pose", d, lo, hi, d + 0.9 * (far - d), st))
+            elif lo < d - 1e-6 and d < hi - 1e-6:
+                amp = min(hi - d, d - lo)
+                tracks.append(AbilityTrack(m["name"], "osc", d, lo, hi, d + 0.85 * amp, st))
+            elif span > 1.5:
+                tracks.append(AbilityTrack(m["name"], "sweep", d, lo, hi, d + SWEEP_PEAK * (far - d), st))
+            elif tg:
+                tracks.append(AbilityTrack(m["name"], "sweep", d, lo, hi, far, st))
+            else:
+                tracks.append(AbilityTrack(m["name"], "toggle", d, lo, hi, far, st))
+        has_motion = any(t.role in ("sweep", "osc") for t in tracks)
+        kind = "pose" if is_pose else ("moment" if has_motion else "toggle")
+        duration = float(dur) if dur else (3.5 if kind == "pose" else 3.0 if kind == "moment" else 5.0)
+        aid = "rig_" + slug
+        n = 2
+        while aid in used:
+            aid = f"rig_{slug}_{n}"
+            n += 1
+        used.add(aid)
+        on_stage = True
+        if geo is not None:
+            # judge the group by what makes it APPEAR: its show toggles, else its appear clips, else everything
+            prim = [m["name"] for m in tg] or [nm for nm in names if _ABIL_APPEAR_RE.search(_nfkc(nm))] or names
+            raws = [raw_params[nm] for nm in prim if nm in raw_params]
+            v = view
+            if is_pose and view is not None:
+                v = (view[0], view[1], view[2], view[3] + POSE_VIEW_DROP * (view[3] - view[2]) / (1.0 + 2.0 * VIEW_MARGIN))
+            on_stage = _group_on_stage(raws, geo[0], geo[1], v) if raws else True
+        score = (3.0 if known else 1.0) + (1.5 if dur else 0.0) + (1.0 if has_motion else 0.0) + (0.5 if tg else 0.0) - (1.0 if is_pose else 0.0) \
+            - 0.001 * idx
+        out.append(RigAbility(aid, label, desc_, kind, duration, list(moods), tracks, on_stage=on_stage,
+                              score=score))
+    ranked = sorted((a for a in out if a.on_stage), key=lambda a: -a.score)
+    offered = {a.id for a in ranked[:AI_ABILITY_CAP]}
+    for a in out:
+        a.ai = a.id in offered
+    return out
+
+
+_ABILITY_CACHE: dict[tuple[str, int, int], list[RigAbility]] = {}
+
+
+def discover_rig_abilities(info: PuppetInfo) -> list[RigAbility]:
+    """All custom abilities / props / effects of an inspected puppet (Hikari: her builtin VFX abilities).
+    Uses the puppet JSON + recommended camera to flag off-stage effects (never offered to the AI)."""
+    key: tuple[str, int, int] | None = None
+    model: dict[str, Any] | None = None
+    try:
+        st = Path(info.path).stat()
+        key = (str(Path(info.path).resolve()), int(st.st_mtime_ns), int(st.st_size))
+        with _CACHE_LOCK:
+            hit = _ABILITY_CACHE.get(key)
+        if hit is not None:
+            return [RigAbility(**{**a.__dict__, "tracks": list(a.tracks), "moods": list(a.moods)}) for a in hit]
+        model = read_puppet_json(info.path)
+    except (OSError, PuppetFormatError):
+        model = None
+    mid = HIKARI_ID if info.passthrough else (Path(info.path).stem or "puppet")
+    res = discover_abilities_from_meta(info.param_meta, mid, model, info.recommended_camera, info.physics_settings)
+    if key is not None:
+        with _CACHE_LOCK:
+            if len(_ABILITY_CACHE) > 32:
+                _ABILITY_CACHE.clear()
+            _ABILITY_CACHE[key] = res
+    return [RigAbility(**{**a.__dict__, "tracks": list(a.tracks), "moods": list(a.moods)}) for a in res]
+
+
 # ----------------------------------------------------------------------------- library ids / importer
 
 _ID_BAD = re.compile(r"[^\w\-. ]+", re.UNICODE)

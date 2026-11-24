@@ -771,3 +771,47 @@ kbd {
   .rig-slider { width: auto; flex: 1; }
   .rig-sliders { flex: 1; }
 }
+
+/* ───────────── Rig Abilities & Props (Puppet Library row + ✦ popover strip) ───────────── */
+.abil-wrap { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.abil-grid { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.ability-pill {
+  position: relative; overflow: hidden; display: inline-flex; align-items: center; gap: 7px; max-width: 100%;
+  padding: 5px 12px 5px 6px; border-radius: 999px; border: 1px solid var(--line);
+  background: var(--field); color: var(--text); font: 500 12.5px/1.2 var(--font);
+  cursor: pointer; transition: background 120ms, border-color 120ms, color 120ms, box-shadow 160ms, transform 100ms;
+}
+.ability-pill:hover { background: var(--field-hover); border-color: var(--line-2); }
+.ability-pill:active { transform: scale(0.97); }
+.ability-pill:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.ability-glyph {
+  width: 20px; height: 20px; flex-shrink: 0; display: grid; place-items: center; border-radius: 50%;
+  background: var(--accent-soft); color: var(--accent); font-size: 10.5px; transition: background 160ms, color 160ms;
+}
+.ability-label { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ability-pill::after { content: ""; position: absolute; left: 0; bottom: 0; height: 2px; width: 0; background: var(--accent); }
+.ability-pill.playing {
+  background: var(--accent-soft); color: var(--accent); border-color: rgba(255, 106, 158, 0.55);
+  box-shadow: 0 0 0 3px rgba(255, 106, 158, 0.1), 0 0 16px rgba(255, 106, 158, 0.28);
+}
+.ability-pill.playing .ability-glyph { background: var(--accent); color: var(--accent-ink); }
+.ability-pill.playing::after { animation: sweep var(--dur, 3s) linear forwards; }
+.ability-pill.failed { border-color: rgba(255, 92, 114, 0.6); }
+.abil-foot { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.abil-foot[hidden], .ability-stop[hidden], .ability-status[hidden] { display: none; }
+.btn.ability-stop { margin-left: auto; padding: 4px 12px; font-size: 12px; color: var(--muted); }
+.btn.ability-stop:hover { color: var(--text); }
+.ai-chip {
+  padding: 2px 7px; border-radius: 999px; font-size: 10.5px; font-weight: 700; letter-spacing: 0.04em;
+  color: var(--accent-2); background: rgba(123, 228, 255, 0.1); border: 1px solid rgba(123, 228, 255, 0.3);
+}
+.pop-abil { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.pop-abil[hidden] { display: none; }
+.pop-sub-head { display: flex; align-items: center; gap: 6px; padding: 0 6px 8px; font-size: 12px; font-weight: 600; color: var(--text-2); }
+.pop-sub-head .grow { flex: 1; }
+.pop-sub-count { font-size: 11px; font-weight: 600; color: var(--muted); }
+.pop-abil .abil-grid { max-height: 118px; overflow-y: auto; padding: 1px 2px 4px; scrollbar-width: thin; }
+.pop-abil .abil-foot { padding: 6px 6px 0; }
+.pop-abil .ability-status { font-size: 12px; }
+.pop-abil .ability-stop { margin-left: auto; }
+@media (prefers-reduced-motion: reduce) { .ability-pill.playing::after { animation: none; width: 100%; } }

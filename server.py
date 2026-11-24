@@ -39,7 +39,7 @@ from core.events import HookRegistry
 from core.plugins import PluginManager
 from core.puppet_adapter import (
     DEFAULT_MINT_CLI, HIKARI_ID, MAX_IMPORT_BYTES, PUPPET_EXTS, ImportError_, PuppetFormatError, build_param_inspector,
-    import_puppet_file, inspect_puppet, sanitize_model_cameras, valid_model_id,
+    discover_rig_abilities, import_puppet_file, inspect_puppet, sanitize_model_cameras, valid_model_id,
 )
 from core.rig_controller import EMOTE_CATALOG, VFX_PARAMS, RigController
 from core.wardrobe import WARDROBE_STYLES
@@ -435,6 +435,8 @@ class StudioRuntime:
             self.engine.start()
             self._activate_meta(HIKARI_ID, self.model_path)
         self.config.data["stage"]["activeModel"] = self.active_model_id
+        # the decision engine offers the live puppet's own discovered abilities from the first turn
+        self.decisions.set_rig_abilities(self.rig.get_rig_abilities(), self.active_model_id)
 
         self.plugins = PluginManager(HERE / "plugins", self.hooks)
         self.plugins.discover_and_load(self, self.config.data.get("plugins", {}))
@@ -516,8 +518,13 @@ class StudioRuntime:
         else:
             info = inspect_puppet(path, model_id)
             self.param_meta = info.bound_param_meta
-            summary = self.rig.reload_puppet_meta(info.param_meta, model_id, info.physics_settings)
+            summary = self.rig.reload_puppet_meta(info.param_meta, model_id, info.physics_settings,
+                                                  abilities=discover_rig_abilities(info))
         self.active_model_id = model_id
+        # swap the AI's ability catalog to THIS puppet at once (never stale options from the previous one)
+        decisions = getattr(self, "decisions", None)
+        if decisions is not None:
+            decisions.set_rig_abilities(self.rig.get_rig_abilities(), model_id)
         return summary
 
     @staticmethod
@@ -1368,6 +1375,8 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         return web.json_response({
             "ok": True,
             "emotes": emote_list(),
+            "rigAbilities": runtime.rig.get_rig_abilities(),
+            "activeModel": getattr(runtime, "active_model_id", HIKARI_ID),
             "emotions": {k: {"tag": v["tag"], "emotes": v["emotes"], "description": v["desc"]} for k, v in EMOTIONS.items()},
             "active": runtime.rig.emote_status(),
         })
@@ -1853,6 +1862,46 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         ovr = _ovr_json()
         return web.json_response({"ok": True, "overriddenCount": len(ovr), "overrides": ovr})
 
+    def _origin_guard(req) -> web.Response | None:
+        """Local-only control surface: loopback / Tauri origins (reads included) + the loopback Host check."""
+        if not _origin_allowed(req.headers.get("Origin")) or not _host_allowed(req.headers.get("Host"), _local_port(req)):
+            return web.json_response({"ok": False, "error": "Origin not allowed"}, status=403)
+        return None
+
+    async def api_models_abilities(req):
+        """GET /api/models/abilities: the live puppet's auto-discovered abilities / props / effects."""
+        bad = _origin_guard(req)
+        if bad is not None:
+            return bad
+        return web.json_response({"ok": True, "activeModel": runtime.active_model_id,
+                                  "aiEnabled": bool(runtime.decisions.cfg.get("autonomousGestures", True)),
+                                  "abilities": runtime.rig.get_rig_abilities()})
+
+    async def api_models_ability(req):
+        """POST /api/models/ability {"id": "rig_..."} plays it live; {"stopAll": true} stops every ability."""
+        bad = _origin_guard(req)
+        if bad is not None:
+            return bad
+        body = await _json_body(req)
+        if not isinstance(body, dict):
+            return web.json_response({"ok": False, "error": "Expected a JSON object"}, status=400)
+        if _truthy(body.get("stopAll"), False):
+            runtime.rig.stop_rig_abilities()
+            return web.json_response({"ok": True, "id": None, "playing": False, "duration": 0.0})
+        aid = body.get("id")
+        if not isinstance(aid, str) or not aid.strip() or len(aid) > 64:
+            return web.json_response({"ok": False, "error": "Expected an ability id"}, status=400)
+        dur = body.get("duration")
+        dur_f = _finite(dur, 0.0, 0.6, 30.0) if dur is not None else None
+        res = runtime.rig.trigger_rig_ability(aid.strip(), dur_f or None)
+        if res is None:
+            return web.json_response({"ok": False, "error": f"Unknown ability {aid.strip()!r} on {runtime.active_model_id}",
+                                      "id": aid.strip(), "playing": False}, status=404)
+        runtime.decisions.note_manual_emote(res["id"])     # manual choice wins; autonomy waits its cooldown
+        runtime.note_stage_event(f"the viewer just had you use your {res['label'].lower()} ability", "emote")
+        return web.json_response({"ok": True, "id": res["id"], "label": res["label"], "playing": True,
+                                  "duration": res["duration"]})
+
     async def api_models_test_mouth(_req):
         res = runtime.rig.trigger_mouth_test(2.2)
         return web.json_response({"ok": True, "duration": res["duration"], "mouthMapped": res["mouthMapped"]})
@@ -2114,7 +2163,7 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         res = runtime.rig.trigger_emote(eid, duration=dur)
         if res.get("ok"):
             runtime.decisions.note_manual_emote(res["emote"])   # manual choice wins; autonomy waits its cooldown
-            label = str(EMOTE_CATALOG.get(res["emote"], {}).get("label") or res["emote"]).lower()
+            label = str(EMOTE_CATALOG.get(res["emote"], {}).get("label") or res.get("label") or res["emote"]).lower()
             runtime.note_stage_event(f"the viewer just had you do the {label} emote", "emote")
         return web.json_response(res, status=200 if res.get("ok") else 400)
 
@@ -2296,6 +2345,8 @@ def build_app(runtime: StudioRuntime) -> web.Application:
     app.router.add_get("/api/models/params", api_models_params)
     app.router.add_post("/api/models/params", api_models_params_set)
     app.router.add_post("/api/models/test-mouth", api_models_test_mouth)
+    app.router.add_get("/api/models/abilities", api_models_abilities)
+    app.router.add_post("/api/models/ability", api_models_ability)
     app.router.add_post("/api/models/select", api_models_select)
     app.router.add_post("/api/models/import", api_models_import)
     app.router.add_delete("/api/models/{model_id}", api_models_delete)

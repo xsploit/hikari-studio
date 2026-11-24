@@ -273,7 +273,10 @@ const SEARCH_SYNONYMS = {
   'extra controls': ['extra controls', 'extra rig'], flap: ['flap', 'mouth'], flaps: ['flap', 'mouth'],
   capabilities: ['capabilit', 'hookup'], capability: ['capabilit', 'hookup'], hookup: ['hookup', 'capabilit'], hookups: ['hookup', 'capabilit'],
   extras: ['extra'], extra: ['extra'], toggles: ['toggle'], springs: ['spring', 'physics'], spring: ['spring', 'physics'],
-  aura: ['aura'], bunny: ['bunny'], ears: ['ears', 'bunny'], override: ['override'], overrides: ['override'],
+  aura: ['aura', 'abilit'], bunny: ['bunny'], ears: ['ears', 'bunny'], override: ['override'], overrides: ['override'],
+  abilities: ['abilit', 'rig abilities', 'props'], ability: ['abilit', 'rig abilities'], 'rig abilities': ['rig abilities', 'abilit'],
+  props: ['props', 'abilit'], prop: ['prop', 'abilit'], spells: ['spell', 'magic', 'abilit'], spell: ['spell', 'magic', 'abilit'],
+  magic: ['magic', 'spell', 'abilit'], starlight: ['starlight', 'abilit'], explosion: ['explosion', 'abilit'], cast: ['cast', 'abilit'],
   motion: ['motion', 'clip', 'retarget'], video: ['video', 'motion lab'], save: ['save', 'preset'],
 };
 const SYN_PHRASES = Object.keys(SEARCH_SYNONYMS).filter((k) => k.includes(' ')).sort((a, b) => b.length - a.length);
