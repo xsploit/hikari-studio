@@ -22,6 +22,7 @@ const BLEND_PARAMS = [
   ['Eye Heart', 'Heart Eyes'],
   ['Cheek Puff', 'Cheek Puff'],
   ['Cat Mouth', 'Cat Mouth :3'],
+  ['Pupil Shrink', 'Pupil Shrink'],
 ];
 
 const vfx = { overrides: {}, loaded: false, loading: null, error: '' };
@@ -112,7 +113,7 @@ export function renderExpressionFx(store) {
       onChange: (v) => store.patch('rig', { autoVfx: v }),
     }),
     row({ title: 'Expression VFX', desc: 'Sparkles, hearts, sweatdrop, anger vein, shock lines, music notes', stack: true, control: fxPills(VFX_PARAMS) }),
-    row({ title: 'Blend shapes', desc: 'Star eyes, heart eyes, cheek puff, cat mouth :3', stack: true, control: fxPills(BLEND_PARAMS) }),
+    row({ title: 'Blend shapes', desc: 'Star eyes, heart eyes, cheek puff, cat mouth :3, pupil shrink (shocked)', stack: true, control: fxPills(BLEND_PARAMS) }),
     el('div', { class: 's-row' }, [
       el('div', { class: 's-row-text' }, [
         el('div', { class: 's-title', text: 'Reset FX' }),

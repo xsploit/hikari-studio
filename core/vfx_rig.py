@@ -847,11 +847,14 @@ def cheek_puff_offsets(face_rest: np.ndarray) -> np.ndarray:
     return off
 
 
-def apply_vfx_rig(header: bytes, tid_of: dict[str, int], sizes: dict[str, tuple[float, float]]) -> bytes:
+def apply_vfx_rig(header: bytes, tid_of: dict[str, int], sizes: dict[str, tuple[float, float]],
+                  iris_pngs: dict[str, bytes] | None = None) -> bytes:
     puppet = _parse(header)
     by_id, _ = _index(puppet["nodes"])
     if NODE_BASE in by_id or FACE not in by_id:
         return header
+    # pro transforms first: the eye star / heart followers built below then also inherit Pupil Shrink
+    apply_pro_transforms(puppet, iris_pngs or {})
     params = puppet.setdefault("param", [])
     by_name = {p["name"]: p for p in params}
     fol = Follower(puppet)
@@ -940,3 +943,215 @@ def apply_vfx_rig(header: bytes, tid_of: dict[str, int], sizes: dict[str, tuple[
         if lip in by_id:
             _bind(cm, lip, "opacity", [1.0, 0.0])
     return _dump(header, puppet)
+
+
+# =================================================================================================================
+# 5. Pro VTuber transforms (Hiyori / Mao style): stage move + lean, pupil shrink, shoulder shrug, and the three
+#    face channels that shipped with zero bindings (mouth corners, brow X, eye form).
+#    Every vertex offset is a smooth function of the vertex's REST world position, so parts that touch at rest
+#    (topwear / resting arms / shoulder lineart, lash / eye white, lips / cavity) move identically at the seam.
+# =================================================================================================================
+PRO_PARAM_IDS = {"Stage X": 54200, "Stage Y": 54201, "Stage Zoom": 54202, "Pupil Shrink": 54203, "Shoulder Shrug": 54204}
+PUPPET_ROOT = 1
+STAGE_X = 45.0                    # +-units of whole-body sway at Stage X = +-1
+STAGE_Y = (45.0, -55.0)           # t.y at Stage Y = -1 (crouch, down) / +1 (hop, UP: Inochi2D y points down)
+STAGE_ZOOM = (0.92, 1.10)         # root scale at Stage Zoom = -1 (recoil back) / +1 (lean in)
+STAGE_PIVOT_Y = -420.0            # lean pivots on the face so the face stays framed while the body grows / shrinks
+PUPIL_SHRINK = 0.68               # iris scale at Pupil Shrink = 1
+SHRUG_UP, SHRUG_DOWN = 14.0, 8.0  # shoulder lift (units) at Shoulder Shrug = +1 / drop at -1
+SHRUG_TORSO = (1005, 53200, 53201, 51001)   # topwear, both shoulder lineart overlays (same mesh), halter collar
+SHRUG_ARMS = (1046, 1000)                   # seamless resting arms
+SHRUG_RAISED_ROOTS = (50006, 50015)         # raised wave-arm shoulder roots (rigid: translated by the field value)
+IRIS_SETS = {"R": (1023, 1025, 50019), "L": (1024, 1026, 50020)}   # iris, catchlight layer, sparkle-eye FX
+MOUTH_PARTS = (40001, 40002, 40003, 40004, 40005, 40006, 1037, 1038, 1039, 1040, 1041, 1042, 1043, 1044, 1045)
+MOUTH_HALF_W = 12.5
+MOUTH_CORNER = (3.2, 3.2)         # corner lift at +1 / drop at -1 (units)
+BROWS = {"R": (1031, 1032), "L": (1033, 1034)}
+BROW_SLIDE = 6.0                  # whole-brow horizontal slide at +-1, inner end gets BROW_INNER_EXTRA more
+BROW_INNER_EXTRA = 3.0
+EYE_FORM_NODES = {"R": {"white": 1014, "lash": (1019, 1020)}, "L": {"white": 1015, "lash": (1021, 1022)}}
+EYE_FORM_DROP, EYE_FORM_LIFT = 7.0, 3.0     # upper-lid centre travel at Eye Form = -1 (smug half-lid) / +1 (wide)
+
+
+def _world_rest(node: dict[str, Any], parent: dict[int, dict[str, Any]]) -> np.ndarray:
+    off = np.zeros(2)
+    n: dict[str, Any] | None = node
+    while n is not None:
+        t = n.get("transform", {}).get("trans", [0.0, 0.0, 0.0])
+        off += (float(t[0]), float(t[1]))
+        n = parent.get(n["uuid"])
+    return _rest(node) + off
+
+
+def _ensure_param(params: list[dict[str, Any]], name: str, lo: float) -> dict[str, Any]:
+    for p in params:
+        if p["name"] == name:
+            return p
+    p = _new_param(name, PRO_PARAM_IDS[name])
+    if lo < 0:
+        p.update(min=[-1.0, 0.0], max=[1.0, 1.0], axis_points=[[0.0, 0.5, 1.0], [0.0, 1.0]])
+    params.append(p)
+    return p
+
+
+def _bind_deform(param: dict[str, Any], node: int, offs: list[np.ndarray]) -> None:
+    """offs: one (N, 2) offset array per axis point of the (1D) param."""
+    n0, n1 = len(param["axis_points"][0]), len(param["axis_points"][1])
+    assert len(offs) == n0
+    bs = param.setdefault("bindings", [])
+    bs[:] = [b for b in bs if not (b["node"] == node and b["param_name"] == "deform")]
+    bs.append({"node": node, "param_name": "deform", "interpolate_mode": "Linear", "isSet": [[True] * n1 for _ in range(n0)],
+               "values": [[np.round(o, 4).tolist()] * n1 for o in offs]})
+
+
+def iris_uv_centroid(png: bytes) -> tuple[float, float] | None:
+    """Alpha-weighted centre of the iris art in UV space (the pupil sits dead-centre of the iris disc)."""
+    try:
+        a = np.asarray(Image.open(io.BytesIO(png)).convert("RGBA"), np.float32)[..., 3] / 255.0
+    except Exception:
+        return None
+    a = np.where(a > 0.5, a, 0.0)
+    s = float(a.sum())
+    if s < 16.0:
+        return None
+    ys, xs = np.mgrid[0:a.shape[0], 0:a.shape[1]]
+    return float(((xs + 0.5) * a).sum() / s / a.shape[1]), float(((ys + 0.5) * a).sum() / s / a.shape[0])
+
+
+def _uv_to_world(node: dict[str, Any], world: np.ndarray, uv: tuple[float, float]) -> np.ndarray:
+    uvs = np.asarray(node["mesh"]["uvs"], np.float64).reshape(-1, 2)
+    tris = np.asarray(node["mesh"]["indices"], np.int64).reshape(-1, 3)
+    W = _bary_weights(uvs, tris, np.array([uv], np.float64))
+    return (W @ world)[0]
+
+
+def shrug_field(pts: np.ndarray, arm: bool) -> np.ndarray:
+    """0..1 shoulder-lift weight. Zero across the neck, full on the shoulder caps; on the torso it fades out above
+    the bust, on the arms it fades much more slowly so the whole upper arm rides up (the arms sit BEHIND the
+    topwear, so the small torso/arm difference near the armpit slides under the top's side edge, never gaps)."""
+    x, y = pts[:, 0], pts[:, 1]
+    sx = _ss(30.0, 66.0, np.abs(x))
+    sy = 1.0 - (_ss(-305.0, -110.0, y) if arm else _ss(-305.0, -232.0, y))
+    return sx * sy
+
+
+def mouth_corner_weight(pts: np.ndarray, side: str) -> np.ndarray:
+    """Hikari's LEFT = screen right (+x). Weight 0 at the mouth centre -> 1 at that corner (eased)."""
+    u = (pts[:, 0] - MOUTH_CENTER[0]) / MOUTH_HALF_W * (1.0 if side == "L" else -1.0)
+    return np.clip(u, 0.0, 1.2) ** 1.6
+
+
+def apply_pro_transforms(puppet: dict[str, Any], iris_pngs: dict[str, bytes]) -> None:
+    by_id, parent = _index(puppet["nodes"])
+    params = puppet.setdefault("param", [])
+
+    # ---- 1. Stage X / Y / Zoom on the puppet root: hair, face, body, arms, VFX and physics anchors move as one.
+    if puppet["nodes"].get("uuid") == PUPPET_ROOT:
+        _bind(_ensure_param(params, "Stage X", -1), PUPPET_ROOT, "transform.t.x", [-STAGE_X, 0.0, STAGE_X])
+        _bind(_ensure_param(params, "Stage Y", -1), PUPPET_ROOT, "transform.t.y", [STAGE_Y[0], 0.0, STAGE_Y[1]])
+        zp = _ensure_param(params, "Stage Zoom", -1)
+        s0, s1 = STAGE_ZOOM
+        _bind(zp, PUPPET_ROOT, "transform.s.x", [s0, 1.0, s1])
+        _bind(zp, PUPPET_ROOT, "transform.s.y", [s0, 1.0, s1])
+        # world = s * p + t; t = pivot * (1 - s) keeps the pivot (face) fixed. Both are linear per segment -> exact.
+        _bind(zp, PUPPET_ROOT, "transform.t.y", [STAGE_PIVOT_Y * (1 - s0), 0.0, STAGE_PIVOT_Y * (1 - s1)])
+
+    # ---- 2. Pupil Shrink: vertex scale toward each iris's true art centre (deforms add, so it stays centred
+    #         while the gaze / head deforms move the iris). Eye white sits behind -> solid white, no hole.
+    ps = _ensure_param(params, "Pupil Shrink", 0)
+    for side, nodes in IRIS_SETS.items():
+        iris = by_id.get(nodes[0])
+        if iris is None:
+            continue
+        iw = _world_rest(iris, parent)
+        uv = iris_uv_centroid(iris_pngs[side]) if side in iris_pngs else None
+        c = _uv_to_world(iris, iw, uv) if uv is not None else np.asarray(IRIS_CENTER[side], np.float64)
+        for nid in nodes:
+            n = by_id.get(nid)
+            if n is None or not n.get("mesh", {}).get("verts"):
+                continue
+            w = _world_rest(n, parent)
+            _bind_deform(ps, nid, [np.zeros_like(w), (PUPIL_SHRINK - 1.0) * (w - c)])
+
+    # ---- 3. Shoulder Shrug: one continuous field over topwear + lineart overlays + collar + resting arms,
+    #         raised wave-arm roots translated by the field value at their pivot.
+    sp = _ensure_param(params, "Shoulder Shrug", -1)
+    for nid in SHRUG_TORSO + SHRUG_ARMS:
+        n = by_id.get(nid)
+        if n is None or not n.get("mesh", {}).get("verts"):
+            continue
+        w = _world_rest(n, parent)
+        f = shrug_field(w, arm=nid in SHRUG_ARMS)
+        up = np.stack([np.zeros_like(f), -SHRUG_UP * f], 1)
+        down = np.stack([np.zeros_like(f), SHRUG_DOWN * f], 1)
+        _bind_deform(sp, nid, [down, np.zeros_like(up), up])
+    for nid in SHRUG_RAISED_ROOTS:
+        n = by_id.get(nid)
+        if n is None:
+            continue
+        piv = _world_rest({"uuid": nid, "mesh": {"verts": [0.0, 0.0]}, "transform": n.get("transform", {})}, parent)
+        f = float(shrug_field(piv, arm=True)[0])
+        _bind(sp, nid, "transform.t.y", [SHRUG_DOWN * f, 0.0, -SHRUG_UP * f])
+
+    by_name = {p["name"]: p for p in params}
+    # ---- 4a. Left / Right mouth corner: lift (+1) / drop (-1) one half of every mouth layer, eased toward the corner.
+    for side, pname in (("L", "Left mouth corner"), ("R", "Right mouth corner")):
+        prm = by_name.get(pname)
+        if prm is None or len(prm["axis_points"][0]) != 3:
+            continue
+        sg = 1.0 if side == "L" else -1.0
+        for nid in MOUTH_PARTS:
+            n = by_id.get(nid)
+            if n is None or not n.get("mesh", {}).get("verts"):
+                continue
+            w = _world_rest(n, parent)
+            k = mouth_corner_weight(w, side)
+            up = np.stack([sg * 0.7 * k, -MOUTH_CORNER[0] * k], 1)      # smile corners also widen a touch
+            down = np.stack([-sg * 0.3 * k, MOUTH_CORNER[1] * k], 1)
+            _bind_deform(prm, nid, [down, np.zeros_like(up), up])
+
+    # ---- 4b. Brow L / R X: -1 = pinch inward toward the nose bridge (inner end dips: furrow), +1 = spread outward.
+    for side, pname in (("L", "Brow L X"), ("R", "Brow R X")):
+        prm = by_name.get(pname)
+        if prm is None or len(prm["axis_points"][0]) != 3:
+            continue
+        out_dir = 1.0 if side == "L" else -1.0                       # outward = away from x = 0
+        for nid in BROWS[side]:
+            n = by_id.get(nid)
+            if n is None or not n.get("mesh", {}).get("verts"):
+                continue
+            w = _world_rest(n, parent)
+            ax = np.abs(w[:, 0])
+            inner = 1.0 - _ss(float(ax.min()), float(ax.max()), ax)    # 1 at the inner end, 0 at the tail
+            dx = out_dir * (BROW_SLIDE + BROW_INNER_EXTRA * inner)
+            pinch = np.stack([-dx, 3.0 * inner], 1)
+            spread = np.stack([dx * 0.85, -1.0 * inner], 1)
+            _bind_deform(prm, nid, [pinch, np.zeros_like(pinch), spread])
+
+    # ---- 4c. Eye L / R Form: upper-lid arch. Lash moves rigidly by an arch-shaped profile, the eye white's top edge
+    #          follows exactly (its bottom stays), the iris is masked by the white so it is clipped cleanly.
+    for side, pname in (("L", "Eye L Form"), ("R", "Eye R Form")):
+        prm = by_name.get(pname)
+        spec = EYE_FORM_NODES[side]
+        white = by_id.get(spec["white"])
+        if prm is None or white is None or len(prm["axis_points"][0]) != 3:
+            continue
+        ww = _world_rest(white, parent)
+        x0, x1 = float(ww[:, 0].min()), float(ww[:, 0].max())
+        cx, hw = (x0 + x1) / 2.0, (x1 - x0) / 2.0
+        y_top, y_bot = float(ww[:, 1].min()), float(ww[:, 1].max())
+
+        def emit(nid: int, p: np.ndarray, vy: np.ndarray) -> None:
+            # centre travels most -> lid flattens / arches; the corners + lash tail keep ~30% so the tail never spikes
+            u = np.clip(np.abs(p[:, 0] - cx) / (hw * 1.35), 0.0, 1.0)
+            k = (0.3 + 0.7 * np.cos(u * np.pi / 2.0) ** 1.5) * vy
+            down = np.stack([np.zeros_like(k), EYE_FORM_DROP * k], 1)
+            up = np.stack([np.zeros_like(k), -EYE_FORM_LIFT * k], 1)
+            _bind_deform(prm, nid, [down, np.zeros_like(down), up])
+
+        emit(spec["white"], ww, _ss(y_bot - 4.0, y_top + 6.0, ww[:, 1]))
+        for nid in spec["lash"]:
+            n = by_id.get(nid)
+            if n is not None and n.get("mesh", {}).get("verts"):
+                p = _world_rest(n, parent)
+                emit(nid, p, np.ones(len(p)))

@@ -1,9 +1,11 @@
 """Verification: Mao / Neuro-style expression VFX & blend-shape layer.
 
-  * all 10 VFX params ease in / out smoothly (no jumps) and animate in their ranges (twinkle / bob / throb)
+  * all 11 VFX / blend-shape params (incl. Pupil Shrink) ease in / out smoothly (no jumps) and animate in their ranges (twinkle / bob / throb)
   * Cat Mouth ducks while the lip-sync mouth is open (> 0.15) and eases back to :3 in pauses
   * auto emotion mapping (rig.autoVfx), manual overrides beat auto, thinking / neutral calm everything
   * every emote (original + new) runs without NaN / errors; wrists stay within +-0.65; shoulders untouched
+  * AAA rig transforms (Stage X / Y / Zoom, Shoulder Shrug, mouth corners, Brow X, Eye Form): every emote
+    stays finite, in range, smooth and eases back to 0; sustained emotion poses; corners duck for wide speech
   * decision engine knows the new emotions / emotes
   * GET / POST /api/vfx, GET /api/emotes, POST /api/config rig.autoVfx on the real server.py handlers
     (random loopback port, never 8800; no engine / mic / network)
@@ -28,7 +30,8 @@ from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
 from core.config import ConfigStore, default_config  # noqa: E402
 from core.events import HookRegistry  # noqa: E402
 import core.rig_controller as rig_mod  # noqa: E402
-from core.rig_controller import EMOTE_CATALOG, VFX_MOTION, VFX_PARAMS, RigController  # noqa: E402
+from core.rig_controller import (EMOTE_CATALOG, EMOTION_POSE, RIG_FX_PARAMS, VFX_MOTION, VFX_PARAMS,  # noqa: E402
+                                 RigController)
 
 
 class VirtualClock:
@@ -75,14 +78,15 @@ class FakeLipSync:
 
 
 def rig_param_defaults() -> dict[str, tuple[float, float]]:
-    """Every parameter name the controller writes (scraped from its source) + the 10 VFX params + shoulders."""
+    """Every parameter name the controller writes (scraped from its source) + the 11 VFX params + the AAA rig
+    transforms + shoulders."""
     src = (HERE / "core" / "rig_controller.py").read_text(encoding="utf-8")
     names = set(re.findall(r'p\["([^"]+)"\]', src))
     names |= {f"Arm {s} {j}" for s in "RL" for j in ("Elbow", "Wrist")}
     names |= {"Brow L Angle", "Brow R Angle", "Cheek", "Proportion (Chibi)", "Gloom", "Emissive Glow",
               "Chest X", "Chest Y", "Eye Jelly", "Mouth Spring", "Arm R Swing", "Arm L Swing", "Lips Press / Part",
               "Shoulder R", "Shoulder L"}
-    names |= set(VFX_PARAMS)
+    names |= set(VFX_PARAMS) | set(RIG_FX_PARAMS)
     d = {n: (0.0, 0.0) for n in names}
     d["Emissive Glow"] = (1.0, 0.0)
     d["Left Eye Open"] = d["Right Eye Open"] = (1.0, 0.0)
@@ -92,6 +96,7 @@ def rig_param_defaults() -> dict[str, tuple[float, float]]:
 def new_rig() -> tuple[RigController, FakeLipSync, dict[str, Any]]:
     lip = FakeLipSync()
     rig = RigController(rig_param_defaults(), lip, HookRegistry())   # type: ignore[arg-type]
+    rig._rnd.seed(20261124)              # deterministic idle life (random brow twitches could flake brow checks)
     cfg = default_config()
     cfg["rig"]["autoGaze"] = True
     return rig, lip, cfg
@@ -116,7 +121,9 @@ def test_rig_layer() -> None:
     rig, lip, cfg = new_rig()
     run(rig, cfg, 0.5)
     base = rig.get_vfx_state()
-    check("rig. all 10 VFX params known, start at 0", base["available"] == list(VFX_PARAMS)
+    check("rig. 11 VFX / blend-shape params incl. Pupil Shrink", len(VFX_PARAMS) == 11 and "Pupil Shrink" in VFX_PARAMS,
+          str(VFX_PARAMS))
+    check("rig. all 11 VFX params known, start at 0", base["available"] == list(VFX_PARAMS)
           and all(v == 0.0 for v in base["active"].values()), str(base))
 
     # Manual overrides: every param eases in smoothly, then animates within its range.
@@ -189,6 +196,9 @@ def test_rig_layer() -> None:
     check("auto. nervous -> sweat ~0.95", 0.93 <= a["VFX Sweat"] <= 0.96, str(a))
     a = settle("surprised")
     check("auto. surprised -> shock ~0.9", 0.88 <= a["VFX Shock"] <= 0.91, str(a))
+    check("auto. surprised -> Pupil Shrink ~0.45", 0.43 <= a["Pupil Shrink"] <= 0.46, str(a))
+    a = settle("shocked")
+    check("auto. shocked -> Pupil Shrink ~0.95 + shock", 0.93 <= a["Pupil Shrink"] <= 0.96 and a["VFX Shock"] > 0.85, str(a))
     a = settle("singing")
     check("auto. singing -> music notes ~0.95", 0.95 * 0.78 <= a["VFX Music"] <= 0.96, str(a))
     rig.set_vfx_emotion("smug", hold=30.0)
@@ -299,6 +309,153 @@ def test_emotes() -> None:
               (peak > 0.3) if auto else (peak < 0.02), f"peak={peak:.3f}")
         run(rig, cfg, 1.5)
     rig.set_auto_vfx(True)
+
+
+# ------------------------------------------------------------------------------------------------ AAA rig transforms
+FX_PEAKS: dict[str, list[tuple[str, str, float]]] = {
+    # emote: [(param, "max" | "min", threshold)]  ("max" = peak above, "min" = trough below)
+    "excited_hop":   [("Stage Y", "max", 0.6), ("Stage Zoom", "max", 0.2)],
+    "cheer_bounce":  [("Stage Y", "max", 0.45), ("Stage X", "max", 0.15), ("Stage X", "min", -0.15)],
+    "vibe_music":    [("Stage Y", "max", 0.15), ("Stage X", "max", 0.2), ("Stage X", "min", -0.2)],
+    "curious_lean":  [("Stage Zoom", "max", 0.45)],
+    "smug_tease":    [("Left mouth corner", "max", 0.75), ("Right mouth corner", "min", -0.28), ("Eye L Form", "min", -0.68),
+                      ("Eye R Form", "min", -0.68), ("Stage Zoom", "max", 0.2)],
+    "cat_smug":      [("Eye L Form", "min", -0.62), ("Eye R Form", "min", -0.62), ("Stage Zoom", "max", 0.15)],
+    "anger_vein":    [("Brow L X", "min", -0.75), ("Brow R X", "min", -0.75), ("Shoulder Shrug", "max", 0.38)],
+    "pout_puff":     [("Brow L X", "min", -0.55), ("Brow R X", "min", -0.55), ("Shoulder Shrug", "max", 0.33)],
+    "flustered_shy": [("Shoulder Shrug", "max", 0.55), ("Stage Zoom", "min", -0.14)],
+    "shy_blush":     [("Shoulder Shrug", "max", 0.55), ("Stage Zoom", "min", -0.14)],
+    "anime_sweat":   [("Shoulder Shrug", "max", 0.45), ("Pupil Shrink", "max", 0.25)],
+    "gloom_shake":   [("Shoulder Shrug", "min", -0.45), ("Brow L X", "min", -0.45), ("Brow R X", "min", -0.45),
+                      ("Stage Y", "min", -0.2)],
+    "sleepy_yawn":   [("Eye L Form", "min", -0.62), ("Eye R Form", "min", -0.62), ("Shoulder Shrug", "min", -0.4)],
+    "starry_eyes":   [("Stage Zoom", "max", 0.22), ("Stage Y", "max", 0.22)],
+    "heart_crush":   [("Stage Zoom", "max", 0.22), ("Stage Y", "max", 0.22)],
+}
+FX_ALL = tuple(RIG_FX_PARAMS) + ("Pupil Shrink",)
+
+
+def max_step(s: list[float]) -> float:
+    return max((abs(b - a) for a, b in zip(s, s[1:])), default=0.0)
+
+
+def test_rig_fx() -> None:
+    rig, lip, cfg = new_rig()
+    cfg["rig"]["expression"] = "happy"                       # no sustained pose: emotes alone drive the channels
+    run(rig, cfg, 0.5)
+    check("fx. AAA channels rest at 0", all(abs(rig.last_params[k][0]) < 1e-9 for k in FX_ALL))
+
+    for eid in EMOTE_CATALOG:
+        res = rig.trigger_emote(eid)
+        frames = run(rig, cfg, float(res["duration"]))
+        tail = run(rig, cfg, 0.8)
+        allf = frames + tail
+        finite = all(math.isfinite(f[k][0]) and math.isfinite(f[k][1]) for f in allf for k in FX_ALL)
+        in_range = all(-1.0 <= f[k][0] <= 1.0 for f in allf for k in RIG_FX_PARAMS)
+        steps = {k: max_step([0.0] + series(allf, k)) for k in FX_ALL}
+        worst = max(steps, key=steps.get)
+        back = max(abs(tail[-1][k][0]) for k in FX_ALL)
+        check(f"fx. {eid}: AAA channels finite, in range, smooth (max step {steps[worst]:.3f} on {worst}), back to 0",
+              finite and in_range and steps[worst] < 0.12 and back < 0.01, f"back={back:.4f}")
+        for k, mode, thr in FX_PEAKS.get(eid, ()):
+            s = series(frames, k)
+            v = max(s) if mode == "max" else min(s)
+            check(f"fx. {eid}: {k} {'peaks above' if mode == 'max' else 'dips below'} {thr:+.2f}",
+                  v > thr if mode == "max" else v < thr, f"{mode}={v:.3f}")
+        run(rig, cfg, 0.7)
+    check("fx. every requested emote is wired", set(FX_PEAKS) <= set(EMOTE_CATALOG))
+
+    # Interrupting an emote mid-hop with another never pops a channel
+    rig.trigger_emote("excited_hop")
+    a = run(rig, cfg, 0.55)
+    rig.trigger_emote("gloom_shake")
+    b = run(rig, cfg, 3.6)
+    w = max(max_step(series(a + b, k)) for k in RIG_FX_PARAMS)
+    check("fx. emote interrupt eases (no pop)", w < 0.15, f"max step={w:.3f}")
+    run(rig, cfg, 1.0)
+
+    # Talking during an emote: still finite and smooth
+    rig.trigger_emote("smug_tease")
+    fr = []
+    for i in range(int(2.9 / DT)):
+        lip.open, lip.energy = ((0.7, 0.4) if (i // 20) % 2 else (0.0, 0.0))
+        fr += run(rig, cfg, DT)
+    lip.open, lip.energy = 0.0, 0.0
+    check("fx. smug_tease while talking stays finite and smooth",
+          all(math.isfinite(f[k][0]) for f in fr for k in FX_ALL) and max(max_step(series(fr, k)) for k in RIG_FX_PARAMS) < 0.12)
+    run(rig, cfg, 1.5)
+
+    # Sustained emotion poses (spring-eased)
+    def pose(emo: str, secs: float = 2.5) -> tuple[dict[str, float], float]:
+        rig.set_vfx_emotion(emo, hold=30.0)
+        fr = run(rig, cfg, secs)
+        return {k: fr[-1][k][0] for k in FX_ALL}, max(max_step(series(fr, k)) for k in RIG_FX_PARAMS)
+
+    def near(v: float, want: float, tol: float = 0.04) -> bool:
+        return abs(v - want) <= tol
+
+    for emo in ("smug", "playful"):
+        v, st = pose(emo)
+        check(f"pose. {emo}: smirk L+0.65 / R-0.2 + smug half-lids -0.55 (smooth)",
+              near(v["Left mouth corner"], 0.65) and near(v["Right mouth corner"], -0.2) and near(v["Eye L Form"], -0.55)
+              and near(v["Eye R Form"], -0.55) and st < 0.05, f"{v} step={st:.3f}")
+    lip.open, lip.energy = 0.75, 0.4
+    talk = run(rig, cfg, 0.6)
+    lc_talk = series(talk, "Left mouth corner")
+    lip.open, lip.energy = 0.2, 0.2
+    small = run(rig, cfg, 1.2)
+    lip.open, lip.energy = 0.0, 0.0
+    check("pose. smirk corners duck during wide-open speech (> 0.35)", lc_talk[-1] < 0.3, f"{lc_talk[-1]:.3f}")
+    check("pose. corner duck is smooth", max_step(lc_talk) < 0.1, f"{max_step(lc_talk):.3f}")
+    check("pose. small mouth movement keeps the smirk", series(small, "Left mouth corner")[-1] > 0.6,
+          f"{series(small, 'Left mouth corner')[-1]:.3f}")
+    for emo in ("angry", "annoyed", "pout"):
+        v, st = pose(emo)
+        check(f"pose. {emo}: inward brow pinch -0.75", near(v["Brow L X"], -0.75) and near(v["Brow R X"], -0.75)
+              and abs(v["Left mouth corner"]) < 0.04, str(v))
+    for emo, pupil in (("shocked", 0.95), ("surprised", 0.45)):
+        v, st = pose(emo)
+        check(f"pose. {emo}: recoil zoom -0.45 + wide eyes +0.65 + Pupil Shrink {pupil}",
+              near(v["Stage Zoom"], -0.45) and near(v["Eye L Form"], 0.65) and near(v["Eye R Form"], 0.65)
+              and near(v["Pupil Shrink"], pupil, 0.03) and abs(v["Brow L X"]) < 0.04, str(v))
+    for emo in ("sad", "tired"):
+        v, st = pose(emo)
+        check(f"pose. {emo}: slumped shoulders -0.45 + droopy lids -0.4", near(v["Shoulder Shrug"], -0.45)
+              and near(v["Eye L Form"], -0.4) and near(v["Eye R Form"], -0.4), str(v))
+    for emo in ("flustered", "shy", "nervous"):
+        v, st = pose(emo)
+        check(f"pose. {emo}: cute shoulder hunch +0.45", near(v["Shoulder Shrug"], 0.45), str(v))
+    rig.set_auto_vfx(False)
+    v, _ = pose("shocked", 1.5)
+    check("pose. autoVfx off: no auto Pupil Shrink, recoil pose kept", v["Pupil Shrink"] < 0.02 and near(v["Stage Zoom"], -0.45), str(v))
+    rig.set_auto_vfx(True)
+    v, _ = pose("neutral", 3.0)
+    check("pose. neutral: every AAA channel eases back to 0", max(abs(x) for x in v.values()) < 0.01, str(v))
+    cfg["rig"]["expression"] = "pout"                        # expression preset path (no decided emotion)
+    fr = run(rig, cfg, 2.5)
+    check("pose. expression preset 'pout' -> brow pinch", near(fr[-1]["Brow L X"][0], -0.75), str(fr[-1]["Brow L X"]))
+    cfg["rig"]["expression"] = "happy"
+    run(rig, cfg, 3.0)
+
+    # Manual Pupil Shrink override (POST /api/vfx path)
+    rig.set_vfx_override("Pupil Shrink", 1.0)
+    fr = run(rig, cfg, 1.0)
+    check("fx. manual Pupil Shrink override eases to 1.0", series(fr, "Pupil Shrink")[-1] > 0.97
+          and max_step([0.0] + series(fr, "Pupil Shrink")) < 0.2)
+    rig.clear_vfx_overrides()
+    run(rig, cfg, 1.5)
+
+    # Older rigs without the AAA transforms: nothing written, no warnings
+    d = rig_param_defaults()
+    for k in RIG_FX_PARAMS:
+        d.pop(k, None)
+    old = RigController(d, FakeLipSync(), HookRegistry())   # type: ignore[arg-type]
+    old.set_vfx_emotion("smug", hold=10.0)
+    old.trigger_emote("excited_hop")
+    p = run(old, cfg, 1.0)[-1]
+    check("fx. older rig without AAA transforms: skipped silently", not any(k in p for k in RIG_FX_PARAMS)
+          and not old._warned_unknown, str(old._warned_unknown))
+    check("fx. EMOTION_POSE values stay within -1..1", all(-1.0 <= v <= 1.0 for m in EMOTION_POSE.values() for v in m.values()))
 
 
 # ------------------------------------------------------------------------------------------------ decider
@@ -431,6 +588,7 @@ async def test_http(tmp: Path) -> None:
 def main() -> int:
     test_rig_layer()
     test_emotes()
+    test_rig_fx()
     test_decider()
     with tempfile.TemporaryDirectory(prefix="hikari-vfx-test-") as td:
         asyncio.run(test_http(Path(td)))

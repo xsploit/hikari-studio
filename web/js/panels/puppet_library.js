@@ -1,10 +1,14 @@
 /** PUPPET LIBRARY — switch between Hikari (Custom), bundled rigs (Hiyori, Mao…) and imported .inp / .inx / Live2D rigs.
- *  Fetches GET /api/models lazily while Look & Props is open (cached 8 s, no background timers). */
-import { btn, el, group, row } from '../ui.js';
+ *  Fetches GET /api/models lazily while Look & Props is open (cached 8 s, no background timers).
+ *  Below the cards: live rig hookup badges + 1-click mouth-flap test, and an "Extra Rig Controls" inspector
+ *  (GET/POST /api/models/params) cached per active puppet and refetched whenever the puppet switches. */
+import { btn, el, group, more, row, segmented, switchEl } from '../ui.js';
 
 const CACHE_MS = 8000;
 const HIKARI_ID = 'hikari';
 const SEARCH_KW = 'puppet puppets model models avatar avatars rig rigs character switch hikari hiyori mao';
+const CAPS_KW = 'capabilities capability hookups hooked auto hooked mapped mouth flap flaps test mouth lip lips head eyes arms physics springs extras';
+const PARAMS_KW = 'extra rig controls rig params parameters params extras extra controls toggles props effects fx aura bunny ears hidden physics springs arms hands auto mapped override reset';
 const IMPORT_KW = 'import rig inp inx inochi live2d zip mint convert';
 
 const lib = {
@@ -94,6 +98,7 @@ async function run(store, pending, task, success) {
     lib.kind = 'error';
   } finally {
     lib.busy = false;
+    rig.key = null;                      // re-read rig params/capabilities for whatever is on stage now
     await refreshModels(store, true);   // immediate refresh after switch / import / delete
   }
 }
@@ -165,6 +170,359 @@ function puppetCard(store, m, active) {
   return card;
 }
 
+/* ───────────── Rig hookups + Extra Rig Controls (GET/POST /api/models/params) ───────────── */
+
+const PARAM_ROW_CAP = 80;
+const SEND_MS = 40;              // slider POST throttle — smooth drags without flooding HTTP
+const TEST_FALLBACK_S = 2.2;
+const PARAM_TABS = [
+  ['extras', 'Extras & FX'],
+  ['arms', 'Arms & Hands'],
+  ['auto', 'Auto-Mapped'],
+  ['physics', 'Physics'],
+  ['all', 'All'],
+];
+
+const rig = {
+  key: null,          // active puppet id the cached params belong to (null = refetch)
+  data: null,         // last GET /api/models/params payload
+  loading: null,
+  error: '',
+  tab: null,          // null = pick default for this rig (Extras if any, else All)
+  query: '',
+  testing: false,
+  testMsg: '',
+  testKind: '',
+  overrides: 0,
+};
+const sends = new Map(); // param name → { timer, last, inflight, pending }
+
+const params = () => (Array.isArray(rig.data?.params) ? rig.data.params : []);
+const num = (v, d = 0) => (Number.isFinite(Number(v)) ? Number(v) : d);
+const vec = (v, d = [0, 0]) => (Array.isArray(v) ? [num(v[0], d[0]), num(v[1], d[1])] : [num(v, d[0]), d[1]]);
+const countOverrides = () => params().filter((p) => p.overridden).length;
+
+function inCategory(p, tab) {
+  if (tab === 'all') return true;
+  if (tab === 'auto') return p.category === 'auto' || Boolean(p.mappedTo);
+  return p.category === tab;
+}
+const tabCount = (tab) => params().filter((p) => inCategory(p, tab)).length;
+const currentTab = () => rig.tab || (tabCount('extras') > 0 ? 'extras' : 'all');
+
+/** Fetch params for the puppet on stage (once per puppet; switching puppets clears `rig.key`). */
+function ensureRig(store, active) {
+  if (rig.key === active || rig.loading || lib.busy || !visible(store)) return;
+  rig.key = active;
+  rig.tab = null;
+  rig.query = '';
+  rig.loading = api('/api/models/params')
+    .then((data) => { rig.data = data; rig.error = ''; rig.overrides = countOverrides(); })
+    .catch((error) => { rig.data = null; rig.error = error.message; })
+    .finally(() => {
+      rig.loading = null;
+      // The puppet switched while we were loading: drop this result and fetch again on render.
+      if (rig.key !== activeModelId(store)) rig.key = null;
+      store.rerenderPanel();
+    });
+}
+
+/* ---- Capability badges + Test Mouth Flap ---- */
+
+function badge(text, state, title) {
+  return el('span', { class: `rig-badge ${state}`, title: title || undefined, text });
+}
+
+function capsBadges() {
+  if (rig.loading && !rig.data) return [badge('Checking rig…', 'pending')];
+  if (rig.error) return [badge('Hookups unknown', 'off', rig.error)];
+  const c = rig.data?.capabilities || {};
+  const on = (k) => Boolean(c[k]);
+  const yes = (label, k, title) => badge(`${label} ${on(k) ? '✓' : '–'}`, on(k) ? 'ok' : 'off',
+    title || `${label} ${on(k) ? 'auto-hooked to the live rig' : 'not found on this rig'}`);
+  const physics = num(c.physicsCount);
+  const extras = num(c.extrasCount);
+  const also = ['body', 'gaze', 'brows', 'blush', 'breath'].map((k) => `${k[0].toUpperCase()}${k.slice(1)} ${on(k) ? '✓' : '–'}`).join(' · ');
+  return [
+    yes('Head', 'head', `Head ${on('head') ? '✓' : '–'} · ${also}`),
+    yes('Eyes', 'eyes'),
+    on('mouth')
+      ? badge('Mouth Flaps ✓', 'ok', 'Speech drives this rig’s mouth')
+      : badge('Mouth Flaps ⚠ unbound', 'warn', 'No mouth parameter was auto-mapped — speech will not move the lips'),
+    yes('Arms', 'arms'),
+    physics > 0 ? badge(`Physics (${physics}) ✓`, 'ok', `${physics} physics springs`) : null,
+    extras > 0 ? badge(`Extras (${extras})`, 'accent', `${extras} hidden toggles / effects — see Extra Rig Controls`) : null,
+  ].filter(Boolean);
+}
+
+const TEST_IDLE = 'Test Mouth Flap';
+const TEST_BUSY = 'Testing mouth flaps…';
+
+/** Patch every live copy of the test button/status in place (no full re-render — keeps slider drags alive). */
+function syncTestUi() {
+  document.querySelectorAll('.rig-test-btn').forEach((b) => {
+    b.disabled = rig.testing;
+    b.textContent = rig.testing ? TEST_BUSY : TEST_IDLE;
+  });
+  document.querySelectorAll('.rig-test-status').forEach((s) => {
+    s.textContent = rig.testMsg;
+    s.className = `rig-test-status apply-status ${rig.testKind}`.trim();
+    s.hidden = !rig.testMsg;
+  });
+}
+
+async function testMouth() {
+  if (rig.testing) return;
+  rig.testing = true;
+  rig.testMsg = 'Watch the lips — playing a 2.2 s speech flap…';
+  rig.testKind = 'pending';
+  syncTestUi();
+  let holdMs = TEST_FALLBACK_S * 1000;
+  try {
+    const r = await api('/api/models/test-mouth', json({}));
+    holdMs = Math.max(400, num(r.duration, TEST_FALLBACK_S) * 1000);
+    if (r.mouthMapped === false) {
+      rig.testMsg = 'Played, but no mouth parameter is mapped on this rig — lips can’t move.';
+      rig.testKind = 'error';
+    } else {
+      rig.testMsg = 'Mouth flaps playing on stage ✓';
+      rig.testKind = 'ok';
+    }
+  } catch (error) {
+    rig.testMsg = `Mouth test failed: ${error.message}`;
+    rig.testKind = 'error';
+    holdMs = 600;
+  }
+  syncTestUi();
+  setTimeout(() => { rig.testing = false; syncTestUi(); }, holdMs);
+}
+
+function renderCapsRow(store, active) {
+  const testBtn = btn(rig.testing ? TEST_BUSY : TEST_IDLE, () => testMouth(), 'primary rig-test-btn', {
+    disabled: rig.testing || lib.busy, title: 'Play a short speech mouth-flap on the puppet on stage',
+  });
+  const status = el('div', { class: `rig-test-status apply-status ${rig.testKind}`.trim(), role: 'status', text: rig.testMsg });
+  status.hidden = !rig.testMsg;
+  const r = row({
+    title: 'Rig Hookups', stack: true,
+    desc: `What auto-hooked up on ${modelName(active)}`,
+    control: el('div', { class: 'rig-caps' }, [
+      el('div', { class: 'rig-badges', role: 'list', 'aria-label': 'Rig capabilities' }, capsBadges()),
+      el('div', { class: 'rig-test' }, [testBtn, status]),
+    ]),
+  });
+  r.dataset.searchKw = CAPS_KW;
+  return r;
+}
+
+/* ---- Live overrides ---- */
+
+function postParam(body) {
+  return api('/api/models/params', json(body)).then((r) => {
+    if (Number.isFinite(Number(r.overriddenCount))) rig.overrides = Number(r.overriddenCount);
+    syncResetAll();
+    return r;
+  });
+}
+
+/** Throttled per-param send: at most one request per 40 ms, never two in flight, last value always wins. */
+function sendParam(name, body, immediate = false) {
+  const s = sends.get(name) || { timer: 0, last: 0, inflight: false, pending: null };
+  sends.set(name, s);
+  s.pending = { name, ...body };
+  const flush = () => {
+    s.timer = 0;
+    if (s.inflight || !s.pending) return;
+    const payload = s.pending;
+    s.pending = null;
+    s.inflight = true;
+    s.last = Date.now();
+    postParam(payload).catch((error) => setInspectorMsg(`Couldn’t set ${name}: ${error.message}`, 'error'))
+      .finally(() => {
+        s.inflight = false;
+        if (s.pending && !s.timer) s.timer = setTimeout(flush, Math.max(0, SEND_MS - (Date.now() - s.last)));
+      });
+  };
+  if (s.timer) { if (!immediate) return; clearTimeout(s.timer); s.timer = 0; }
+  const wait = immediate ? 0 : SEND_MS - (Date.now() - s.last);
+  if (wait <= 0) flush();
+  else s.timer = setTimeout(flush, wait);
+}
+
+function setInspectorMsg(text, kind = '') {
+  document.querySelectorAll('.rig-params-msg').forEach((m) => {
+    m.textContent = text;
+    m.className = `rig-params-msg apply-status ${kind}`.trim();
+    m.hidden = !text;
+  });
+}
+
+function syncResetAll() {
+  document.querySelectorAll('.rig-reset-all').forEach((b) => {
+    b.disabled = rig.overrides <= 0;
+    b.textContent = rig.overrides > 0 ? `Reset all (${rig.overrides})` : 'Reset all';
+  });
+}
+
+function markOverridden(p, on, rowEl) {
+  const was = p.overridden;
+  p.overridden = on;
+  if (was !== on) rig.overrides = Math.max(0, rig.overrides + (on ? 1 : -1));
+  rowEl?.classList.toggle('overridden', on);
+  syncResetAll();
+}
+
+function clearParam(p, rowEl) {
+  p.current = vec(p.default);
+  markOverridden(p, false, rowEl);
+  sendParam(p.name, { clear: true }, true);
+}
+
+/* ---- Param rows ---- */
+
+function paramMeta(p) {
+  const bits = [];
+  if (p.category) bits.push(p.category);
+  if (p.mappedTo) bits.push(`→ ${p.mappedTo}`);
+  return bits.join(' · ');
+}
+
+function resetBtn(onClick) {
+  return el('button', { type: 'button', class: 'rig-reset', title: 'Reset to rig default', 'aria-label': 'Reset to rig default', text: '↺', onclick: onClick });
+}
+
+function axisSlider(p, axis, rowEl, label) {
+  const lo = vec(p.min, [0, 0])[axis];
+  const hi = vec(p.max, [1, 1])[axis];
+  const range = hi - lo || 1;
+  const step = Math.max(range / 200, 0.0005);
+  const dec = range <= 2 ? 2 : (range <= 20 ? 1 : 0);
+  const cur = Math.min(hi, Math.max(lo, vec(p.current, vec(p.default))[axis]));
+  const val = el('span', { class: 'ctrl-val', text: cur.toFixed(dec) });
+  const inp = el('input', { type: 'range', min: lo, max: hi, step, value: cur, 'aria-label': `${p.name}${label ? ` ${label}` : ''}` });
+  const paint = () => inp.style.setProperty('--fill', `${Math.max(0, Math.min(100, ((Number(inp.value) - lo) / range) * 100))}%`);
+  paint();
+  const push = (immediate) => {
+    const v = Number(inp.value);
+    const xy = vec(p.current, vec(p.default));
+    xy[axis] = v;
+    p.current = xy;
+    val.textContent = v.toFixed(dec);
+    paint();
+    markOverridden(p, true, rowEl);
+    sendParam(p.name, { x: xy[0], y: xy[1] }, immediate);
+  };
+  inp.addEventListener('input', () => push(false));
+  inp.addEventListener('change', () => push(true));   // release → flush the final value
+  return el('div', { class: 's-slider rig-slider' }, [label ? el('span', { class: 'rig-axis', text: label }) : null, inp, val]);
+}
+
+function paramRow(p) {
+  const rowEl = el('div', { class: `rig-param${p.overridden ? ' overridden' : ''}`, role: 'listitem' });
+  const meta = paramMeta(p);
+  const text = el('div', { class: 'rig-param-text' }, [
+    el('div', { class: 'rig-param-name', title: p.name, text: p.name }),
+    meta ? el('div', { class: 'rig-param-meta', text: meta }) : null,
+  ]);
+  let ctrl;
+  if (p.isToggle) {
+    const def = vec(p.default)[0] >= 0.5;
+    ctrl = [switchEl({
+      checked: vec(p.current, vec(p.default))[0] >= 0.5, label: p.name,
+      onChange: (v) => {
+        p.current = [v ? 1 : 0, 0];
+        if (v === def) { clearParam(p, rowEl); return; }
+        markOverridden(p, true, rowEl);
+        sendParam(p.name, { x: v ? 1 : 0, y: 0 }, true);
+      },
+    })];
+  } else {
+    const rebuild = () => { clearParam(p, rowEl); rowEl.replaceWith(paramRow(p)); };
+    ctrl = [
+      el('div', { class: 'rig-sliders' }, p.isVec2 ? [axisSlider(p, 0, rowEl, 'X'), axisSlider(p, 1, rowEl, 'Y')] : [axisSlider(p, 0, rowEl, '')]),
+      resetBtn(rebuild),
+    ];
+  }
+  if (p.isToggle) ctrl.push(resetBtn(() => { clearParam(p, rowEl); rowEl.replaceWith(paramRow(p)); }));
+  rowEl.append(text, el('div', { class: 'rig-param-ctrl' }, ctrl));
+  return rowEl;
+}
+
+function filtered() {
+  const tab = currentTab();
+  const q = rig.query.trim().toLowerCase();
+  return params().filter((p) => inCategory(p, tab) && (!q
+    || String(p.name).toLowerCase().includes(q)
+    || String(p.category || '').toLowerCase().includes(q)
+    || String(p.mappedTo || '').toLowerCase().includes(q)));
+}
+
+function fillList(list) {
+  const items = filtered();
+  const shown = items.slice(0, PARAM_ROW_CAP);
+  list.replaceChildren(...(shown.length ? shown.map(paramRow) : [el('div', { class: 'rig-empty', text: rig.query ? 'No parameters match that filter.' : 'Nothing in this category on this rig.' })]));
+  if (items.length > shown.length) {
+    list.append(el('div', { class: 'rig-empty', text: `Showing ${shown.length} of ${items.length} — type in the filter to narrow down.` }));
+  }
+}
+
+function renderInspector() {
+  const list = el('div', { class: 'rig-param-list', role: 'list' });
+  const tabsHost = el('div', { class: 'rig-tabs' });
+  const drawTabs = () => tabsHost.replaceChildren(segmented(
+    PARAM_TABS.map(([id, t]) => [id, `${t} ${tabCount(id)}`]),
+    { active: currentTab(), label: 'Parameter category', onPick: (id) => { rig.tab = id; drawTabs(); fillList(list); } },
+  ));
+  drawTabs();
+  const search = el('input', {
+    class: 'text-in rig-search', type: 'search', placeholder: 'Filter parameters…', value: rig.query, 'aria-label': 'Filter parameters',
+    oninput: (e) => { rig.query = e.target.value; fillList(list); },
+  });
+  const resetAll = btn(rig.overrides > 0 ? `Reset all (${rig.overrides})` : 'Reset all', async () => {
+    try {
+      await postParam({ clearAll: true });
+      for (const p of params()) { p.overridden = false; p.current = vec(p.default); }
+      rig.overrides = 0;
+      syncResetAll();
+      fillList(list);
+      setInspectorMsg('All rig overrides cleared ✓', 'ok');
+    } catch (error) { setInspectorMsg(`Reset failed: ${error.message}`, 'error'); }
+  }, 'rig-reset-all', { disabled: rig.overrides <= 0 });
+  const msg = el('div', { class: 'rig-params-msg apply-status', role: 'status' });
+  msg.hidden = true;
+  fillList(list);
+  return el('div', { class: 'rig-inspector' }, [
+    tabsHost,
+    el('div', { class: 'rig-toolbar' }, [search, resetAll]),
+    msg,
+    list,
+  ]);
+}
+
+function renderParamsMore(store) {
+  const total = params().length;
+  const c = rig.data?.capabilities || {};
+  let desc;
+  let body;
+  if (rig.error) {
+    desc = 'Rig inspector unavailable';
+    body = el('div', { class: 's-row note' }, [
+      el('div', { class: 's-desc', text: `Couldn’t read rig parameters: ${rig.error}` }),
+      btn('Retry', () => { rig.key = null; rig.error = ''; store.rerenderPanel(); }),
+    ]);
+  } else if (!rig.data) {
+    desc = 'Reading rig parameters…';
+    body = el('div', { class: 's-row note' }, [el('div', { class: 's-desc', text: 'Reading rig parameters…' })]);
+  } else {
+    const extras = num(c.extrasCount, tabCount('extras'));
+    desc = `${extras ? `${extras} hidden toggles & FX · ` : ''}${total} parameters — discover, toggle and slide`;
+    body = total ? renderInspector() : el('div', { class: 's-row note' }, [el('div', { class: 's-desc', text: 'This rig reports no adjustable parameters.' })]);
+  }
+  const m = more({ id: 'puppet.params', title: 'Extra Rig Controls', desc }, [body]);
+  m.querySelector('.s-more-head').dataset.searchKw = PARAMS_KW;
+  return m;
+}
+
 /** The "Puppet Library" settings group (top of Look & Props). */
 export function renderPuppetLibrary(store) {
   const stale = !lib.data || Date.now() - lib.fetchedAt >= CACHE_MS;
@@ -210,8 +568,12 @@ export function renderPuppetLibrary(store) {
     ? el('div', { class: 's-row note' }, [el('div', { class: `apply-status ${lib.kind}`.trim(), role: 'status', text: lib.status })])
     : null;
 
-  const g = group('Puppet Library', [libRow, importRow, statusRow], { desc: 'Switch avatars or import any rig' });
-  g.dataset.searchKw = `${SEARCH_KW} ${IMPORT_KW}`;
+  ensureRig(store, active);
+  const capsRow = renderCapsRow(store, active);
+  const paramsMore = renderParamsMore(store);
+
+  const g = group('Puppet Library', [libRow, capsRow, paramsMore, importRow, statusRow], { desc: 'Switch avatars or import any rig' });
+  g.dataset.searchKw = `${SEARCH_KW} ${IMPORT_KW} ${CAPS_KW} ${PARAMS_KW}`;
   return g;
 }
 

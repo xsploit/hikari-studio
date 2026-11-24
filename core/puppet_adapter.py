@@ -345,7 +345,7 @@ for _names, _sx, _sy, _ch in _RULES:
     for _n in _names:
         _RULE_INDEX.setdefault(norm_name(_n), (_sx, _sy, _ch))
 
-CHANNEL_ORDER = ("head", "body", "eyes", "gaze", "brows", "mouth", "breath", "blush", "vfx")
+CHANNEL_ORDER = ("head", "body", "eyes", "gaze", "brows", "mouth", "arms", "breath", "blush", "vfx")
 # Hikari's own rig (passthrough when a puppet carries these natively)
 HIKARI_NATIVE_PARAMS = ("Angle", "Angle Z", "Left Eye Open", "Right Eye Open", "EyeBall", "VB Mouth", "Breath")
 
@@ -356,6 +356,185 @@ def match_rule(name: str) -> tuple[Spec, Spec, str] | None:
     if r is None:
         r = _RULE_INDEX.get(_strip_param(n))
     return r
+
+
+# ----------------------------------------------------------------------------- arms / shoulders / hands
+# Japanese Live2D / MINT (左腕 A, 右腕A　肩の回転, 左手B 回転, 左肩の上下, 肩　すくみ), English Live2D (ParamArmLA,
+# ParamLeftShoulderUp) and official Inochi2D (Arm:: Left:: Move). Positive = arm out / raised (Live2D convention,
+# visually verified on Hiyori 左腕 A and Mao 腕A 肩の回転 / 肘の回転).
+_TOGGLE_WORDS_RE = re.compile(r"表示|出現|消滅|show|toggle|enable|visible|(?:^|[^a-z])(?:on|off)(?:$|[^a-z])", re.I)
+_SIDE_L_RE = re.compile(r"左|left|(?:^|[^a-z])l(?:$|[^a-z])|arml|shoulderl|handl|elbowl|wristl", re.I)
+_SIDE_R_RE = re.compile(r"右|right|(?:^|[^a-z])r(?:$|[^a-z])|armr|shoulderr|handr|elbowr|wristr", re.I)
+
+
+def arm_rule(name: str) -> str | None:
+    """Canonical arm channel for an arm / shoulder / hand param, or None. Hand-shape swaps (左手A, 右手B,
+    ParamHandL) are left alone - they are poses, not rotations."""
+    raw = unicodedata.normalize("NFKC", str(name))
+    low = raw.lower()
+    n = norm_name(raw)
+    if _TOGGLE_WORDS_RE.search(raw) or "杖" in raw or "wand" in low:
+        return None
+    sides = [s for s, rx in (("l", _SIDE_L_RE), ("r", _SIDE_R_RE)) if rx.search(raw) or rx.search(n)]
+    side = sides[0] if len(sides) == 1 else None
+    is_arm = "腕" in raw or re.search(r"arm", low) is not None
+    is_hand = "手" in raw or re.search(r"hand|wrist", low) is not None
+    is_shoulder = "肩" in raw or "shoulder" in low
+    if "手首" in raw or "wrist" in low or (is_hand and ("回転" in raw or re.search(r"rot|angle|turn", low))):
+        return f"arm_{side}_wrist" if side else None
+    if "肘" in raw or "elbow" in low:
+        return f"arm_{side}_elbow" if side else None
+    if is_arm and not ("腕のy" in n or "army" in n):
+        return f"arm_{side}_raise" if side else None
+    if is_shoulder:
+        return f"shoulder_{side}" if side else "shoulder"
+    return None
+
+
+# ----------------------------------------------------------------------------- physics detection
+_PHYS_JA = ("揺れ", "ふわ", "めくれ", "サイドアップ", "前髪", "後髪", "後ろ髪", "横髪", "アホ毛")
+_PHYS_EN_RE = re.compile(r"hair|ribbon|skirt|bust|chest|cape|robe|hat|feather|sleeve|tail|(?:^|[^a-z])ears?(?:$|[^a-z])"
+                         r"|phys|sway|bounce|jiggle|swing", re.I)
+_PHYS_CORE_RE = re.compile(r"角度|体の回転|目|眉|口|腕|手|肩|呼吸|照れ|angle|eye|brow|mouth|arm|hand|shoulder|breath|"
+                           r"cheek|blink|smile", re.I)
+_CHAIN_RE = re.compile(r"^\s*\[(\d+)\]\s*(.+)$")
+
+
+def is_physics_param(name: str) -> bool:
+    raw = unicodedata.normalize("NFKC", str(name))
+    if _PHYS_CORE_RE.search(raw) and not any(k in raw for k in ("髪", "揺れ", "ふわ")):
+        return False
+    if match_rule(raw) is not None or _TOGGLE_WORDS_RE.search(raw):
+        return False
+    return any(k in raw for k in _PHYS_JA) or _PHYS_EN_RE.search(raw) is not None
+
+
+def _phys_profile(name: str) -> tuple[dict[str, float], float, float, float]:
+    """(input weights over canonical channels, omega rad/s, zeta, gain) by what the param hangs from."""
+    raw = unicodedata.normalize("NFKC", str(name)).lower()
+    vertical = any(k in raw for k in ("ふわ", "めくれ", "胸 揺れ", "胸揺れ", "bust", "bounce", "jiggle")) or raw.endswith("y")
+    body_hung = any(k in raw for k in ("スカート", "ローブ", "胸", "首飾り", "パーカー", "ひも", "skirt", "robe", "cape",
+                                        "chest", "bust", "sleeve", "tail", "necklace", "string"))
+    if vertical and body_hung:
+        return {"body_y": 1.0, "breath": 0.7, "head_y": 0.25, "body_x": 0.2}, 9.0, 0.30, 2.4
+    if vertical:                                           # fluffy hair / hat lift: head nods
+        return {"head_y": 0.9, "body_y": 0.5, "breath": 0.35, "head_x": 0.25}, 7.5, 0.32, 2.6
+    if body_hung:
+        return {"body_x": 0.9, "body_z": 0.8, "head_x": 0.25, "body_y": 0.2}, 6.5, 0.36, 3.0
+    # hair, ahoge, hat brim, feather, ribbons on the head
+    return {"head_x": 0.9, "head_z": 0.8, "body_x": 0.35, "body_z": 0.3, "head_y": 0.15}, 7.0, 0.30, 2.0
+
+
+class _PhysParam:
+    __slots__ = ("name", "weights", "omega", "zeta", "gain", "chain", "index", "d", "mn", "mx",
+                 "p", "v", "out")
+
+    def __init__(self, m: dict[str, Any], sp: dict[str, Any] | None) -> None:
+        self.name = m["name"]
+        self.weights, omega, zeta, gain = _phys_profile(self.name)
+        if sp:                                             # MINT kept the Cubism physics settings: use their feel
+            f = _f(sp.get("frequency"), 0.0)
+            if f > 0.05:
+                omega = 0.5 * omega + 0.5 * max(3.5, min(14.0, 2.0 * math.pi * f * 1.1))
+            ad = _f(sp.get("angle_damping"), 0.0)
+            if ad > 0.0:
+                zeta = max(0.18, min(0.75, 0.5 * zeta + 0.5 * ad * 0.75))
+        cm = _CHAIN_RE.match(unicodedata.normalize("NFKC", self.name))
+        self.chain = cm.group(2).strip() if cm else ""
+        self.index = int(cm.group(1)) if cm else 0
+        if cm:                                             # outer segments: softer, slightly lazier
+            omega *= max(0.6, 1.0 - 0.05 * self.index)
+            zeta = max(zeta, 0.62 + 0.02 * self.index)     # followers must not resonate down the chain
+            gain *= (0.16 if "前髪" in self.chain else 0.2) * (1.0 - 0.05 * self.index)   # 7 segments add up
+        self.omega, self.zeta, self.gain = omega, zeta, gain
+        self.d, self.mn, self.mx = float(m["defaults"][0]), float(m["min"][0]), float(m["max"][0])
+        self.p = 0.0
+        self.v = 0.0
+        self.out = 0.0
+
+    def value(self, s: float) -> float:
+        s = max(-1.0, min(1.0, s))
+        up, dn = self.mx - self.d, self.d - self.mn
+        x = self.d + s * up if s >= 0.0 else self.d + s * dn
+        lo, hi = min(self.mn, self.mx), max(self.mn, self.mx)
+        return lo if x < lo else hi if x > hi else x
+
+
+class SpringPhysics:
+    """Universal 2nd-order damped spring physics for puppets whose physics arrived as plain params (MINT / Live2D).
+    Each param is a pendulum tip p chasing its anchor A (a weighted mix of head / body / breath channels):
+        p'' = w^2 (A - p) - 2 zeta w (p' - A')        output = gain * (p - A)   (lag behind the motion)
+    Numbered chains ([0]..[6]サイドアップ左) cascade: segment k chases segment k-1, so a wave runs down the tail.
+    Semi-implicit Euler, sub-stepped at <= 1/240 s (unconditionally stable for w <= 14). Disabled -> anchors
+    freeze and an envelope eases the output back to the author default."""
+
+    SUBSTEP = 1.0 / 240.0
+
+    def __init__(self, params: list[_PhysParam]) -> None:
+        self.params = params
+        chains: dict[str, list[_PhysParam]] = {}
+        self.solo: list[_PhysParam] = []
+        for pp in params:
+            (chains.setdefault(pp.chain, []) if pp.chain else self.solo).append(pp)
+        self.chains = [sorted(c, key=lambda q: q.index) for c in chains.values()]
+        self._prev_in: dict[str, float] | None = None
+        self.env = 1.0
+
+    def __len__(self) -> int:
+        return len(self.params)
+
+    def reset(self) -> None:
+        for pp in self.params:
+            pp.p = pp.v = pp.out = 0.0
+        self._prev_in = None
+
+    @staticmethod
+    def _anchor(pp: _PhysParam, ch: dict[str, float]) -> float:
+        return sum(w * ch.get(k, 0.0) for k, w in pp.weights.items())
+
+    def step(self, dt: float, ch: dict[str, float], enabled: bool) -> dict[str, tuple[float, float]]:
+        dt = max(1e-4, min(0.1, _f(dt, 1.0 / 60.0)))
+        cur = {k: max(-1.5, min(1.5, _f(ch.get(k), 0.0)))
+               for k in ("head_x", "head_y", "head_z", "body_x", "body_y", "body_z", "breath")}
+        if self._prev_in is None:
+            self._prev_in = dict(cur)
+            for pp in self.params:                       # start at rest on the current pose (no first-frame kick)
+                pp.p, pp.v = self._anchor(pp, cur), 0.0
+        if not enabled:
+            cur = dict(self._prev_in)                    # frozen anchors: springs ring down
+        self.env += ((1.0 if enabled else 0.0) - self.env) * (1.0 - math.exp(-dt / 0.25))
+        prev = self._prev_in
+        n = max(1, int(math.ceil(dt / self.SUBSTEP)))
+        h = dt / n
+        for i in range(n):
+            a = (i + 1) / n
+            inp = {k: prev[k] + (cur[k] - prev[k]) * a for k in cur}
+            vel = {k: (cur[k] - prev[k]) / dt for k in cur}
+            for pp in self.solo:
+                A = self._anchor(pp, inp)
+                Av = self._anchor(pp, vel)
+                acc = pp.omega * pp.omega * (A - pp.p) - 2.0 * pp.zeta * pp.omega * (pp.v - Av)
+                pp.v += acc * h
+                pp.p += pp.v * h
+                pp.out = A
+            for chain in self.chains:
+                A = self._anchor(chain[0], inp)
+                Av = self._anchor(chain[0], vel)
+                for pp in chain:
+                    acc = pp.omega * pp.omega * (A - pp.p) - 2.0 * pp.zeta * pp.omega * (pp.v - Av)
+                    pp.v += acc * h
+                    pp.p += pp.v * h
+                    pp.out = A
+                    A, Av = pp.p, pp.v                   # next segment hangs from this one
+        self._prev_in = cur
+        out: dict[str, tuple[float, float]] = {}
+        env = self.env
+        for pp in self.params:
+            if not (math.isfinite(pp.p) and math.isfinite(pp.v)):
+                pp.p, pp.v = pp.out, 0.0
+            s = env * math.tanh(pp.gain * (pp.p - pp.out))     # soft limit: hair never slams into its range end
+            out[pp.name] = (pp.value(s), 0.0)
+        return out
 
 
 def _canon_span(v: float, span: float) -> float:
@@ -393,7 +572,25 @@ def canonical_channels(p: dict[str, tuple[float, float]]) -> dict[str, float]:
         a_w, i_w, u_w, e_w, o_w = (x / tot for x in (a_w, i_w, u_w, e_w, o_w))
     sm_l = g("Eye L Smile")
     sm_r = g("Eye R Smile")
+    breath = max(0.0, min(1.0, g("Breath")))
+    arms: dict[str, float] = {}
+    for s, side in (("l", "L"), ("r", "R")):
+        pose = max(0.0, min(1.0, g(f"Arm {side} Pose")))
+        gest = max(-1.0, min(1.0, g(f"Arm {side} Gesture")))
+        lift = max(-1.0, min(1.0, g(f"Arm {side} Lift")))
+        swing = max(-1.0, min(1.0, g(f"Arm {side} Swing")))
+        arms[f"arm_{s}_pose"] = pose
+        arms[f"arm_{s}_gesture"] = gest
+        arms[f"arm_{s}_swing"] = swing
+        # upper arm: raised pose (+ lift) with the wave gesture riding on top; resting arms breathe a little
+        arms[f"arm_{s}_raise"] = max(-0.4, min(1.0, pose * (0.55 + 0.45 * max(0.0, lift)) + 0.30 * pose * gest
+                                         + 0.18 * swing + 0.05 * (breath - 0.4)))
+        arms[f"arm_{s}_elbow"] = max(-1.0, min(1.0, pose * (0.30 + 0.45 * max(0.0, gest)) + 0.10 * swing))
+        arms[f"arm_{s}_wrist"] = max(-1.0, min(1.0, 0.5 * g(f"Arm {side} Wrist") + 0.25 * pose * gest))
+        arms[f"shoulder_{s}"] = max(-1.0, min(1.0, 0.30 * (breath - 0.35) + 0.45 * pose * max(0.0, lift)))
+    arms["shoulder"] = 0.5 * (arms["shoulder_l"] + arms["shoulder_r"])
     return {
+        **arms,
         "head_x": _canon_span(head[0] if head else 0.0, 30.0) if head else 0.0,
         "head_y": _canon_span(head[1] if head else 0.0, 30.0) if head else 0.0,
         "head_z": _canon_span(g("Angle Z"), 30.0),
@@ -418,7 +615,7 @@ def canonical_channels(p: dict[str, tuple[float, float]]) -> dict[str, float]:
         "mouth_frown": max(0.0, -m_form),
         "vowel_a": a_w, "vowel_i": i_w, "vowel_u": u_w, "vowel_e": e_w, "vowel_o": o_w,
         "cheek_puff": max(0.0, min(1.0, g("Cheek Puff"))),
-        "breath": max(0.0, min(1.0, g("Breath"))),
+        "breath": breath,
         "blush": max(0.0, min(1.0, max(g("Cheek"), g("Anime Blush Lines")))),
         "vfx_sparkle": max(0.0, min(1.0, max(g("Eye Star"), g("VFX Sparkles"), g("Sparkle Eyes")))),
         "vfx_ink": max(0.0, min(1.0, max(g("VFX Sparkles"), g("VFX Music")))),     # Mao: playful paint splashes
@@ -454,7 +651,8 @@ def _axis_fn(spec: Spec, d: float, mn: float, mx: float) -> tuple[str, Callable[
 class UniversalParamMapper:
     """Hikari canonical rig frame -> any puppet's params (fast precompiled table, one dict per frame)."""
 
-    def __init__(self, param_meta: list[dict[str, Any]], model_id: str = "") -> None:
+    def __init__(self, param_meta: list[dict[str, Any]], model_id: str = "",
+                 physics_settings: dict[str, dict[str, Any]] | None = None) -> None:
         self.model_id = model_id
         self.meta = [m for m in param_meta if isinstance(m, dict) and m.get("name")]
         self.defaults: dict[str, tuple[float, float]] = param_defaults_of(self.meta)
@@ -462,12 +660,33 @@ class UniversalParamMapper:
         self.passthrough = model_id == HIKARI_ID or all(n in names for n in HIKARI_NATIVE_PARAMS)
         self._table: list[tuple[str, tuple[str, Callable] | None, tuple[str, Callable] | None]] = []
         self.matches: dict[str, str] = {}               # target param -> canonical channel group
+        self.channel_of: dict[str, str] = {}            # target param -> canonical channel (inspector "mappedTo")
+        self.physics_names: list[str] = []
+        self.physics: SpringPhysics | None = None
+        self._dyn: dict[str, float] = {}                # stateful channels (arm swing / wrist follow-through)
+        self._arm_sp: dict[str, list[float]] = {}
         bound_channels: set[str] = set()
         all_channels: set[str] = set()
         if not self.passthrough:
+            phys: list[_PhysParam] = []
+            psets = physics_settings or {}
             for m in self.meta:
                 rule = match_rule(m["name"])
                 if rule is None:
+                    arm = arm_rule(m["name"]) if not m.get("isVec2") else None
+                    if arm is not None and m.get("bound", True):
+                        fx = _axis_fn((arm, "bi"), m["defaults"][0], m["min"][0], m["max"][0])
+                        if fx is not None:
+                            self._table.append((m["name"], fx, None))
+                            self.matches[m["name"]] = "arms"
+                            self.channel_of[m["name"]] = arm
+                            all_channels.add("arms")
+                            bound_channels.add("arms")
+                        continue
+                    lo, hi, d = m["min"][0], m["max"][0], m["defaults"][0]
+                    if (m.get("bound", True) and not m.get("isVec2") and min(lo, hi) < d < max(lo, hi)
+                            and (m["name"] in psets or is_physics_param(m["name"]))):
+                        phys.append(_PhysParam(m, psets.get(m["name"])))
                     continue
                 sx, sy, group = rule
                 vec2 = bool(m.get("isVec2"))
@@ -479,9 +698,13 @@ class UniversalParamMapper:
                     continue
                 self._table.append((m["name"], fx, fy))
                 self.matches[m["name"]] = group
+                self.channel_of[m["name"]] = "/".join(s[0] for s in (sx, sy if vec2 else None) if s is not None)
                 all_channels.add(group)
                 if m.get("bound", True):
                     bound_channels.add(group)
+            if phys:
+                self.physics = SpringPhysics(phys)
+                self.physics_names = [pp.name for pp in phys]
         else:
             bound_channels = set(CHANNEL_ORDER)
             all_channels = set(CHANNEL_ORDER)
@@ -489,7 +712,59 @@ class UniversalParamMapper:
         # declared but every matching param is unbound (e.g. Mao's a/i/u/e/o after a MINT conversion)
         self.unbound_channels = [c for c in CHANNEL_ORDER if c in all_channels and c not in bound_channels]
 
-    def map_frame(self, canonical: dict[str, tuple[float, float]]) -> dict[str, tuple[float, float]]:
+    @property
+    def owns_physics(self) -> bool:
+        """True when this mapper drives the puppet's physics params itself (engine drivers must stay off: MINT's
+        SimplePhysics nodes hang from static root nodes and would force those params back to rest)."""
+        return self.physics is not None
+
+    def step_physics(self, dt: float, canonical: dict[str, float], enabled: bool) -> dict[str, tuple[float, float]]:
+        """Advance spring physics + arm follow-through one frame from normalized canonical channels
+        (`canonical_channels(...)`). Returns {physics param: value} (empty when the puppet has none)."""
+        dt = max(1e-4, min(0.1, _f(dt, 1.0 / 60.0)))
+        if "arms" in self.mapped_channels:
+            # resting arms sway with body motion + breath (lagging springs); the wrist trails the gesture
+            for s in ("l", "r"):
+                st = self._arm_sp.setdefault(s, [0.0, 0.0, 0.0, 0.0, None, None])   # swing y, v, wrist y, v, prev bx, prev bz
+                bx, bz = _f(canonical.get("body_x")), _f(canonical.get("body_z"))
+                if st[4] is None:
+                    st[4], st[5] = bx, bz
+                vbx = (bx - st[4]) / dt
+                vbz = (bz - st[5]) / dt
+                st[4], st[5] = bx, bz
+                sign = 1.0 if s == "l" else -1.0
+                h = dt / 4.0
+                for _ in range(4):
+                    acc = -4.6 * 4.6 * st[0] - 2.0 * 0.35 * 4.6 * st[1] - 9.0 * sign * vbx - 6.0 * vbz
+                    st[1] += acc * h
+                    st[0] += st[1] * h
+                    g = _f(canonical.get(f"arm_{s}_gesture"))
+                    acc = 6.0 * 6.0 * (g - st[2]) - 2.0 * 0.7 * 6.0 * st[3]
+                    st[3] += acc * h
+                    st[2] += st[3] * h
+                if not (math.isfinite(st[0]) and math.isfinite(st[1]) and math.isfinite(st[2]) and math.isfinite(st[3])):
+                    st[0] = st[1] = st[2] = st[3] = 0.0
+                pose = _f(canonical.get(f"arm_{s}_pose"))
+                self._dyn[f"arm_{s}_swing_dyn"] = max(-1.0, min(1.0, st[0]))
+                self._dyn[f"arm_{s}_wrist_dyn"] = max(-1.0, min(1.0, 1.1 * (st[2] - _f(canonical.get(f"arm_{s}_gesture")))
+                                                               * max(0.25, pose)))
+        if self.physics is None:
+            return {}
+        return self.physics.step(dt, canonical, enabled)
+
+    def step(self, canonical_frame: dict[str, tuple[float, float]], dt: float,
+             physics_enabled: bool = True) -> dict[str, tuple[float, float]]:
+        """Stateful per-frame output: arm follow-through + spring physics + the stateless mapping."""
+        if self.passthrough:
+            return self.map_frame(canonical_frame)
+        ch = canonical_channels(canonical_frame)
+        phys = self.step_physics(dt, ch, physics_enabled)
+        out = self._map_channels(ch, self._dyn)
+        out.update(phys)
+        return out
+
+    def map_frame(self, canonical: dict[str, tuple[float, float]],
+                  dyn: dict[str, float] | None = None) -> dict[str, tuple[float, float]]:
         if self.passthrough:
             out = dict(self.defaults)
             for k in out:
@@ -497,7 +772,17 @@ class UniversalParamMapper:
                 if v is not None:
                     out[k] = v
             return out
-        ch = canonical_channels(canonical)
+        return self._map_channels(canonical_channels(canonical), dyn)
+
+    def _map_channels(self, ch: dict[str, float], dyn: dict[str, float] | None) -> dict[str, tuple[float, float]]:
+        if dyn:
+            ch = dict(ch)
+            for s in ("l", "r"):
+                sw = dyn.get(f"arm_{s}_swing_dyn", 0.0)
+                wr = dyn.get(f"arm_{s}_wrist_dyn", 0.0)
+                ch[f"arm_{s}_raise"] = max(-0.4, min(1.0, ch[f"arm_{s}_raise"] + 0.22 * sw))
+                ch[f"arm_{s}_elbow"] = max(-1.0, min(1.0, ch[f"arm_{s}_elbow"] + 0.10 * sw))
+                ch[f"arm_{s}_wrist"] = max(-1.0, min(1.0, ch[f"arm_{s}_wrist"] + 0.45 * wr + 0.12 * sw))
         out = dict(self.defaults)                        # author-intended rest pose for everything untouched
         for name, fx, fy in self._table:
             dx, dy = out[name]
@@ -508,7 +793,97 @@ class UniversalParamMapper:
 
     def summary(self) -> dict[str, Any]:
         return {"passthrough": self.passthrough, "mappedChannels": list(self.mapped_channels),
-                "unboundChannels": list(self.unbound_channels), "matchedParams": dict(self.matches)}
+                "unboundChannels": list(self.unbound_channels), "matchedParams": dict(self.matches),
+                "physicsCount": len(self.physics_names), "physicsParams": list(self.physics_names)}
+
+
+# ----------------------------------------------------------------------------- live parameter inspector
+CAPABILITY_KEYS = ("head", "body", "eyes", "gaze", "brows", "mouth", "arms", "blush", "breath")
+_ARMISH_RE = re.compile(r"腕|手|肩|arm|hand|shoulder|elbow|wrist", re.I)
+_TOGGLE_NAME_RE = re.compile(r"表示|show|toggle|enable|(?:^|[^a-z])(?:on|off)(?:$|[^a-z])", re.I)
+
+
+def is_toggle_param(m: dict[str, Any]) -> bool:
+    if m.get("isVec2"):
+        return False
+    mn, mx, d = float(m["min"][0]), float(m["max"][0]), float(m["defaults"][0])
+    if mn == 0.0 and mx == 1.0 and d in (0.0, 1.0):
+        return True
+    return bool(_TOGGLE_NAME_RE.search(unicodedata.normalize("NFKC", str(m.get("name", "")))))
+
+
+def extract_physics_settings(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """{param name: SimplePhysics node settings} for every physics driver in the puppet (MINT keeps Cubism's)."""
+    by_uuid = {p.get("uuid"): str(p.get("name") or "") for p in model.get("param") or [] if isinstance(p, dict)}
+    out: dict[str, dict[str, Any]] = {}
+
+    def walk(n: Any, depth: int) -> None:
+        if not isinstance(n, dict) or depth > 64:
+            return
+        if n.get("type") == "SimplePhysics":
+            name = by_uuid.get(n.get("param"))
+            if name and name not in out:
+                out[name] = {k: n.get(k) for k in ("frequency", "angle_damping", "length", "gravity", "output_scale")}
+        for c in n.get("children") or []:
+            walk(c, depth + 1)
+
+    walk(model.get("nodes"), 0)
+    return out
+
+
+def build_param_inspector(param_meta: list[dict[str, Any]], mapper: "UniversalParamMapper | None",
+                          current: dict[str, tuple[float, float]] | None = None,
+                          overrides: dict[str, tuple[float, float]] | None = None,
+                          native_physics: list[str] | tuple[str, ...] = (),
+                          extras_names: tuple[str, ...] | frozenset[str] = ()) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Bound params of the live puppet, categorized for the Studio inspector + the capability summary.
+    `mapper` None = Hikari's native rig (everything is driven natively; VFX blend shapes count as extras)."""
+    cur = current or {}
+    ovr = overrides or {}
+    nat_phys = set(native_physics)
+    phys = set(mapper.physics_names) if mapper is not None else set()
+    out: list[dict[str, Any]] = []
+    for m in param_meta:
+        if not isinstance(m, dict) or not m.get("name") or not m.get("bound", True):
+            continue
+        name = m["name"]
+        mapped: str | None = None
+        if mapper is None or mapper.passthrough:
+            if name in nat_phys:
+                cat = "physics"
+            elif name in extras_names:
+                cat = "extras"
+            elif _ARMISH_RE.search(name):
+                cat = "arms"
+            else:
+                cat = "auto"
+            mapped = None if cat == "extras" else "native"
+        elif name in phys:
+            cat, mapped = "physics", "spring"
+        else:
+            group = mapper.matches.get(name)
+            mapped = mapper.channel_of.get(name)
+            if group == "arms" or (group is None and _ARMISH_RE.search(name) and not _TOGGLE_WORDS_RE.search(name)):
+                cat = "arms"
+            elif group is None or group == "vfx":
+                cat = "extras"
+            else:
+                cat = "auto"
+        d = m.get("defaults") or [0.0, 0.0]
+        c = cur.get(name, (d[0], d[1]))
+        out.append({
+            "name": name, "category": cat, "isVec2": bool(m.get("isVec2")), "isToggle": is_toggle_param(m),
+            "min": [float(m["min"][0]), float(m["min"][1])], "max": [float(m["max"][0]), float(m["max"][1])],
+            "default": [float(d[0]), float(d[1])], "current": [round(float(c[0]), 5), round(float(c[1]), 5)],
+            "overridden": name in ovr, "mappedTo": mapped,
+        })
+    if mapper is None or mapper.passthrough:
+        caps: dict[str, Any] = {k: True for k in CAPABILITY_KEYS}
+    else:
+        caps = {k: (k in mapper.mapped_channels) for k in CAPABILITY_KEYS}
+    caps["physicsCount"] = sum(1 for p in out if p["category"] == "physics")
+    caps["extrasCount"] = sum(1 for p in out if p["category"] == "extras")
+    return out, caps
 
 
 # ----------------------------------------------------------------------------- inspection + auto framing
@@ -527,10 +902,16 @@ class PuppetInfo:
     mapped_channels: list[str] = field(default_factory=list)
     unbound_channels: list[str] = field(default_factory=list)
     passthrough: bool = False
+    physics_settings: dict[str, dict[str, Any]] = field(default_factory=dict)   # SimplePhysics outputs
+    physics_params: list[str] = field(default_factory=list)                     # spring-driven by the mapper
+    capabilities: dict[str, Any] = field(default_factory=dict)
 
     @property
     def param_defaults(self) -> dict[str, tuple[float, float]]:
         return param_defaults_of(self.param_meta)
+
+    def make_mapper(self, model_id: str) -> "UniversalParamMapper":
+        return UniversalParamMapper(self.param_meta, model_id, self.physics_settings)
 
     @property
     def bound_param_meta(self) -> list[dict[str, Any]]:
@@ -544,6 +925,9 @@ class PuppetInfo:
             "mappedChannels": list(self.mapped_channels), "unboundChannels": list(self.unbound_channels),
             "recommendedCamera": dict(self.recommended_camera),
             "bounds": [round(v, 1) for v in self.bounds],
+            "capabilities": dict(self.capabilities),
+            "physicsCount": int(self.capabilities.get("physicsCount", 0)),
+            "mouthMapped": bool(self.capabilities.get("mouth", False)),
         }
 
 
@@ -649,11 +1033,14 @@ def inspect_puppet(path: Path, model_id: str = "", width: int = FRAME_W, height:
         else:
             head_top = min(b[2] for b in hb)
     cam = recommend_camera(bounds, head_top, eye_center, eye_box, width, height)
-    mapper = UniversalParamMapper(pmeta, model_id)
+    psets = extract_physics_settings(model)
+    mapper = UniversalParamMapper(pmeta, model_id, psets)
+    _, caps = build_param_inspector(pmeta, mapper, native_physics=list(psets))
     info = PuppetInfo(path=path, name=name, artist=artist, param_meta=pmeta, bounds=bounds, face_box=face_box,
                       eye_center=eye_center, head_top=head_top, recommended_camera=cam,
                       mapped_channels=mapper.mapped_channels, unbound_channels=mapper.unbound_channels,
-                      passthrough=mapper.passthrough)
+                      passthrough=mapper.passthrough, physics_settings=psets,
+                      physics_params=list(mapper.physics_names), capabilities=caps)
     with _CACHE_LOCK:
         if len(_CACHE) > 32:
             _CACHE.clear()
@@ -799,6 +1186,10 @@ def import_puppet_file(upload: Path, original_name: str, library_dir: Path, mint
     work = Path(tempfile.mkdtemp(prefix="hikari_mint_", dir=str(tmp_root) if tmp_root else None))
     try:
         produced = convert_live2d_zip(upload, stem, work, mint_exe)
+        try:                                             # MINT drops Cubism blend-shape mouths: rebuild if clean
+            synthesize_missing_mouth(produced)
+        except Exception:
+            pass                                         # never fail an import over the optional mouth
         dest = unique_dest(library_dir, stem, ".inp")
         tmp = dest.with_name(dest.name + ".part")
         shutil.copyfile(produced, tmp)
@@ -806,6 +1197,213 @@ def import_puppet_file(upload: Path, original_name: str, library_dir: Path, mint
         return dest
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+# ----------------------------------------------------------------------------- mouth synthesis (MINT imports)
+MOUTH_VOWEL_OPEN = (("あ", 1.0), ("お", 0.8), ("え", 0.55), ("う", 0.32), ("い", 0.25))
+_MOUTH_NODE_NAMES = {"口", "mouth", "mouths", "くち"}
+
+
+def _write_puppet_json(path: Path, model: dict[str, Any]) -> None:
+    """Replace the JSON payload of an .inp, keeping the texture / extension sections byte-for-byte (atomic)."""
+    path = Path(path)
+    raw = path.read_bytes()
+    jlen = int.from_bytes(raw[8:12], "big")
+    payload = json.dumps(model, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    tmp = path.with_name(path.name + ".part")
+    tmp.write_bytes(raw[:8] + len(payload).to_bytes(4, "big") + payload + raw[12 + jlen:])
+    read_puppet_json(tmp)
+    os.replace(tmp, path)
+
+
+def _smoothstep(x: float) -> float:
+    x = 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+    return x * x * (3.0 - 2.0 * x)
+
+
+def synthesize_missing_mouth(inp_path: Path, write: bool = True) -> dict[str, Any]:
+    """Give a converted puppet with NO bound mouth param a clean anime mouth-open, but only when the art allows it.
+
+    Requires the classic layered Cubism mouth: a cavity Part (the mask source of teeth / tongue) hidden behind an
+    upper and a lower skin-cover Part that meet at the closed lip line. Opening slides the lower cover's lip band
+    down (its lower edge stays put, so the cover keeps hiding the cavity below), lifts the upper cover a little,
+    and carries the lower teeth / tongue and lower-lip highlights along - nothing is stretched past the art.
+    Deforms are bound to the puppet's empty vowel params (あ 1.0, お 0.8, え 0.55, う 0.32, い 0.25) or a new
+    "Mouth Open" param. Returns {"ok": bool, "reason" | "params", ...}; leaves the file untouched unless ok."""
+    path = Path(inp_path)
+    model = read_puppet_json(path)
+    params = [p for p in model.get("param") or [] if isinstance(p, dict)]
+    for p in params:
+        r = match_rule(str(p.get("name") or ""))
+        if r is not None and r[2] == "mouth" and p.get("bindings") and (r[0] or r[1]) and \
+                any((s or ("", ""))[0] in ("mouth_open", "vowel_a", "vowel_o") for s in (r[0], r[1])):
+            return {"ok": False, "reason": "mouth already bound"}
+
+    def find_mouth(n: Any, depth: int) -> dict | None:
+        if not isinstance(n, dict) or depth > 64:
+            return None
+        if norm_name(n.get("name") or "") in _MOUTH_NODE_NAMES:
+            return n
+        for c in n.get("children") or []:
+            r = find_mouth(c, depth + 1)
+            if r is not None:
+                return r
+        return None
+
+    mouth = find_mouth(model.get("nodes"), 0)
+    if mouth is None:
+        return {"ok": False, "reason": "no mouth group node"}
+    parts: list[dict] = []
+
+    def collect(n: dict, depth: int) -> None:
+        for c in n.get("children") or []:
+            if isinstance(c, dict) and depth < 8:
+                if c.get("type") in ("Part", "AnimatedPart") and c.get("enabled", True) is not False:
+                    parts.append(c)
+                collect(c, depth + 1)
+
+    collect(mouth, 0)
+    if len(parts) < 3:
+        return {"ok": False, "reason": "mouth has fewer than 3 art layers (baked single texture)"}
+    for c in parts:                                     # deforms are local: all layers must share one space
+        tr = c.get("transform") or {}
+        if any(abs(_f(v)) > 1e-6 for v in (tr.get("trans") or [0, 0, 0])[:2]) or \
+                abs(_f((tr.get("rot") or [0, 0, 0])[2] if len(tr.get("rot") or []) > 2 else 0)) > 1e-6:
+            return {"ok": False, "reason": "mouth layers have their own transforms"}
+    deform, _ = _rest_state(model)
+    geo: dict[int, dict[str, Any]] = {}
+    for c in parts:
+        verts = (c.get("mesh") or {}).get("verts") or []
+        uid = c.get("uuid")
+        if not isinstance(uid, int) or len(verts) < 6:
+            continue
+        offs = deform.get(uid) or []
+        xs, ys = [], []
+        for k in range(len(verts) // 2):
+            ox, oy = (offs[k] if k < len(offs) else (0.0, 0.0))
+            xs.append(_f(verts[2 * k]) + ox)
+            ys.append(_f(verts[2 * k + 1]) + oy)
+        masks = [m.get("source") for m in (c.get("masks") or []) if isinstance(m, dict)]
+        geo[uid] = {"node": c, "xs": xs, "ys": ys, "n": len(verts) // 2, "masks": masks,
+                    "box": (min(xs), max(xs), min(ys), max(ys)), "z": _f(c.get("zsort"))}
+    sources: dict[int, int] = {}
+    for uid, g in geo.items():
+        for s in g["masks"]:
+            if s in geo and s != uid:
+                sources[s] = sources.get(s, 0) + 1
+    if not sources:
+        return {"ok": False, "reason": "no masked mouth cavity (mouth is a single drawn shape)"}
+    cav_id = max(sources, key=lambda u: (sources[u], (geo[u]["box"][1] - geo[u]["box"][0]) * (geo[u]["box"][3] - geo[u]["box"][2])))
+    cav = geo[cav_id]
+    cx0, cx1, cy0, cy1 = cav["box"]
+    cw, ch = max(1e-3, cx1 - cx0), max(1e-3, cy1 - cy0)
+
+    def xcover(b: tuple) -> float:
+        return max(0.0, min(b[1], cx1) - max(b[0], cx0)) / cw
+
+    lower = upper = None
+    for uid, g in geo.items():
+        if uid == cav_id or cav_id in g["masks"] or g["z"] >= cav["z"]:      # covers draw in front (lower zsort)
+            continue
+        b = g["box"]
+        if xcover(b) < 0.85:
+            continue
+        if b[2] > cy0 + 0.15 * ch and b[3] >= cy1 - 0.02 * ch and b[2] < cy1:
+            if lower is None or (b[3] - b[2]) > (geo[lower]["box"][3] - geo[lower]["box"][2]):
+                lower = uid
+        elif b[3] < cy1 - 0.15 * ch and b[2] <= cy0 + 0.02 * ch and b[3] > cy0:
+            if upper is None or (b[3] - b[2]) > (geo[upper]["box"][3] - geo[upper]["box"][2]):
+                upper = uid
+    if lower is None or upper is None:
+        return {"ok": False, "reason": "no separate upper / lower lip covers over the mouth cavity"}
+    lb, ub = geo[lower]["box"], geo[upper]["box"]
+    if lb[2] > ub[3]:
+        return {"ok": False, "reason": "lip covers leave a seam (they do not meet)"}
+    seam = 0.5 * (lb[2] + ub[3])
+    delta = 0.36 * (cy1 - seam)                         # full あ: a third of the hidden cavity below the lips
+    if delta <= 1e-3 or delta > 0.6 * (lb[3] - lb[2]):
+        return {"ok": False, "reason": "mouth cavity too shallow to open cleanly"}
+
+    # lens-shaped opening: the corners stay pinned at the lip-line ends (the cavity is wider than the lines, so a
+    # dropped corner would expose it), the centre opens most
+    lx0 = max(lb[0], ub[0], cx0)
+    lx1 = min(lb[1], ub[1], cx1)
+    lmid, lhalf = 0.5 * (lx0 + lx1), max(1e-3, 0.5 * (lx1 - lx0) * 0.86)
+
+    def xprof(x: float) -> float:
+        u = (x - lmid) / lhalf
+        return max(0.0, 1.0 - u * u) ** 0.65
+
+    r0 = lb[2] + 0.30 * (lb[3] - lb[2])                 # lower cover: rigid lip band, then compress to its edge
+
+    def w_lower(y: float) -> float:
+        return 1.0 if y <= r0 else _smoothstep((lb[3] - y) / max(1e-3, lb[3] - r0))
+
+    r1 = ub[3] - 0.30 * (ub[3] - ub[2])
+
+    def w_upper(y: float) -> float:
+        return 1.0 if y >= r1 else _smoothstep((y - ub[2]) / max(1e-3, r1 - ub[2]))
+
+    offsets: dict[int, list[list[float]]] = {}
+    moved: dict[str, list[int]] = {"lowerCover": [lower], "upperCover": [upper], "jaw": [], "lowerLipDecor": []}
+    for uid, g in geo.items():
+        if uid == cav_id:
+            continue
+        if uid == lower:
+            offsets[uid] = [[0.0, delta * w_lower(y) * xprof(x)] for x, y in zip(g["xs"], g["ys"])]
+        elif uid == upper:
+            offsets[uid] = [[0.0, -0.22 * delta * w_upper(y) * xprof(x)] for x, y in zip(g["xs"], g["ys"])]
+        elif cav_id in g["masks"]:
+            cyc = 0.5 * (g["box"][2] + g["box"][3])
+            if cyc > seam:                                # lower teeth / tongue ride the jaw
+                offsets[uid] = [[0.0, 0.55 * delta * xprof(x)] for x in g["xs"]]
+                moved["jaw"].append(uid)
+        else:
+            b = g["box"]
+            cyc = 0.5 * (b[2] + b[3])
+            if seam - 0.05 * ch < cyc < lb[3] and b[0] >= lb[0] - 1 and b[1] <= lb[1] + 1:
+                offsets[uid] = [[0.0, delta * w_lower(y) * xprof(x)] for x, y in zip(g["xs"], g["ys"])]
+                moved["lowerLipDecor"].append(uid)
+
+    # target params: empty vowel params, else an unbound open param, else a new "Mouth Open"
+    by_name = {str(p.get("name") or ""): p for p in params}
+    targets: list[tuple[dict, float]] = []
+    for nm, amt in MOUTH_VOWEL_OPEN:
+        p = by_name.get(nm)
+        if p is not None and not p.get("bindings") and not p.get("is_vec2"):
+            targets.append((p, amt))
+    if not targets:
+        for p in params:
+            r = match_rule(str(p.get("name") or ""))
+            if r and r[0] and r[0][0] == "mouth_open" and not p.get("bindings") and not p.get("is_vec2"):
+                targets.append((p, 1.0))
+                break
+    if not targets:
+        uid_new = max([int(p.get("uuid")) for p in params if isinstance(p.get("uuid"), int)] + [5000]) + 1
+        newp = {"name": "Mouth Open", "uuid": uid_new, "is_vec2": False, "min": [0.0, 0.0], "max": [1.0, 1.0],
+                "defaults": [0.0, 0.0], "axis_points": [[0.0, 1.0], [0.0, 1.0]], "merge_mode": "Additive",
+                "bindings": []}
+        model["param"].append(newp)
+        targets.append((newp, 1.0))
+    for p, amt in targets:
+        mn, mx = _pair(p.get("min")), _pair(p.get("max"), (1.0, 1.0))
+        if (mn[0], mx[0]) != (0.0, 1.0):
+            continue
+        p["axis_points"] = [[0.0, 1.0], [0.0, 1.0]]
+        binds = []
+        for uid, offs in offsets.items():
+            zero = [[0.0, 0.0] for _ in offs]
+            full = [[round(dx * amt, 4), round(dy * amt, 4)] for dx, dy in offs]
+            binds.append({"node": uid, "param_name": "deform", "interpolate_mode": "Linear",
+                          "isSet": [[True, True], [True, True]], "values": [[zero, zero], [full, full]]})
+        p["bindings"] = binds
+    bound = [p["name"] for p, _ in targets if p.get("bindings")]
+    if not bound:
+        return {"ok": False, "reason": "no usable 0..1 mouth param"}
+    if write:
+        _write_puppet_json(path, model)
+    return {"ok": True, "params": bound, "cavity": cav_id, "delta": round(delta, 2), "seam": round(seam, 2),
+            "layers": moved}
 
 
 def sanitize_model_cameras(value: Any) -> dict[str, dict[str, float]]:

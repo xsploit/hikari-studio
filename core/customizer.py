@@ -1864,15 +1864,19 @@ class CharacterCustomizer:
                                    lambda h: apply_midori_arms(h, bake, tids))
 
     def _attach_vfx(self, header: bytes, out_texs: list[tuple[int, bytes]]) -> bytes:
-        """Expression VFX ('tiddlywinks') + Eye Star / Eye Heart / Cheek Puff / Cat Mouth (core/vfx_rig.py)."""
+        """Expression VFX ('tiddlywinks') + Eye Star / Eye Heart / Cheek Puff / Cat Mouth, plus the pro transforms
+        (Stage X/Y/Zoom, Pupil Shrink, Shoulder Shrug, mouth corners, Brow X, Eye Form) - core/vfx_rig.py.
+        Pupil Shrink scales toward the active iris art's centre, so the iris textures are part of the cache key."""
         tid_of: dict[str, int] = {}
         sizes: dict[str, tuple[float, float]] = {}
         for slot, png, w, h in build_vfx_textures(out_texs[51][1]):
             tid_of[slot] = len(out_texs)
             out_texs.append((0, png))
             sizes[slot] = (w, h)
-        return self._cached_header(("vfx", tuple(sorted(tid_of.items()))), header,
-                                   lambda h: apply_vfx_rig(h, tid_of, sizes))
+        iris = {"R": out_texs[TEX_IRIS_R][1], "L": out_texs[TEX_IRIS_L][1]}
+        ikey = tuple((len(v), hash(v)) for v in iris.values())
+        return self._cached_header(("vfx", tuple(sorted(tid_of.items())), ikey), header,
+                                   lambda h: apply_vfx_rig(h, tid_of, sizes, iris))
 
     def _feathered_top(self, premul_png: bytes) -> tuple[bytes, bytes | None, bytes | None]:
         """Cached shoulder-tab feather + corner carve for whichever topwear texture is active:

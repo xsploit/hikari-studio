@@ -6,7 +6,10 @@ Combines cleanly in strict layered priority:
   3. Autonomous gaze + mouse look-at (eyes lead, head follows)
   4. Spring-smoothed Expression Preset + asymmetric brow micro-life + cheek blush
      + Expression VFX layer (VFX Sparkles / Hearts / Sweat / Anger / Shock / Music, Eye Star / Heart, Cheek Puff,
-       Cat Mouth): auto emotion mapping (rig.autoVfx) < emote VFX < manual Studio overrides; :3 ducks while talking
+       Cat Mouth, Pupil Shrink): auto emotion mapping (rig.autoVfx) < emote VFX < manual Studio overrides; :3 ducks
+     while talking
+     + AAA rig-transform layer (Stage X / Y / Zoom, Shoulder Shrug, L/R mouth corners, Brow L/R X, Eye L/R Form):
+       spring-eased sustained emotion poses + emote motion; mouth corners duck during wide-open speech
   5. Arms: the original seamless resting arms sway with body / breath physics (Arm L/R Swing); the raised wave arms
      (Right Wave / Left Gesture / Both Cheer) come up for emotes, AI actions and real excited peaks in speech
   6. Live 6-axis VBridger lip-sync + syllable-onset head beats + pitch-coupled brows / chin
@@ -29,7 +32,7 @@ from typing import Any
 
 from core.config import EXPRESSION_PRESETS, ROOM_AMBIENT_MAP
 from core.events import HookRegistry
-from core.puppet_adapter import HIKARI_ID, UniversalParamMapper
+from core.puppet_adapter import HIKARI_ID, UniversalParamMapper, build_param_inspector
 from modules.lipsync import DEFAULT_PARAM_MAP, LiveLipSyncEngine, Spring2nd
 
 log = logging.getLogger("hikari.rig")
@@ -66,7 +69,7 @@ EMOTE_CATALOG: dict[str, dict[str, Any]] = {
 # Expression VFX & blend-shape params (1D, 0..1, default 0) built into Hikari-v28-Custom.inp.
 VFX_PARAMS: tuple[str, ...] = (
     "VFX Sparkles", "VFX Hearts", "VFX Sweat", "VFX Anger", "VFX Shock", "VFX Music",
-    "Eye Star", "Eye Heart", "Cheek Puff", "Cat Mouth",
+    "Eye Star", "Eye Heart", "Cheek Puff", "Cat Mouth", "Pupil Shrink",
 )
 # Lively animation while active: (low, frequency Hz). Output = level * osc with osc in [low, 1]; low 1.0 = clean ease.
 VFX_MOTION: dict[str, tuple[float, float]] = {
@@ -95,8 +98,8 @@ EMOTION_VFX: dict[str, dict[str, float]] = {
     "embarrassed": {"VFX Sweat": 0.95},
     "awkward":   {"VFX Sweat": 0.95},
     "sweat":     {"VFX Sweat": 0.95},
-    "surprised": {"VFX Shock": 0.9},
-    "shocked":   {"VFX Shock": 0.9},
+    "surprised": {"VFX Shock": 0.9, "Pupil Shrink": 0.45},
+    "shocked":   {"VFX Shock": 0.9, "Pupil Shrink": 0.95},
     "smug":      {"Cat Mouth": 1.0},
     "playful":   {"Cat Mouth": 1.0},
     "teasing":   {"Cat Mouth": 1.0},
@@ -104,6 +107,29 @@ EMOTION_VFX: dict[str, dict[str, float]] = {
     "vibing":    {"VFX Music": 0.95},
 }
 SMUG_EMOTIONS = frozenset(("smug", "playful", "teasing"))
+
+# AAA rig transforms built into Hikari-v28-Custom.inp (all 1D, -1..+1, default 0). Older rigs skip them.
+#   Stage X +1 = slide right | Stage Y +1 = hop up, -1 = crouch | Stage Zoom +1 = lean closer, -1 = recoil
+#   Shoulder Shrug +1 = hunch up, -1 = relax down | L/R mouth corner +1 = lift | Brow L/R X -1 = pinch inward
+#   Eye L/R Form -1 = lower upper lid (smug / sleepy), +1 = lift upper lid (wide-eyed)
+RIG_FX_PARAMS: tuple[str, ...] = (
+    "Stage X", "Stage Y", "Stage Zoom", "Shoulder Shrug", "Left mouth corner", "Right mouth corner",
+    "Brow L X", "Brow R X", "Eye L Form", "Eye R Form",
+)
+_SMIRK = {"Left mouth corner": 0.65, "Right mouth corner": -0.2, "Eye L Form": -0.55, "Eye R Form": -0.55}
+_FURROW = {"Brow L X": -0.75, "Brow R X": -0.75}
+_STARTLE = {"Stage Zoom": -0.45, "Eye L Form": 0.65, "Eye R Form": 0.65}
+_SLUMP = {"Shoulder Shrug": -0.45, "Eye L Form": -0.4, "Eye R Form": -0.4}
+_HUNCH = {"Shoulder Shrug": 0.45}
+# Sustained emotion (decision engine emotion, else expression preset) -> held AAA pose, spring-eased.
+EMOTION_POSE: dict[str, dict[str, float]] = {
+    "smug": _SMIRK, "playful": _SMIRK, "teasing": _SMIRK,
+    "angry": _FURROW, "annoyed": _FURROW, "pout": _FURROW,
+    "shocked": _STARTLE, "surprised": _STARTLE,
+    "sad": _SLUMP, "tired": _SLUMP, "sleepy": _SLUMP, "gloomy": _SLUMP,
+    "flustered": _HUNCH, "shy": _HUNCH, "nervous": _HUNCH,
+}
+MOUTH_CORNER_DUCK_OPEN = 0.35       # mouth corners ease toward neutral while the lip-sync mouth opens wider than this
 
 
 def _smooth(x: float) -> float:
@@ -415,6 +441,13 @@ class RigController:
         self._cat_duck_hold = 0.0
         self.sp_smug_look = Spring2nd(0.0)
 
+        # AAA rig-transform layer: slow springs for the sustained emotion pose, fast output springs (pop guard)
+        self._has_rig_fx = {k: k in self._known for k in RIG_FX_PARAMS}
+        self._fx_pose = {k: Spring2nd(0.0) for k in RIG_FX_PARAMS}
+        self._fx_out = {k: Spring2nd(0.0) for k in RIG_FX_PARAMS}
+        self._corner_duck = 0.0                   # 0 = full smirk, 1 = ducked for wide-open talking
+        self.rig_fx_active: dict[str, float] = {k: 0.0 for k in RIG_FX_PARAMS}
+
         # Live telemetry snapshot
         self.last_params: dict[str, tuple[float, float]] = dict(self.defaults)
         self.last_shader: dict[str, Any] = {}
@@ -428,17 +461,106 @@ class RigController:
         self._mapper: UniversalParamMapper | None = None
         self.last_canonical: dict[str, tuple[float, float]] = self.last_params
 
-    def reload_puppet_meta(self, param_meta: list[dict[str, Any]] | None, active_model_id: str) -> dict[str, Any]:
-        """Hot-swap the output puppet. "hikari" (or no meta) = native output, byte-for-byte the old behaviour."""
+        # Live Parameter Inspector: manual per-param overrides on the OUTPUT puppet (applied after mapping / physics,
+        # Hikari included). Cleared on every puppet switch.
+        self.rig_param_overrides: dict[str, tuple[float, float]] = {}
+        # 1-click mouth flap test: a synthetic syllable track fed through the real lip-sync mouth path
+        self._mouth_test_start = 0.0
+        self._mouth_test_dur = 0.0
+
+    def reload_puppet_meta(self, param_meta: list[dict[str, Any]] | None, active_model_id: str,
+                           physics_settings: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Hot-swap the output puppet. "hikari" (or no meta) = native output, byte-for-byte the old behaviour.
+        A different puppet starts with fresh spring physics and no manual inspector overrides."""
         mid = str(active_model_id or HIKARI_ID)
-        mapper = None if mid == HIKARI_ID or not param_meta else UniversalParamMapper(param_meta, mid)
+        mapper = None if mid == HIKARI_ID or not param_meta else UniversalParamMapper(param_meta, mid, physics_settings)
         with self.lock:
+            if mid != self.active_model_id:
+                self.rig_param_overrides.clear()
             self._mapper = mapper
             self.active_model_id = mid
         if mapper is None:
             return {"passthrough": True, "mappedChannels": list(("head", "body", "eyes", "gaze", "brows", "mouth",
-                                                                   "breath", "blush", "vfx")), "unboundChannels": []}
+                                                                   "arms", "breath", "blush", "vfx")),
+                    "unboundChannels": [], "physicsCount": 0, "physicsParams": []}
         return mapper.summary()
+
+    # ------------------------------------------------------------------ live parameter inspector
+    @property
+    def mapper(self) -> UniversalParamMapper | None:
+        return self._mapper
+
+    def engine_physics(self, physics_enabled: bool) -> bool:
+        """Engine SimplePhysics flag for this frame: off while the universal spring solver owns the puppet's
+        physics params (MINT drivers hang from static nodes and would force them back to rest)."""
+        m = self._mapper
+        return bool(physics_enabled) and not (m is not None and m.owns_physics)
+
+    def output_param_names(self) -> frozenset[str]:
+        m = self._mapper
+        return frozenset(m.defaults) if m is not None else self._known
+
+    def set_param_override(self, name: str, x: float, y: float = 0.0) -> dict[str, tuple[float, float]]:
+        """Pin one output param (any param of the live puppet). KeyError: unknown param; ValueError: NaN."""
+        if name not in self.output_param_names():
+            raise KeyError(name)
+        fx, fy = _ff(x, float("nan")), _ff(y, float("nan"))
+        if fx != fx or fy != fy:
+            raise ValueError("override values must be finite numbers")
+        with self.lock:
+            self.rig_param_overrides[name] = (_clamp(fx, -1000.0, 1000.0), _clamp(fy, -1000.0, 1000.0))
+            return dict(self.rig_param_overrides)
+
+    def clear_param_override(self, name: str | None = None) -> dict[str, tuple[float, float]]:
+        with self.lock:
+            if name is None:
+                self.rig_param_overrides.clear()
+            else:
+                self.rig_param_overrides.pop(name, None)
+            return dict(self.rig_param_overrides)
+
+    def param_inspector(self, param_meta: list[dict[str, Any]], native_physics: list[str] | tuple[str, ...] = ()
+                        ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        with self.lock:
+            ovr = dict(self.rig_param_overrides)
+        return build_param_inspector(param_meta, self._mapper, dict(self.last_params), ovr, native_physics,
+                                     frozenset(VFX_PARAMS))
+
+    def mouth_mapped(self) -> bool:
+        m = self._mapper
+        return m is None or m.passthrough or "mouth" in m.mapped_channels
+
+    def trigger_mouth_test(self, duration: float = 2.2) -> dict[str, Any]:
+        """Crisp synthetic speech (Ah - Eh - Oh - Ah - Oo) through the EXACT live lip-sync mouth channels
+        (mouthOpen / mouthForm / mouthFunnel + onsets -> head accent nods), so it proves the real path."""
+        dur = _clamp(_ff(duration, 2.2), 0.5, 10.0)
+        with self.lock:
+            self._mouth_test_start = time.perf_counter()
+            self._mouth_test_dur = dur
+        return {"ok": True, "duration": dur, "mouthMapped": self.mouth_mapped()}
+
+    def mouth_test_active(self) -> bool:
+        return 0.0 <= time.perf_counter() - self._mouth_test_start <= self._mouth_test_dur
+
+    # (open, form, funnel) per syllable: Ah - Eh - Oh - Ah - Oo
+    _MOUTH_TEST_SYL = ((1.0, 0.25, 0.0), (0.62, 0.85, 0.0), (0.8, -0.25, 0.85), (0.95, 0.2, 0.0), (0.38, -0.35, 1.0))
+
+    def _mouth_test_frame(self, t_now: float, lip: dict[str, Any]) -> dict[str, Any] | None:
+        el = t_now - self._mouth_test_start
+        dur = self._mouth_test_dur
+        if dur <= 0.0 or not (0.0 <= el <= dur):
+            return None
+        n = len(self._MOUTH_TEST_SYL)
+        u = el / dur * n
+        i = min(n - 1, int(u))
+        f = u - i                                               # 0..1 within the syllable
+        env = math.sin(math.pi * f / 0.86) ** 0.6 if f < 0.86 else 0.0     # open, close, tiny gap
+        op, form, fun = self._MOUTH_TEST_SYL[i]
+        out = dict(lip)
+        out.update({"open": op * env, "form": form, "funnel": fun * env, "energy": 0.55 * env + 0.1,
+                    "stress": 0.6 if i in (0, 3) else 0.3, "onset": 1.0 if f < 0.12 else 0.0, "voiced": 1.0,
+                    "pitch": 0.5 + 0.08 * math.sin(i * 1.7), "press": 0.0, "tongue": 0.0, "x": 0.0, "shrug": 0.0})
+        return out
 
     @property
     def output_defaults(self) -> dict[str, tuple[float, float]]:
@@ -511,7 +633,7 @@ class RigController:
         eased back to calm. Unknown / neutral emotions clear it."""
         emo = str(emotion or "").strip().lower()
         with self.lock:
-            self._vfx_emotion = emo if emo in EMOTION_VFX else ""
+            self._vfx_emotion = emo if (emo in EMOTION_VFX or emo in EMOTION_POSE) else ""
             self._vfx_emotion_until = time.perf_counter() + _clamp(_ff(hold, 6.0), 0.5, 60.0)
 
     def set_vfx_override(self, param: str, value: float | None) -> None:
@@ -700,6 +822,9 @@ class RigController:
 
         # 1. Live lip-sync & hook
         lip = self.lipsync.step(dt, t_now)
+        test_lip = self._mouth_test_frame(t_now, lip)
+        if test_lip is not None:
+            lip = test_lip
         self.hooks.emit_sync("on_lipsync_frame", ctx, lip)
         energy = _clamp(_ff(lip.get("energy", 0.0), 0.0), 0.0, 1.0)
         stress = _clamp(_ff(lip.get("stress", 0.0), 0.0), 0.0, 1.0)
@@ -1250,6 +1375,7 @@ class RigController:
         em_glow_boost = 0.0
         em_vfx: dict[str, float] = {}             # emote-driven VFX targets (eased by the VFX layer below)
         em_smug = 0.0
+        em_fx: dict[str, float] = {}              # emote-driven AAA rig transforms (already enveloped by env)
 
         if em_id and em_dur > 0.1:
             u_t = _clamp(em_el / em_dur, 0.0, 1.0)
@@ -1273,6 +1399,11 @@ class RigController:
                 if self._has_raised_joints and name in p:
                     p[name] = (_clamp(p[name][0] * (1.0 - env) + follow * env, -0.65, 0.65), p[name][1])
 
+            def _fx(*pairs: tuple[str, float]) -> None:
+                """AAA rig transforms for this emote (amounts already shaped by env -> always ease back to 0)."""
+                for name, amount in pairs:
+                    em_fx[name] = em_fx.get(name, 0.0) + amount
+
             if em_id == "excited_hop":
                 hop = math.sin(u_t * math.pi * 4.0)
                 body_y += 8.2 * env * hop
@@ -1287,6 +1418,7 @@ class RigController:
                 p["Arm L Gesture"] = (0.45 * math.sin(u_t * math.pi * 6.0 + 0.5) * env, 0.0)
                 _wrist("R", 0.55 * math.sin(u_t * math.pi * 6.0 - 1.1))
                 _wrist("L", 0.55 * math.sin(u_t * math.pi * 6.0 + 0.5 - 1.1))
+                _fx(("Stage Y", 0.75 * max(0.0, hop) * env), ("Stage Zoom", 0.25 * env))
                 _bump("Left Brow Y", 0.30 * env)
                 _bump("Right Brow Y", 0.30 * env)
                 if auto_vfx:
@@ -1297,6 +1429,7 @@ class RigController:
                 head_y -= 7.5 * env
                 head_z += 11.0 * env
                 body_lean += 4.5 * env
+                _fx(("Shoulder Shrug", 0.65 * env), ("Stage Zoom", -0.18 * env))
                 p["EyeBall"] = (max(-1.0, eye_x - 0.35 * env), max(-1.0, eye_y - 0.28 * env))
                 _atleast("Anime Blush Lines", 1.0 * env)
                 _atleast("Eye L Smile", 0.55 * env)
@@ -1326,6 +1459,8 @@ class RigController:
                 head_y -= 10.0 * env
                 body_y -= 4.0 * env
                 gloom_tgt = max(gloom_tgt, env)
+                _fx(("Shoulder Shrug", -0.55 * env), ("Brow L X", -0.55 * env), ("Brow R X", -0.55 * env),
+                    ("Stage Y", -0.25 * env))
                 p["Brow L Form"] = (-0.85 * env + p["Brow L Form"][0] * (1.0 - env), 0.0)
                 p["Brow R Form"] = (-0.85 * env + p["Brow R Form"][0] * (1.0 - env), 0.0)
                 _bump("Left Brow Y", -0.20 * env)
@@ -1338,6 +1473,8 @@ class RigController:
                 head_z -= 16.0 * env
                 head_y += 4.0 * env
                 body_lean += 7.5 * env
+                head_z -= 2.5 * env * math.sin(u_t * math.pi * 3.0)        # subtle curious tilt wobble
+                _fx(("Stage Zoom", 0.55 * env))
                 body_z -= 4.5 * env
                 _bump("Left Brow Y", 0.55 * env)
                 _bump("Right Brow Y", 0.20 * env)
@@ -1359,6 +1496,7 @@ class RigController:
                 p["EyeBall"] = (_clamp(p["EyeBall"][0] * (1.0 - env) - 0.45 * env, -1.0, 1.0), p["EyeBall"][1])   # side glance
                 _atleast("Cheek Puff", 1.0 * env)
                 em_vfx["Cheek Puff"] = 1.0 * env
+                _fx(("Brow L X", -0.65 * env), ("Brow R X", -0.65 * env), ("Shoulder Shrug", (0.4 + 0.15 * huff) * env))
                 _atleast("Anime Blush Lines", 0.65 * env)
                 p["Brow L Form"] = (-0.75 * env + p["Brow L Form"][0] * (1.0 - env), 0.0)
                 p["Brow R Form"] = (-0.75 * env + p["Brow R Form"][0] * (1.0 - env), 0.0)
@@ -1402,6 +1540,7 @@ class RigController:
                 body_y += 9.0 * bnc * env
                 head_y += 7.0 * bnc * env
                 head_z += 6.0 * math.sin(u_t * math.pi * 2.5) * env
+                _fx(("Stage Y", 0.55 * bnc * env), ("Stage X", 0.22 * math.sin(u_t * math.pi * 2.5) * env))
                 _atleast("Arm R Pose", env)
                 _atleast("Arm L Pose", env)
                 _atleast("Arm R Lift", (0.55 + 0.25 * pump) * env)
@@ -1425,6 +1564,8 @@ class RigController:
                 head_y += 2.5 * heh * env
                 body_lean -= 3.0 * env
                 _bump("Left Brow Y", 0.50 * env)
+                _fx(("Left mouth corner", 0.9 * env), ("Right mouth corner", -0.35 * env), ("Eye L Form", -0.8 * env),
+                    ("Eye R Form", -0.8 * env), ("Stage Zoom", 0.25 * env))
                 _bump("Right Brow Y", -0.15 * env)
                 if self._has_brow_angle:
                     _bump("Brow R Angle", -0.35 * env)
@@ -1454,6 +1595,7 @@ class RigController:
                 shake = math.sin(u_t * math.pi * 18.0) * env
                 dart = math.sin(u_t * math.pi * 8.0)
                 head_x += 4.5 * shake - 6.0 * env
+                _fx(("Shoulder Shrug", 0.65 * env), ("Stage Zoom", -0.18 * env))
                 head_y -= 9.0 * env
                 head_z += 7.0 * env
                 body_lean += 3.5 * env
@@ -1483,6 +1625,7 @@ class RigController:
             elif em_id == "sleepy_yawn":
                 yawn = math.sin(math.pi * _clamp(u_t / 0.55, 0.0, 1.0))
                 droop = _smooth((u_t - 0.45) / 0.25) * env
+                _fx(("Eye L Form", -0.75 * env), ("Eye R Form", -0.75 * env), ("Shoulder Shrug", -0.5 * env))
                 head_y += 7.0 * yawn * env - 6.0 * droop
                 head_z += 5.0 * droop
                 body_y += 3.0 * yawn * env
@@ -1518,6 +1661,7 @@ class RigController:
             elif em_id == "starry_eyes":
                 hop = math.sin(u_t * math.pi * 5.0)
                 body_y += 6.5 * max(0.0, hop) * env
+                _fx(("Stage Zoom", 0.28 * env), ("Stage Y", 0.3 * max(0.0, hop) * env))
                 head_y += 6.0 * env + 4.0 * hop * env
                 head_z += 7.0 * math.sin(u_t * math.pi * 2.0) * env
                 _atleast("Eye L Smile", 0.35 * env)
@@ -1533,6 +1677,7 @@ class RigController:
             elif em_id == "heart_crush":
                 sway = math.sin(u_t * math.pi * 2.0)
                 head_z += 10.0 * env + 3.0 * sway * env
+                _fx(("Stage Zoom", 0.28 * env), ("Stage Y", 0.3 * max(0.0, math.sin(u_t * math.pi * 4.0)) * env))
                 head_y += 3.0 * env
                 body_lean += 3.0 * env
                 body_z += 2.5 * env
@@ -1562,6 +1707,7 @@ class RigController:
                 _atleast("Eye L Smile", 0.40 * env)
                 _atleast("Eye R Smile", 0.40 * env)
                 em_vfx["Cat Mouth"] = 1.0 * env
+                _fx(("Eye L Form", -0.75 * env), ("Eye R Form", -0.75 * env), ("Stage Zoom", 0.2 * env))
                 em_smug = env
                 em_glow_boost = 0.25 * env
             elif em_id == "anime_sweat":
@@ -1582,6 +1728,8 @@ class RigController:
                 p["VB Mouth"] = (p["VB Mouth"][0] + (0.35 - p["VB Mouth"][0]) * eq, p["VB Mouth"][1])   # awkward smile
                 p["Mouth X"] = (_clamp(p["Mouth X"][0] - 0.30 * eq, -1.0, 1.0), 0.0)
                 em_vfx["VFX Sweat"] = 1.0 * env
+                em_vfx["Pupil Shrink"] = 0.35 * env
+                _fx(("Shoulder Shrug", 0.55 * env))
                 em_glow_boost = 0.05 * env
             elif em_id == "anger_vein":
                 jolt = math.exp(-u_t * 9.0) * math.sin(u_t * math.pi * 14.0)
@@ -1602,6 +1750,7 @@ class RigController:
                 eq = env * quiet
                 p["VB Mouth"] = (p["VB Mouth"][0] + (-0.75 - p["VB Mouth"][0]) * eq, p["VB Mouth"][1])   # stern scowl
                 em_vfx["VFX Anger"] = 1.0 * env
+                _fx(("Brow L X", -0.9 * env), ("Brow R X", -0.9 * env), ("Shoulder Shrug", (0.45 + 0.2 * jolt) * env))
                 em_glow_boost = -0.10 * env
             elif em_id == "vibe_music":
                 beat = abs(math.sin(em_el * math.pi * 2.2))           # 2.2 bobs / second
@@ -1611,6 +1760,7 @@ class RigController:
                 body_z += 3.5 * sway * env
                 body_x += 2.5 * sway * env
                 body_y += 2.0 * beat * env
+                _fx(("Stage Y", (0.32 * beat - 0.08) * env), ("Stage X", 0.3 * sway * env))
                 _atleast("Eye L Smile", 0.85 * env)
                 _atleast("Eye R Smile", 0.85 * env)
                 _bump("Left Brow Y", 0.20 * env)
@@ -1631,6 +1781,7 @@ class RigController:
         #      eased by critically damped springs, then animated (twinkle / bob / throb) while active.
         self._vfx_step(dt, t_now, p, auto_vfx, vfx_ovr, vfx_emo, temp, em_vfx, em_smug, w_t, mv,
                        max(vb_open, _ff(lip.get("open", 0.0), 0.0)), quiet)
+        self._rig_fx_step(dt, p, vfx_emo, temp, expr_name, em_fx, w_t, max(vb_open, _ff(lip.get("open", 0.0), 0.0)))
 
         chibi_val = _clamp(self.sp_chibi.step(chibi_tgt, dt, 12.0, 0.55), 0.0, 1.0)
         gloom_val = _clamp(self.sp_gloom.step(gloom_tgt, dt, 10.0, 0.80), 0.0, 1.0)
@@ -1695,7 +1846,7 @@ class RigController:
         mapper = self._mapper
         if mapper is not None:
             self.last_canonical = p
-            p = mapper.map_frame(p)
+            p = mapper.step(p, dt, physics_on)          # mapping + arm follow-through + universal spring physics
             if isinstance(overrides, dict) and overrides:
                 known = self._known
                 for pname, ov in overrides.items():
@@ -1705,6 +1856,16 @@ class RigController:
                             p[pname] = (_clamp(ox, -1000.0, 1000.0), _clamp(oy, -1000.0, 1000.0))
         else:
             self.last_canonical = p
+
+        # 15. Live Parameter Inspector overrides (any param of the live puppet, after everything else)
+        with self.lock:
+            insp = dict(self.rig_param_overrides) if self.rig_param_overrides else None
+        if insp:
+            if mapper is None:
+                p = dict(p)                              # never mutate the canonical telemetry frame
+            for pname, (ox, oy) in insp.items():
+                if pname in p:
+                    p[pname] = (ox, oy)
 
         self.last_params = p
         self.last_shader = shader_cfg
@@ -1792,6 +1953,39 @@ class RigController:
                     p[n] = (p[n][0] * (1.0 - 0.12 * sm), p[n][1])
             if "Mouth X" in p:
                 p["Mouth X"] = (_clamp(p["Mouth X"][0] + 0.15 * sm * quiet, -1.0, 1.0), p["Mouth X"][1])
+
+    def _rig_fx_step(self, dt: float, p: dict[str, tuple[float, float]], emotion: str, temp: dict[str, Any] | None,
+                     expr_name: str, em_fx: dict[str, float], w_think: float, mouth_open: float) -> None:
+        """AAA rig transforms: sustained emotion pose (slow critically damped springs) + emote motion, then a
+        fast output spring so nothing ever pops (emote interrupts included). Writes only params the rig has."""
+        emo = emotion
+        if emo not in EMOTION_POSE and temp:
+            emo = str(temp.get("vfxEmotion") or temp.get("expression") or "").lower()
+        if emo not in EMOTION_POSE:
+            emo = str(expr_name or "").lower()
+        pose = EMOTION_POSE.get(emo, {})
+        calm = 1.0 - 0.6 * _clamp(w_think, 0.0, 1.0)            # thinking softens the held pose
+
+        # Wide-open speech: the smirk corners ease toward neutral so talking stays clean (eased, never pops).
+        duck_t = _smooth((mouth_open - MOUTH_CORNER_DUCK_OPEN) / 0.25)
+        tau = 0.06 if duck_t > self._corner_duck else 0.25
+        self._corner_duck += (duck_t - self._corner_duck) * (1.0 - math.exp(-dt / tau))
+        corner_keep = 1.0 - 0.7 * self._corner_duck
+
+        for k in RIG_FX_PARAMS:
+            held = self._fx_pose[k].step(pose.get(k, 0.0) * calm, dt, 6.0, 1.0)
+            tgt = _clamp(held + _ff(em_fx.get(k, 0.0), 0.0), -1.0, 1.0)
+            if k in ("Left mouth corner", "Right mouth corner"):
+                tgt *= corner_keep
+            sp = self._fx_out[k]
+            v = _clamp(sp.step(tgt, dt, 26.0, 1.0), -1.0, 1.0)
+            if not math.isfinite(v):                             # belt and braces: a spring can never NaN the rig
+                sp.y, sp.v, v = 0.0, 0.0, 0.0
+            elif abs(v) < 1e-5 and tgt == 0.0:
+                sp.y, sp.v, v = 0.0, 0.0, 0.0
+            self.rig_fx_active[k] = v
+            if self._has_rig_fx[k] and k in p:
+                p[k] = (v, p[k][1])
 
     def _finalize_params(self, p: dict[str, tuple[float, float]]) -> None:
         if len(p) != len(self.defaults):

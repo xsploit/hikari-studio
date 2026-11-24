@@ -38,8 +38,8 @@ from core.engine_bridge import NativeEngineBridge
 from core.events import HookRegistry
 from core.plugins import PluginManager
 from core.puppet_adapter import (
-    DEFAULT_MINT_CLI, HIKARI_ID, MAX_IMPORT_BYTES, PUPPET_EXTS, ImportError_, PuppetFormatError, import_puppet_file,
-    inspect_puppet, sanitize_model_cameras, valid_model_id,
+    DEFAULT_MINT_CLI, HIKARI_ID, MAX_IMPORT_BYTES, PUPPET_EXTS, ImportError_, PuppetFormatError, build_param_inspector,
+    import_puppet_file, inspect_puppet, sanitize_model_cameras, valid_model_id,
 )
 from core.rig_controller import EMOTE_CATALOG, VFX_PARAMS, RigController
 from core.wardrobe import WARDROBE_STYLES
@@ -516,7 +516,7 @@ class StudioRuntime:
         else:
             info = inspect_puppet(path, model_id)
             self.param_meta = info.bound_param_meta
-            summary = self.rig.reload_puppet_meta(info.param_meta, model_id)
+            summary = self.rig.reload_puppet_meta(info.param_meta, model_id, info.physics_settings)
         self.active_model_id = model_id
         return summary
 
@@ -539,9 +539,28 @@ class StudioRuntime:
             **{k: pub[k] for k in ("artist", "paramCount", "boundParamCount", "mappedChannels", "unboundChannels",
                                    "recommendedCamera")},
         }
+        caps = dict(pub.get("capabilities") or {})
         if model_id == HIKARI_ID:
             entry["recommendedCamera"] = self.hikari_default_camera()      # her hand-tuned framing
+            _, caps = build_param_inspector(info.param_meta, None, native_physics=list(info.physics_settings),
+                                            extras_names=frozenset(VFX_PARAMS))
+        entry["capabilities"] = caps
+        entry["physicsCount"] = int(caps.get("physicsCount", 0))
+        entry["mouthMapped"] = bool(caps.get("mouth", False))
         return entry
+
+    def param_inspector(self) -> dict[str, Any]:
+        """GET /api/models/params: every BOUND param of the live puppet, categorized, with live values."""
+        mid = self.active_model_id
+        if mid == HIKARI_ID:
+            info = inspect_puppet(self.model_path, HIKARI_ID)
+            meta = self.hikari_param_meta
+        else:
+            path = self.library_model_path(mid)
+            info = inspect_puppet(path, mid) if path is not None else None
+            meta = info.param_meta if info is not None else []
+        params, caps = self.rig.param_inspector(meta, list(info.physics_settings) if info is not None else [])
+        return {"ok": True, "activeModel": mid, "capabilities": caps, "params": params}
 
     def list_models(self) -> list[dict[str, Any]]:
         out = [self.model_entry(HIKARI_ID, self.model_path)]
@@ -935,7 +954,8 @@ class StudioRuntime:
             try:
                 with self._frame_lock:                       # a live puppet switch never sees a half-mapped frame
                     params, shader, camera = self.rig.step(dt, self.config.data, self)
-                    phys_on = bool(self.config.data["rig"].get("physicsEnabled", True))
+                    # MINT puppets: the universal spring solver owns their physics params -> engine drivers off
+                    phys_on = self.rig.engine_physics(bool(self.config.data["rig"].get("physicsEnabled", True)))
                     pkt = self.engine.render_packet(dt, camera, shader, phys_on, params, jpeg_quality=95)
                 self._latest_frame = pkt
 
@@ -1799,6 +1819,44 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         return web.json_response({"ok": True, "activeModel": runtime.active_model_id,
                                   "mintAvailable": await asyncio.to_thread(MINT_CLI.is_file), "models": models})
 
+    async def api_models_params(_req):
+        return web.json_response(await asyncio.to_thread(runtime.param_inspector))
+
+    def _ovr_json() -> dict[str, list[float]]:
+        return {k: [round(v[0], 5), round(v[1], 5)] for k, v in runtime.rig.rig_param_overrides.items()}
+
+    async def api_models_params_set(req):
+        try:
+            body = await req.json()
+        except Exception:
+            body = None
+        if not isinstance(body, dict):
+            return web.json_response({"ok": False, "error": "Expected a JSON object"}, status=400)
+        if _truthy(body.get("clearAll"), False):
+            runtime.rig.clear_param_override(None)
+        else:
+            name = body.get("name")
+            if not isinstance(name, str) or not name or len(name) > 200:
+                return web.json_response({"ok": False, "error": "Expected a parameter name"}, status=400)
+            if _truthy(body.get("clear"), False):
+                runtime.rig.clear_param_override(name)
+            else:
+                try:
+                    x = float(body.get("x", 0.0))
+                    y = float(body.get("y", 0.0) if body.get("y") is not None else 0.0)
+                    runtime.rig.set_param_override(name, x, y)
+                except KeyError:
+                    return web.json_response({"ok": False, "error": f"Parameter {name!r} is not on the live puppet"},
+                                             status=404)
+                except (TypeError, ValueError):
+                    return web.json_response({"ok": False, "error": "x / y must be finite numbers"}, status=400)
+        ovr = _ovr_json()
+        return web.json_response({"ok": True, "overriddenCount": len(ovr), "overrides": ovr})
+
+    async def api_models_test_mouth(_req):
+        res = runtime.rig.trigger_mouth_test(2.2)
+        return web.json_response({"ok": True, "duration": res["duration"], "mouthMapped": res["mouthMapped"]})
+
     async def api_models_select(req):
         try:
             body = await req.json()
@@ -2235,6 +2293,9 @@ def build_app(runtime: StudioRuntime) -> web.Application:
     app.router.add_post("/api/presets/save", api_save_preset)
     app.router.add_post("/api/presets/apply", api_apply_preset)
     app.router.add_get("/api/models", api_models)
+    app.router.add_get("/api/models/params", api_models_params)
+    app.router.add_post("/api/models/params", api_models_params_set)
+    app.router.add_post("/api/models/test-mouth", api_models_test_mouth)
     app.router.add_post("/api/models/select", api_models_select)
     app.router.add_post("/api/models/import", api_models_import)
     app.router.add_delete("/api/models/{model_id}", api_models_delete)

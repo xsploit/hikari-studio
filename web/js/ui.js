@@ -254,7 +254,8 @@ const SEARCH_SYNONYMS = {
   shader: ['shader', 'look preset'], sharp: ['sharp'], blur: ['blur', 'bokeh'],
   vfx: ['vfx', 'fx'], fx: ['fx', 'vfx'], effects: ['vfx', 'fx'], tiddlywinks: ['vfx'],
   sparkle: ['sparkle'], sparkles: ['sparkle'], sweat: ['sweat'], sweatdrop: ['sweat'],
-  anger: ['anger'], angry: ['anger'], shock: ['shock'], music: ['music', 'vibing'],
+  anger: ['anger'], angry: ['anger'], shock: ['shock', 'pupil'],
+  pupil: ['pupil'], pupils: ['pupil'], shrink: ['shrink', 'pupil'], shocked: ['shock', 'pupil'], music: ['music', 'vibing'],
   star: ['star'], stars: ['star'], starry: ['star'], cat: ['cat', 'smug'], blend: ['blend'], blendshape: ['blend shape'],
   emote: ['emote'], emotes: ['emote'], expression: ['expression', 'mood'], face: ['face', 'expression', 'blush', 'eye'],
   blink: ['blink'], gaze: ['gaze', 'look at', 'mouse'], look: ['look', 'gaze'], physics: ['physics', 'jiggle', 'bounce', 'spring'],
@@ -267,6 +268,12 @@ const SEARCH_SYNONYMS = {
   models: ['model', 'puppet'], hiyori: ['hiyori', 'puppet'], mao: ['mao', 'puppet'], import: ['import'],
   live2d: ['live2d', 'puppet'], 'live 2d': ['live2d', 'puppet'], inp: ['inp', 'puppet'], inx: ['inx', 'puppet'],
   inochi: ['inp', 'puppet'], inochi2d: ['inp', 'puppet'],
+  'mouth flap': ['mouth flap', 'mouth', 'capabilit'], 'mouth flaps': ['mouth flap', 'mouth', 'capabilit'],
+  'test mouth': ['test mouth', 'mouth flap'], 'rig params': ['rig params', 'parameter'], 'rig controls': ['extra rig', 'parameter'],
+  'extra controls': ['extra controls', 'extra rig'], flap: ['flap', 'mouth'], flaps: ['flap', 'mouth'],
+  capabilities: ['capabilit', 'hookup'], capability: ['capabilit', 'hookup'], hookup: ['hookup', 'capabilit'], hookups: ['hookup', 'capabilit'],
+  extras: ['extra'], extra: ['extra'], toggles: ['toggle'], springs: ['spring', 'physics'], spring: ['spring', 'physics'],
+  aura: ['aura'], bunny: ['bunny'], ears: ['ears', 'bunny'], override: ['override'], overrides: ['override'],
   motion: ['motion', 'clip', 'retarget'], video: ['video', 'motion lab'], save: ['save', 'preset'],
 };
 const SYN_PHRASES = Object.keys(SEARCH_SYNONYMS).filter((k) => k.includes(' ')).sort((a, b) => b.length - a.length);
