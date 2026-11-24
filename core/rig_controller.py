@@ -34,7 +34,8 @@ from core.config import EXPRESSION_PRESETS, ROOM_AMBIENT_MAP
 from core.events import HookRegistry
 from core.puppet_adapter import (HIKARI_ID, AbilityTrack, RigAbility, UniversalParamMapper, build_param_inspector,
                                  discover_abilities_from_meta, hikari_builtin_abilities)
-from modules.lipsync import DEFAULT_PARAM_MAP, LiveLipSyncEngine, Spring2nd
+from modules.lipsync import DEFAULT_PARAM_MAP, LiveLipSyncEngine, Spring2nd, UserVoiceActivity
+from modules.motion_graph import DEFAULT_PHRASE_SEC, MIN_GRAPH_CLIP_SEC, MIN_WALK_PHRASES, MotionGraph, MotionGraphWalker
 
 log = logging.getLogger("hikari.rig")
 
@@ -261,6 +262,13 @@ IDLE_BODY_X_GAIN = 1.85        # amplify tracked torso yaw so upper body turns w
 IDLE_BODY_Z_GAIN = 1.40        # amplify tracked torso rock so waist & shoulders lean into sways
 IDLE_SPEAKING_W = 0.75         # she keeps swaying while she talks (like Neuro), just a little steadier
 IDLE_LOOP_XFADE_SEC = 1.0      # tail -> head crossfade so the loop has no seam
+# Causal prosody-to-body (Super Star / EchoAvatar 2026): stress -> micro-nod, rising pitch -> brow lift + curious tilt,
+# sustained emphasis -> forward lean. Visual backchannel (DuplexPO / DuplexGen 2026): user micro-pause -> double-nod.
+PROSODY_STRESS_TH = 0.35       # stressOnset needed for a micro-nod
+PROSODY_NOD_GAP = 0.22         # min seconds between prosody micro-nods (shrinks a little for fast chatter)
+BACKCHANNEL_COOLDOWN = (2.2, 4.5)
+BACKCHANNEL_DUR = 1.15         # seconds of the attentive brow / lean / micro-smile envelope
+BACKCHANNEL_SECOND_NOD = 0.34  # second, softer nod of the double-nod
 
 
 def prepare_idle_clip(data: dict[str, Any]) -> dict[str, Any]:
@@ -274,7 +282,7 @@ def prepare_idle_clip(data: dict[str, Any]) -> dict[str, Any]:
         tr = tracks.get(k)
         if tr is None:
             continue
-        a = [float(v) for v in tr]
+        a = [float(v) for v in tr[:n]]
         alpha = 1.0 - math.exp(-1.0 / (0.08 * fps))          # forward-backward low-pass: no jitter, no lag
         for rng_ in (range(1, n), range(n - 2, -1, -1)):
             step = 1 if rng_.step > 0 else -1
@@ -523,6 +531,29 @@ class RigController:
         self._idle_clip: dict[str, Any] | None = None
         self._idle_clip_start: float = now
         self._idle_layer_w: float = 0.0
+        # Idle Motion Graph (modules/motion_graph.py): pose-matched phrase walk instead of the fixed linear loop
+        self._idle_graph: MotionGraph | None = None
+        self._idle_graph_walker: MotionGraphWalker | None = None
+        self._idle_writer_lock = threading.Lock()
+        self._idle_phrase_sec = DEFAULT_PHRASE_SEC
+        self._idle_graph_extra: list[dict[str, Any]] = []
+        self._idle_src_w: float = 1.0             # 1 = motion graph, 0 = classic linear loop (eased on toggle)
+        # Causal prosody-to-body state
+        self._pros_last_nod: float = 0.0
+        self.sp_pros_dip = Spring2nd(0.0)
+        self._pros_q: float = 0.0                 # eased "question / rising pitch" weight
+        self._pros_emph: float = 0.0              # eased sustained emphasis
+        self._pros_gate: float = 1.0              # fades prosody body motion out under emotes / clips
+        self._pros_nods: int = 0
+        # Anticipatory visual backchannel state
+        self._user_vad = UserVoiceActivity()
+        self._bc_manual: int = 0                  # note_user_pause() pulses
+        self._bc_manual_seen: int = 0
+        self._bc_seen: int = 0
+        self._bc_start: float = -1e9
+        self._bc_second_done: bool = True
+        self._bc_next_ok: float = now
+        self._bc_count: int = 0
         # Organic Neuro-style whole-body rocking pendulum (planted-foot Stage Roll + lagged waist/head + 2x weight dip)
         self._rock_phase: float = rnd.uniform(0.0, 6.283)
         self._rock_w: float = 0.0
@@ -894,17 +925,89 @@ class RigController:
             self._motion_playing = False
             self._motion_clip = None
 
-    def set_idle_clip(self, clip_path: Path | None) -> dict[str, Any]:
+    def set_idle_clip(self, clip_path: Path | None, phrase_sec: float = DEFAULT_PHRASE_SEC) -> dict[str, Any]:
         """Install (or clear, with None) the looping idle clip. Validates before touching live state."""
-        if clip_path is None:
+        with self._idle_writer_lock:
+            if clip_path is None:
+                with self.lock:
+                    self._idle_clip = None
+                    self._idle_graph = self._idle_graph_walker = None
+                    self._idle_graph_extra = []
+                return self.idle_clip_status()
+            prepared = prepare_idle_clip(validate_motion_clip(json.loads(Path(clip_path).read_text(encoding="utf-8"))))
+            graph, walker = self._build_idle_graph([prepared], phrase_sec)
             with self.lock:
-                self._idle_clip = None
-            return self.idle_clip_status()
-        prepared = prepare_idle_clip(validate_motion_clip(json.loads(Path(clip_path).read_text(encoding="utf-8"))))
-        with self.lock:
-            self._idle_clip = prepared
-            self._idle_clip_start = time.perf_counter()
+                self._idle_phrase_sec = phrase_sec
+                self._idle_clip = prepared
+                self._idle_clip_start = time.perf_counter()
+                self._idle_graph_extra = []
+                self._idle_graph, self._idle_graph_walker = graph, walker
         return self.idle_clip_status()
+
+    def _build_idle_graph(self, clips: list[dict[str, Any]], phrase_sec: float) -> tuple[MotionGraph | None, MotionGraphWalker | None]:
+        """Motion graph over the idle clip(s). None (= classic seamless linear loop) when every clip is shorter than
+        MIN_GRAPH_CLIP_SEC or the graph has < MIN_WALK_PHRASES phrases (a ~6-10 s loop gains no variety from a walk,
+        only crossfade damping)."""
+        usable = [c for c in clips if float(c.get("duration", 0.0)) >= MIN_GRAPH_CLIP_SEC]
+        if not usable:
+            return None, None
+        try:
+            g = MotionGraph(usable, phrase_sec=phrase_sec)
+            if len(g.phrases) < MIN_WALK_PHRASES:
+                return None, None
+            return g, g.walker(random.Random(self._rnd.random()))
+        except (ValueError, KeyError):
+            return None, None
+
+    def add_idle_graph_clips(self, paths: list[Path] | tuple[Path, ...]) -> dict[str, Any]:
+        """Add more Motion Lab clips as extra phrase sources for the idle motion graph (the idle clip stays the base).
+        Validates every clip before touching live state (raises ValueError on a malformed one)."""
+        extra = [prepare_idle_clip(validate_motion_clip(json.loads(Path(pth).read_text(encoding="utf-8"))))
+                 for pth in paths]
+        with self._idle_writer_lock:
+            base = self._idle_clip
+            if base is None:
+                raise ValueError("Select an idle clip before adding phrase sources")
+            sources = self._idle_graph_extra + extra
+            graph, walker = self._build_idle_graph([base, *sources], self._idle_phrase_sec)
+            with self.lock:
+                self._idle_graph_extra = sources
+                self._idle_graph, self._idle_graph_walker = graph, walker
+        return self.idle_graph_status()
+
+    def idle_graph_status(self) -> dict[str, Any]:
+        with self.lock:
+            w = self._idle_graph_walker
+            extra = [c.get("id", "") for c in self._idle_graph_extra]
+            src = self._idle_src_w
+            if w is None:
+                return {"active": False, "phraseCount": 0, "clipCount": 0, "transitions": 0, "activePhraseStyle": "",
+                        "activePhraseEnergy": 0.0, "extraClips": extra}
+            return {"active": True, **w.status(), "extraClips": extra, "graphBlend": round(src, 3)}
+
+    # ------------------------------------------------------------------ live user voice (visual backchannel)
+    def note_user_audio(self, rms: float) -> bool:
+        """Feed the USER's live mic / call RMS (any rate, e.g. per audio block). Detects speech -> brief pause
+        transitions internally; returns True when a micro-pause pulse fired."""
+        with self.lock:
+            return self._user_vad.feed(rms, time.perf_counter())
+
+    def note_user_speech(self, active: bool) -> None:
+        """Explicit user VAD edge (duplex call VAD); a pause after >= 0.4 s of speech pulses 0.25 s later."""
+        with self.lock:
+            self._user_vad.note(bool(active), time.perf_counter())
+
+    def note_user_pause(self) -> None:
+        """Explicit micro-pause pulse: an attentive backchannel plays (cooldown still applies) even outside 'listening'."""
+        with self.lock:
+            self._bc_manual += 1
+
+    def backchannel_status(self) -> dict[str, Any]:
+        with self.lock:
+            t = time.perf_counter()
+            return {"count": self._bc_count, "active": (t - self._bc_start) < BACKCHANNEL_DUR,
+                    "cooldown": round(max(0.0, self._bc_next_ok - t), 3), "user": self._user_vad.state(t),
+                    "prosodyNods": self._pros_nods}
 
     def idle_clip_status(self) -> dict[str, Any]:
         with self.lock:
@@ -1099,6 +1202,10 @@ class RigController:
             m_mix = self._motion_mix
             idle_clip = self._idle_clip
             idle_start = self._idle_clip_start
+            idle_walker = self._idle_graph_walker
+            self._user_vad.tick(t_now)
+            bc_pulses = self._user_vad.pulses + self._bc_manual
+            bc_manual = self._bc_manual
             mood_tv, mood_ta = self._mood_tv, self._mood_ta
             istate = self._istate
             think_side_t = self._think_side
@@ -1254,8 +1361,23 @@ class RigController:
         want_idle = 0.0 if (idle_clip is None or idle_block) else (IDLE_SPEAKING_W if speaking else 1.0)
         self._idle_layer_w += (want_idle - self._idle_layer_w) * (1.0 - math.exp(-dt / 0.35))
         iw = self._idle_layer_w * idle_mix
+        use_graph = idle_walker is not None and bool(rig_cfg.get("idleMotionGraph", True))
+        if idle_walker is None:
+            self._idle_src_w = 0.0
+        else:
+            self._idle_src_w += ((1.0 if use_graph else 0.0) - self._idle_src_w) * (1.0 - math.exp(-dt / 0.3))
         if idle_clip is not None and iw > 1e-3:
-            s_idle = self._idle_sample(idle_clip, idle_start, t_now)
+            gw = self._idle_src_w if idle_walker is not None else 0.0
+            if gw >= 0.999:
+                with self.lock:
+                    s_idle = idle_walker.step(dt, arousal=arousal_n, speaking=speaking, rng=rnd)
+            elif gw <= 0.001:
+                s_idle = self._idle_sample(idle_clip, idle_start, t_now)
+            else:                                                  # toggle crossfade: linear <-> graph, no pop
+                s_lin = self._idle_sample(idle_clip, idle_start, t_now)
+                with self.lock:
+                    s_gr = idle_walker.step(dt, arousal=arousal_n, speaking=speaking, rng=rnd)
+                s_idle = {k: s_lin.get(k, 0.0) * (1.0 - gw) + s_gr.get(k, 0.0) * gw for k in set(s_lin) | set(s_gr)}
             ax = s_idle.get("AngleX", 0.0)
             ay = s_idle.get("AngleY", 0.0)
             az = s_idle.get("AngleZ", 0.0)
@@ -1280,6 +1402,69 @@ class RigController:
             shrug_idle = _clamp((sy * 0.65 + max(0.0, ay) * 0.015) * iw, -0.15, 0.38)
             if abs(shrug_idle) > 1e-4:
                 idle_fx["Shoulder Shrug"] = idle_fx.get("Shoulder Shrug", 0.0) + shrug_idle
+
+        # 3.65 Causal prosody-to-body: stressed syllables -> crisp micro-nod + chest dip, rising pitch -> brow lift +
+        #      curious tilt, sustained emphasis -> forward lean. Critically damped, gated off under emotes / clips.
+        pros_gain = _clamp(_ff(rig_cfg.get("prosodyGain", 1.0), 1.0), 0.0, 2.5)
+        pros_on = bool(rig_cfg.get("causalProsody", True)) and pros_gain > 0.0
+        self._pros_gate += ((0.0 if idle_block else 1.0) - self._pros_gate) * (1.0 - math.exp(-dt / 0.15))
+        p_stress = _clamp(_ff(lip.get("stressOnset", 0.0), 0.0), 0.0, 1.0)
+        p_slope = _clamp(_ff(lip.get("pitchSlope", 0.0), 0.0), -1.0, 1.0)
+        p_norm = _clamp(_ff(lip.get("pitchNorm", 0.0), 0.0), -1.0, 1.0)
+        p_emph = _clamp(_ff(lip.get("emphasis", 0.0), 0.0), 0.0, 1.0)
+        p_rate = _clamp(_ff(lip.get("speechRate", 0.0), 0.0), 0.0, 1.0)
+        q_t = e_t = 0.0
+        if pros_on and speaking:
+            gap = PROSODY_NOD_GAP - 0.07 * p_rate
+            if p_stress > PROSODY_STRESS_TH and (t_now - self._pros_last_nod) > gap and self._pros_gate > 0.05:
+                amp = (p_stress - 0.2) * pros_gain * self._pros_gate * (1.0 - 0.35 * p_rate)
+                self.sp_nod.v -= 30.0 * amp
+                self.sp_pros_dip.v -= 18.0 * amp
+                self._pros_last_nod = t_now
+                self._pros_nods += 1
+            q_t = max(_clamp((p_slope - 0.15) / 0.35, 0.0, 1.0), _clamp((p_norm - 0.45) / 0.4, 0.0, 1.0))
+            e_t = p_emph
+        self._pros_q += (q_t - self._pros_q) * (1.0 - math.exp(-dt / (0.12 if q_t > self._pros_q else 0.35)))
+        self._pros_emph += (e_t - self._pros_emph) * (1.0 - math.exp(-dt / 0.3))
+        pq = self._pros_q * pros_gain * self._pros_gate
+        pe = self._pros_emph * pros_gain * self._pros_gate
+        pros_brow = 0.30 * pq
+        if pq > 1e-4:
+            head_z += 3.2 * pq * (1.0 if listen_side_t >= 0 else -1.0)   # slight curious tilt on a rising question
+            head_y += 0.8 * pq
+        if pe > 1e-4:
+            body_lean += 2.4 * pe
+            idle_fx["Stage Zoom"] = idle_fx.get("Stage Zoom", 0.0) + 0.07 * pe
+        body_y += self.sp_pros_dip.step(0.0, dt, 10.0, 1.0)      # gentle critically damped Body Angle Y dip
+
+        # 3.66 Anticipatory visual backchannel: on a user speech -> micro-pause transition while listening, a soft
+        #      double-nod + brow lift + attentive lean-in + warm micro-smile. Cooled down 2.2-4.5 s, never spammed.
+        bc_gain = _clamp(_ff(rig_cfg.get("backchannelGain", 1.0), 1.0), 0.0, 2.5)
+        if bc_pulses != self._bc_seen:
+            manual = bc_manual != self._bc_manual_seen
+            self._bc_manual_seen = bc_manual
+            self._bc_seen = bc_pulses
+            allowed = (bool(rig_cfg.get("visualBackchannel", True)) and bc_gain > 0.0 and not idle_block
+                       and not speaking and (istate == "listening" or manual) and t_now >= self._bc_next_ok)
+            if allowed:
+                self._bc_start = t_now
+                self._bc_second_done = False
+                self._bc_next_ok = t_now + rnd.uniform(*BACKCHANNEL_COOLDOWN)
+                self._bc_count += 1
+                self.sp_nod.v -= 30.0 * bc_gain
+                self._next_listen_nod = max(self._next_listen_nod, t_now + rnd.uniform(2.0, 3.5))
+        bc_u = (t_now - self._bc_start) / BACKCHANNEL_DUR
+        bc_env = 0.0
+        if 0.0 <= bc_u < 1.0 and not idle_block:
+            if not self._bc_second_done and t_now - self._bc_start >= BACKCHANNEL_SECOND_NOD:
+                self._bc_second_done = True
+                self.sp_nod.v -= 20.0 * bc_gain
+            bc_env = (math.sin(bc_u * math.pi) ** 1.2) * bc_gain
+        if bc_env > 1e-4:
+            body_lean += 2.0 * bc_env
+            idle_fx["Stage Zoom"] = idle_fx.get("Stage Zoom", 0.0) + 0.05 * bc_env
+            idle_brow_boost += 0.20 * bc_env
+            idle_smile_boost += 0.12 * bc_env
 
         # 3.7 Interaction-state layers
         # Listening: lean in, small attentive nods on a loose rhythm.
@@ -1492,6 +1677,9 @@ class RigController:
         tr = 1.0 - tl
         brow_l_extra = brow_ev * (1.0 if self._brow_ev_side > 0 else -0.25) + w_t * (0.38 * tl - 0.08)
         brow_r_extra = brow_ev * (1.0 if self._brow_ev_side < 0 else -0.25) + w_t * (0.38 * tr - 0.08)
+        if pros_brow > 1e-4:                                       # question brow lift (tilt-side brow a bit higher)
+            brow_l_extra += pros_brow * (1.0 if listen_side_t >= 0 else 0.8)
+            brow_r_extra += pros_brow * (0.8 if listen_side_t >= 0 else 1.0)
         # Brow angle: + = worried / soft (inner ends up), - = cross. Sad / shy / thinking soften, pout sharpens.
         ang_base = 0.30 * max(0.0, -mv) + (0.25 if expr_name == "shy" else 0.0) - (0.45 if expr_name == "pout" else 0.0)
         ang_l = self.sp_brow_angle_l.step(ang_base + 0.25 * w_t * (0.4 + 0.6 * tl), dt, 6.0, 0.9)
@@ -1589,7 +1777,7 @@ class RigController:
                 m = {**default_map[name], **m}
             return self.mouth_mapper.map(name, _ff(raw, 0.0), dt, m)
 
-        form_src = lip["form"] if speaking else ev["mouthForm"]
+        form_src = lip["form"] if speaking else _clamp(ev["mouthForm"] + 0.16 * bc_env, -1.0, 1.0)
         m_open = _chan("mouthOpen", lip["open"])
         m_form = _chan("mouthForm", form_src)
         m_jaw = _chan("jawOpen", lip["open"])
@@ -2184,6 +2372,8 @@ class RigController:
         self.last_state = {
             "interaction": istate, "mood": (round(mv, 3), round(ma, 3)), "armRaise": (self._raise_side if t_now < self._raise_until else ""), "breathSigh": self._breath_is_sigh, "blink": self._blink_kind if self._blink_active else "",
             "pitchRel": round(pr, 3),
+            "prosody": {"q": round(pq, 3), "emph": round(pe, 3), "nods": self._pros_nods},
+            "backchannel": {"count": self._bc_count, "env": round(bc_env, 3)},
         }
         return p, shader_cfg, cam_cfg
 

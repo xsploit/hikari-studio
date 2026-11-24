@@ -33,7 +33,7 @@ from core.config import (
     mask_secrets, public_config, sanitize_ai_brain_patch, sanitize_lipsync_patch, sanitize_memory_patch,
     sanitize_section, secrets_set,
 )
-from core.customizer import CharacterCustomizer
+from core.customizer import DEFAULT_CUSTOMIZER_CFG, CharacterCustomizer
 from core.engine_bridge import NativeEngineBridge
 from core.events import HookRegistry
 from core.plugins import PluginManager
@@ -45,15 +45,17 @@ from core.rig_controller import EMOTE_CATALOG, VFX_PARAMS, RigController
 from core.wardrobe import WARDROBE_STYLES
 from modules import http_pool, server_keys
 from modules.ai_companion import (
-    BRAIN_MODES, MAX_CHAT_CHARS, AICompanion, HIKARI_PERSONALITY, TAG_RE, TAG_TO_STATE, parse_emotion_and_clean,
+    BRAIN_MODES, MAX_CHAT_CHARS, AICompanion, HIKARI_PERSONALITY, explicit_cue_tag, TAG_TO_STATE, parse_emotion_and_clean,
 )
 from modules.decision_engine import (
     DECISION_DEFAULTS, DECISION_MODES, EMOTIONS, Decision, DecisionEngine, classify_text,
 )
-from modules.fish_duplex import FishDuplexController, compose_session_prompt
+from modules.fish_duplex import FishDuplexController, clean_voice_id, compose_session_prompt
 from modules.fish_tts_stream import FISH_TRANSPORTS, clean_for_speech
 from modules.lipsync import LiveLipSyncEngine
-from modules.memory_store import CATEGORIES, MemoryStore, PinLimitError
+from modules.memory_store import CATEGORIES, MemoryStore, PinLimitError, temporal_label
+from modules.profiles import ProfileStore
+from modules.screen_vision import capture_screen_jpeg, wants_screen_vision
 from modules import fish_voices
 from modules.vercel_gateway import (
     catalog_entries, evaluation_catalog, list_chat_models_and_providers, pick_gateway_model, resolve_gateway_key,
@@ -67,12 +69,13 @@ MODELS_DIR = HERE / "models"
 MOTIONS_DIR = HERE / "motions"
 UPLOADS_DIR = HERE / "uploads"
 AUDIO_DIR = UPLOADS_DIR / "audio"
-MEMORY_DIR = HERE / "data" / "memory"
+DATA_DIR = HERE / "data"
+MEMORY_DIR = DATA_DIR / "memory"
 LIBRARY_DIR = MODELS_DIR / "library"                 # extra Inochi2D puppets (.inp / .inx), switchable live
 HIKARI_MODEL = MODELS_DIR / "Hikari-v28-Custom.inp"
 MINT_CLI = DEFAULT_MINT_CLI
 HIKARI_LABEL = "Hikari (Custom)"
-CONFIG_SECTIONS = ("stage", "camera", "shader", "rig", "lipsync", "visemes", "ai", "memory")
+CONFIG_SECTIONS = ("stage", "camera", "shader", "rig", "lipsync", "visemes", "ai", "memory", "vision")
 TMP_DIR = HERE / "data" / "tmp"                      # private (never served)
 CUSTOM_ASSETS_DIR = HERE / "data" / "custom_assets"  # validated eye / hair images (never served)
 MAX_VIDEO_BYTES = 120 * 1024 * 1024
@@ -249,12 +252,12 @@ def _host_allowed(host: str | None, port: int | None) -> bool:
 
 @web.middleware
 async def security_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
-    """Host check (DNS rebinding) on EVERY request incl. reads and the WebSocket; Origin check for the
-    WebSocket and every state-changing request; upload errors -> JSON."""
+    """Require a local peer, loopback Host and permitted browser Origin for reads and writes."""
     if not _host_allowed(request.headers.get("Host"), _local_port(request)):
         return web.json_response({"ok": False, "error": "Host not allowed"}, status=403)
-    is_ws = request.headers.get("Upgrade", "").lower() == "websocket"
-    if (is_ws or request.method not in ("GET", "HEAD", "OPTIONS")) and not _origin_allowed(request.headers.get("Origin")):
+    if request.remote not in ("127.0.0.1", "::1"):
+        return web.json_response({"ok": False, "error": "Local connections only"}, status=403)
+    if not _origin_allowed(request.headers.get("Origin")):
         return web.json_response({"ok": False, "error": "Origin not allowed"}, status=403)
     try:
         return await handler(request)
@@ -404,11 +407,16 @@ class StudioRuntime:
         self.lipsync.update_visemes(self.config.data["visemes"])
 
         self.ai = AICompanion(AUDIO_DIR)
-        self.ai.update_config(self.config.data["ai"])
+        ai = self.config.data["ai"]
+        ai["fishReferenceId"] = clean_voice_id(ai.get("fishReferenceId"))
+        self.ai.update_config(ai)
         self.fish_duplex = FishDuplexController()
         self.fish_duplex.set_key_override(str(self.config.data["ai"].get("fishApiKey") or ""))
         self.fish_duplex.set_persona(self.ai.persona)
+        self.voice_sync = self.fish_duplex.sync_voice(self.config.data["ai"].get("fishReferenceId", ""),
+                                                      self.config.data["ai"])
         self.decisions = DecisionEngine(self.config.data["ai"])
+        self.profiles = ProfileStore(DATA_DIR / "profiles.json")     # 1-click Character Profiles
         self._idle_task: asyncio.Task | None = None
         # Real-time memory: every chat / voice turn persisted to SQLite immediately + Waifu Studio-style facts.
         self.memory = MemoryStore(MEMORY_DIR, self.config.data.get("memory") or {}, gateway=self.ai.gateway,
@@ -528,7 +536,7 @@ class StudioRuntime:
         try:
             if path is None or not path.exists():
                 raise FileNotFoundError(cid)
-            self.rig.set_idle_clip(path)
+            self.rig.set_idle_clip(path, phrase_sec=self.config.data["rig"].get("idlePhraseSec", 4.5))
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"[Hikari Studio] Idle loop clip {cid!r} not loaded ({exc}) - idle loop off", flush=True)
             self.config.data["rig"]["idleClip"] = ""
@@ -651,7 +659,7 @@ class StudioRuntime:
                 "paramCount": len(self.engine.param_names), "mappedChannels": summary.get("mappedChannels", []),
                 "unboundChannels": summary.get("unboundChannels", [])}
 
-    async def select_model(self, model_id: str, auto_frame: bool = True) -> dict[str, Any]:
+    async def select_model(self, model_id: str, auto_frame: bool = True, *, hikari_look: dict | None = None) -> dict[str, Any]:
         """Live switch engine + rig to `model_id` (KeyError if unknown; re-raises if it cannot start - the previous
         puppet keeps running)."""
         async with self._model_lock:
@@ -660,11 +668,27 @@ class StudioRuntime:
                 raise KeyError(model_id)
             await asyncio.to_thread(inspect_puppet, path, model_id)        # validate before stopping anything
             prev_id = self.active_model_id
-            if model_id == prev_id:
-                summary = await asyncio.to_thread(self._activate_meta, model_id, path)
-            else:
-                async with self._customizer_lock:
-                    summary = await asyncio.to_thread(self._switch_engine_sync, model_id, path)
+            candidate = self.model_path.with_suffix(".profile.inp") if hikari_look is not None else None
+            try:
+                if candidate is not None:
+                    await asyncio.to_thread(self.customizer.build_custom_model, hikari_look, candidate)
+                if model_id == prev_id:
+                    summary = await asyncio.to_thread(self._activate_meta, model_id, path)
+                else:
+                    async with self._customizer_lock:
+                        summary = await asyncio.to_thread(self._switch_engine_sync, model_id, path)
+                if candidate is not None:
+                    try:
+                        await asyncio.to_thread(candidate.replace, self.model_path)
+                    except OSError:
+                        previous = self.model_path_for(prev_id)
+                        if model_id != prev_id and previous is not None:
+                            await asyncio.to_thread(self._switch_engine_sync, prev_id, previous)
+                        raise
+                    self.config.patch("customizer", hikari_look)
+            finally:
+                if candidate is not None:
+                    await asyncio.to_thread(candidate.unlink, missing_ok=True)
             result = await self._finish_switch(prev_id, model_id, path, auto_frame, summary)
             if model_id != prev_id:
                 label = HIKARI_LABEL if model_id == HIKARI_ID else model_id
@@ -769,8 +793,58 @@ class StudioRuntime:
         self.config.data["ai"]["personaId"] = self.ai.cfg.get("personaId", "")
         self.fish_duplex.set_key_override(str(self.config.data["ai"].get("fishApiKey") or ""))
         self.fish_duplex.set_persona(self.ai.persona)
+        if "fishReferenceId" in values:
+            self.sync_fish_voice()
         self.decisions.update_config(self.config.data["ai"])
         self.memory.persona = self.ai.persona
+
+    def sync_fish_voice(self) -> dict[str, Any]:
+        """Fish Live Call speaks with ai.fishReferenceId (next call; chat TTS uses it immediately)."""
+        ai = self.config.data["ai"]
+        self.voice_sync = self.fish_duplex.sync_voice(ai.get("fishReferenceId", ""), ai)
+        return self.voice_sync
+
+    def fish_status(self) -> dict[str, Any]:
+        return {
+            "keyReady": self.ai.fish_key_ready,
+            "activeSession": bool(self.fish_duplex.active_session_id),
+            "activeMode": self.fish_duplex.active_mode,
+            "duplexActive": self.lipsync.fish_duplex_active,
+            "personaSynced": self.fish_duplex.persona_synced,
+            "personaNote": self.fish_duplex.last_persona_note,
+            "voiceStatus": self.fish_duplex.voice_status(),
+            "voiceSync": dict(getattr(self, "voice_sync", {}) or {}),
+        }
+
+    async def activate_profile(self, profile_id: str) -> dict[str, Any]:
+        """1-click Character Profile: write its character fields into the config (never keys / URLs), switch
+        puppet, rebuild Hikari's look if it changed, sync the Fish voice, restore the idle clip, push config."""
+        cfg = self.config.data
+        staged: dict[str, Any] = {}
+        prof = await asyncio.to_thread(self.profiles.apply_to_config, profile_id, staged)
+        want = prof["puppetId"]
+        if want != HIKARI_ID and await asyncio.to_thread(self.library_model_path, want) is None:
+            raise ValueError("The profile puppet is no longer installed")
+        # Model startup can fail. Keep the current character settings and outgoing camera
+        # until the native renderer has accepted the switch.
+        look = {**DEFAULT_CUSTOMIZER_CFG, **staged["customizer"]}
+        changed = any(cfg["customizer"].get(k) != v for k, v in look.items())
+        if want == HIKARI_ID and changed:
+            await self.apply_customizer(look)
+        elif want != self.active_model_id or changed:
+            await self.select_model(want, auto_frame=not prof.get("camera"), hikari_look=look if changed else None)
+        cfg["stage"]["activeModel"] = self.active_model_id
+        cfg["camera"].update(staged.get("camera", {}))
+        cfg["ai"].update(staged["ai"])
+        self.apply_ai_config(staged["ai"])
+        cfg["rig"].update(staged["rig"])
+        self.rig.set_idle_clip(None)
+        await asyncio.to_thread(self._restore_idle_clip)
+        self.sync_rig_flags()
+        self.apply_memory_config()
+        await self.config.save_async()
+        await self.broadcast_json({"type": "state", "state": await self.full_state_async()})
+        return prof
 
     def sync_rig_flags(self) -> None:
         """Push controller-held rig switches (rig.autoVfx) from the config into the RigController."""
@@ -1077,7 +1151,8 @@ class StudioRuntime:
         act = action or parsed_act
         self._subtitle = clean
         if wav_path is None and synth:
-            wav_path = await self.ai.synthesize_tts(clean)
+            # raw text: Fish Drama-3 / S2 voice its inline [cues]; `clean` (tag-free) is what chat / subtitles show
+            wav_path = await self.ai.synthesize_tts(text, emotion=tag)
         audio_url = ""
         dur = 3.8
         if wav_path and await asyncio.to_thread(wav_path.exists):
@@ -1114,15 +1189,16 @@ class StudioRuntime:
         await self.apply_decision(d)
 
     async def deliver_reply(self, reply: str, decision_task: asyncio.Task, *, wav_path: Path | None = None,
-                            player: SegmentPlayer | None = None) -> tuple[dict[str, Any], Decision | None]:
+                            player: SegmentPlayer | None = None, turn: dict | None = None) -> tuple[dict[str, Any], Decision | None]:
         """Speak a finished reply. The emotion decision (up to decisionTimeoutMs) runs CONCURRENTLY with TTS
         synthesis / segment playback; her voice starts as soon as audio is ready and the decision's emote +
         mood land when it arrives. An explicit [tag] in the reply always wins over the decision's tag."""
         clean, parsed_tag, parsed_act = parse_emotion_and_clean(reply)
-        explicit = bool(TAG_RE.search(reply))
+        explicit = bool(explicit_cue_tag(reply))
         if player is None and wav_path is None:
             try:
-                wav_path = await self.ai.synthesize_tts(clean)          # decision_task keeps running meanwhile
+                # raw reply (inline [vocal cues] for Fish Drama-3 / S2); decision_task keeps running meanwhile
+                wav_path = await self.ai.synthesize_tts(reply, emotion=parsed_tag)
             except Exception as exc:
                 print(f"[Hikari Studio] TTS error: {exc.__class__.__name__}", flush=True)
                 wav_path = None
@@ -1138,10 +1214,10 @@ class StudioRuntime:
         await self.hooks.emit_async("on_ai_reply", self, {"reply": clean, "tag": tag, "action": act})
         if player is not None:
             player.action, player.tag = act, tag
-            unvoiced = str((self.ai.last_turn or {}).get("unvoiced") or "").strip()
+            unvoiced = str((turn if turn is not None else self.ai.last_turn).get("unvoiced") or "").strip()
             if unvoiced:                       # Fish stream broke (or never started): voice the rest classically
                 try:
-                    wav = await self.ai.synthesize_tts(unvoiced)
+                    wav = await self.ai.synthesize_tts(unvoiced, emotion=parsed_tag)
                 except Exception:
                     wav = None
                 player.push_wav(wav, unvoiced)
@@ -1171,10 +1247,11 @@ class StudioRuntime:
         return self._segment_player
 
     async def full_state_async(self) -> dict[str, Any]:
-        motions = await asyncio.to_thread(_read_motion_index)
-        return self.full_state(motions)
+        motions, profiles = await asyncio.gather(asyncio.to_thread(_read_motion_index),
+                                                asyncio.to_thread(self.profiles.list_profiles))
+        return self.full_state(motions, profiles)
 
-    def full_state(self, motions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def full_state(self, motions: list[dict[str, Any]] | None = None, profiles: list | None = None) -> dict[str, Any]:
         if motions is None:
             motions = _read_motion_index()
         return {
@@ -1191,21 +1268,17 @@ class StudioRuntime:
             "motions": motions,
             "motionStatus": self.rig.motion_status(),
             "idleClip": self.rig.idle_clip_status(),
+            "idleGraph": self.rig.idle_graph_status(),
+            "backchannel": self.rig.backchannel_status(),
+            "profiles": self.profiles.list_profiles() if profiles is None else profiles,
             "history": self.ai.history[-24:],
             "engineSize": [self.engine.width, self.engine.height],
-            "fishStatus": {
-                "keyReady": self.ai.fish_key_ready,
-                "activeSession": bool(self.fish_duplex.active_session_id),
-                "activeMode": self.fish_duplex.active_mode,
-                "duplexActive": self.lipsync.fish_duplex_active,
-                "personaSynced": self.fish_duplex.persona_synced,
-                "personaNote": self.fish_duplex.last_persona_note,
-            },
+            "fishStatus": self.fish_status(),
             "persona": self.persona_info(),
             "emotes": emote_list(),
             "emotions": list(EMOTIONS.keys()),
             "vfx": self.rig.get_vfx_state(),
-            "decision": self.decisions.status(),
+            "decision": {**self.decisions.status(), "reconsider": reconsider_status(self.decisions)},
             "lipsyncStatus": self.lipsync_status(),
             "brain": self.brain_status(),
         }
@@ -1233,7 +1306,8 @@ class StudioRuntime:
             return None
         try:
             return await self.memory.build_prompt_context(query, session_start=session_start,
-                                                          mood=self.decisions.get_mood_state(), greeting=greeting)
+                                                          mood=self.decisions.get_mood_state(), greeting=greeting,
+                                                          reconsider=self.decisions.reconsider_memories)
         except Exception as exc:
             print(f"[Hikari Studio] Memory recall error: {exc.__class__.__name__}", flush=True)
             return None
@@ -1289,7 +1363,7 @@ def _finite(value: Any, default: float, lo: float, hi: float) -> float:
     """float(value) clamped to [lo, hi]; NaN / Inf / non-numbers -> default."""
     try:
         f = float(value) if not isinstance(value, bool) else default
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return max(lo, min(hi, f)) if math.isfinite(f) else default
 
@@ -1344,6 +1418,14 @@ def _sanitize_hook_payload(body: Any) -> tuple[dict[str, Any] | None, str]:
 def _sanitize_ai_patch(values: dict[str, Any]) -> dict[str, Any]:
     """Coerce decision settings to valid values so a bad UI value can't wedge the engine."""
     out = dict(values)
+    if "fishReferenceId" in out:
+        rid = out["fishReferenceId"]
+        if not isinstance(rid, str) or (rid.strip() and not clean_voice_id(rid)):
+            del out["fishReferenceId"]
+        else:
+            out["fishReferenceId"] = clean_voice_id(rid)
+    if "fishVocalTags" in out and not isinstance(out["fishVocalTags"], bool):
+        del out["fishVocalTags"]
     if "decisionMode" in out and str(out["decisionMode"]).lower() not in DECISION_MODES:
         out["decisionMode"] = "auto"
     elif "decisionMode" in out:
@@ -1360,10 +1442,35 @@ def _sanitize_ai_patch(values: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def reconsider_status(decisions: Any) -> dict[str, Any]:
+    """Reconsider gate (memory appropriateness) stats + last outcome for the UI."""
+    try:
+        stats = getattr(decisions, "stats", {}) or {}
+        return {"last": decisions.reconsider_result, "llmReady": bool(decisions.reconsider_llm_ready()),
+                "reconsidered": int(stats.get("reconsidered", 0)), "heldBack": int(stats.get("heldBack", 0))}
+    except Exception:
+        return {"last": {}, "llmReady": False, "reconsidered": 0, "heldBack": 0}
+
+
 def build_app(runtime: StudioRuntime) -> web.Application:
     app = web.Application(client_max_size=120 * 1024 * 1024, middlewares=[security_middleware])
 
     chat_lock = asyncio.Lock()
+    profile_lock = asyncio.Lock()
+    capture_lock = asyncio.Lock()
+    idle_lock = asyncio.Lock()
+
+    async def capture_screen():
+        if (runtime.config.data.get("vision") or {}).get("enabled", True) is not True:
+            return {"ok": False, "error": "Screen Vision is disabled"}, 403
+        if capture_lock.locked():
+            return {"ok": False, "error": "Screen capture already in progress"}, 429
+        async with capture_lock:
+            try:
+                cap = await asyncio.to_thread(capture_screen_jpeg)
+            except Exception as exc:
+                cap = {"ok": False, "error": f"capture failed ({exc.__class__.__name__})"}
+            return cap, 200 if cap.get("ok") else 503
     framing_sync: dict[str, Any] = {"task": None, "sender": None}
 
     def _cancel_wave() -> None:
@@ -1396,6 +1503,8 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             vals = sanitize_lipsync_patch(raw)
         elif sec == "memory":
             vals = sanitize_memory_patch(raw)
+        elif sec == "vision":
+            vals = {"enabled": raw["enabled"]} if isinstance(raw.get("enabled"), bool) else {}
         elif sec in FRAME_SECTIONS:
             # rig / camera / shader / stage / visemes feed the 60 FPS loop: type-checked against the defaults,
             # NaN / Inf / non-numeric dropped, numbers clamped, rig.overrides finite [x, y] pairs only.
@@ -1419,6 +1528,9 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             runtime.apply_memory_config()
         elif sec == "rig":
             runtime.sync_rig_flags()
+            if "idlePhraseSec" in vals and runtime.config.data["rig"].get("idleClip"):
+                async with idle_lock:
+                    await asyncio.to_thread(runtime._restore_idle_clip)
 
     async def index(_req):
         return web.FileResponse(WEB_DIR / "index.html")
@@ -1508,7 +1620,8 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         return web.json_response(payload)
 
     async def api_decision_status(_req):
-        return web.json_response({"ok": True, **runtime.decisions.status()})
+        return web.json_response({"ok": True, **runtime.decisions.status(),
+                                  "reconsider": reconsider_status(runtime.decisions)})
 
     async def api_decider_models(req):
         """Vercel AI Gateway `type: evaluation` models (catalog cached 10 min; curated list if offline)."""
@@ -1611,11 +1724,13 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         except Exception as exc:
             return _fish_error(exc)
         applied = _truthy(body.get("applyNow"), False)
+        voice_sync: dict[str, Any] = {}
         if applied:
             await apply_section("ai", {"fishReferenceId": voice["id"]})
+            voice_sync = dict(getattr(runtime, "voice_sync", {}) or {})
             await runtime.config.save_async()
             await runtime.broadcast_json({"type": "config_sync", "config": public_config(runtime.config.data)})
-        return web.json_response({"ok": True, "voice": voice, "applied": applied,
+        return web.json_response({"ok": True, "voice": voice, "applied": applied, "voiceSync": voice_sync,
                                   "activeVoiceId": _active_voice_id(),
                                   "ai": public_config(runtime.config.data)["ai"]})
 
@@ -1707,6 +1822,8 @@ def build_app(runtime: StudioRuntime) -> web.Application:
     async def _json_body(req) -> Any:
         try:
             return await req.json()
+        except web.HTTPRequestEntityTooLarge:
+            raise
         except Exception:
             return None
 
@@ -1720,6 +1837,7 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             return web.json_response({"ok": False, "error": "Empty message"}, status=400)
         truncated = len(msg) > MAX_CHAT_CHARS
         msg = msg[:MAX_CHAT_CHARS]                      # history itself is size-bounded (~16 KB) in AICompanion
+        include_screen = body.get("includeScreen") is True or wants_screen_vision(msg)
         payload = {"message": msg}
         await runtime.hooks.emit_async("on_user_message", runtime, payload)
         msg = str(payload.get("message") or msg)[:MAX_CHAT_CHARS]
@@ -1727,6 +1845,7 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         user_task = asyncio.create_task(runtime.decide_and_apply(msg, "user"))
         greeting = classify_text(msg, "user").emotion == "greeting"
         runtime._last_user_activity = time.monotonic()
+        image_data_url: str | None = None
         await runtime.ensure_memory()                  # history restored before the first reply
         runtime._chat_inflight = getattr(runtime, "_chat_inflight", 0) + 1
         runtime._ai_busy = True
@@ -1736,14 +1855,21 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         ctx = None
         try:
             async with chat_lock:                  # history: user turn + reply stay paired and in order
+                if include_screen and (runtime.ai.brain_mode == "vercel_fish" or
+                                       runtime.config.data["ai"].get("provider", "offline") != "offline"):
+                    cap, status = await capture_screen()
+                    if status == 200:
+                        image_data_url = cap.get("dataUrl")
                 ctx = await runtime.prompt_context(msg, greeting=greeting)
                 if runtime.ai.voices_inline:
                     if runtime.config.data["ai"].get("segmentedPlayback", True):
                         player = runtime.new_segment_player()
                     reply, pre_voiced = await runtime.ai.generate_reply_with_voice(
-                        msg, ctx or "", on_segment=player.push_pcm if player is not None else None)
+                        msg, ctx or "", on_segment=player.push_pcm if player is not None else None,
+                        image_data_url=image_data_url)
                 else:
-                    reply = await runtime.ai.generate_reply(msg, ctx or "")
+                    reply = await runtime.ai.generate_reply(msg, ctx or "", image_data_url=image_data_url)
+                turn = dict(runtime.ai.last_turn) if pre_voiced or player is not None else {}
         except Exception:
             if player is not None:
                 player.cancel()
@@ -1764,12 +1890,13 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             user_decision = await user_task
             _cancel_wave()          # no reply is coming: an on_reply wave must not fire later
             return web.json_response({"ok": False, "error": err, "history": runtime.ai.history[-24:],
-                                      "decisions": {"user": user_decision.to_dict()}, "brainMode": runtime.ai.brain_mode},
+                                      "decisions": {"user": user_decision.to_dict()}, "brainMode": runtime.ai.brain_mode,
+                                      "usedVision": image_data_url is not None},
                                      status=502)
         runtime.commit_context(ctx, reply, delivered=True)       # both turns were persisted inside AICompanion
         # Emotion decision runs alongside TTS / playback; it never delays her voice.
         decision_task = asyncio.create_task(runtime.decisions.decide(reply, "reply"))
-        evt, reply_decision = await runtime.deliver_reply(reply, decision_task, wav_path=pre_voiced, player=player)
+        evt, reply_decision = await runtime.deliver_reply(reply, decision_task, wav_path=pre_voiced, player=player, turn=turn)
         if player is None:
             runtime.set_interaction("idle")
         user_decision = await user_task          # (started with the request; awaited only after her voice started)
@@ -1783,7 +1910,8 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             "brainMode": runtime.ai.brain_mode, "memories": runtime.memory.last_recall,
             "context": ctx.debug if ctx is not None else {},
             "recallMs": round(runtime.memory.last_recall_ms, 3),
-            "turn": runtime.ai.last_turn if (pre_voiced or player is not None) else {},
+            "turn": turn,
+            "usedVision": image_data_url is not None,
         })
 
     async def api_memory_status(_req):
@@ -1795,8 +1923,19 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         st["restoredMessages"] = runtime.ai.restored_turns
         return web.json_response({"ok": True, **st})
 
+    def _with_temporal(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Temporal Semantic Memory: dated facts carry a label reframed against today ("today", "upcoming"...)."""
+        for f in facts:
+            if isinstance(f, dict) and f.get("eventDate") and not f.get("temporalLabel"):
+                try:
+                    f["temporalLabel"] = temporal_label(str(f["eventDate"]), str(f.get("temporalKind") or "timeless"))
+                except Exception:
+                    pass
+        return facts
+
     async def api_memory_facts(_req):
-        return web.json_response({"ok": True, "facts": await runtime.memory.list_facts(), "categories": list(CATEGORIES)})
+        return web.json_response({"ok": True, "facts": _with_temporal(await runtime.memory.list_facts()),
+                                  "categories": list(CATEGORIES)})
 
     async def api_memory_fact_add(req):
         body = await _json_body(req)
@@ -1966,21 +2105,24 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         if not isinstance(body, dict):
             return web.json_response({"ok": False, "error": "Expected a JSON object"}, status=400)
         cid = str(body.get("id") or "")
-        if cid:
-            clip_path = _motion_path(cid, ".json")
-            if clip_path is None:
-                return web.json_response({"ok": False, "error": "Invalid clip id"}, status=400)
-            if not await asyncio.to_thread(clip_path.exists):
-                return web.json_response({"ok": False, "error": "Clip not found"}, status=404)
-            try:
-                status = await asyncio.to_thread(runtime.rig.set_idle_clip, clip_path)
-            except (ValueError, json.JSONDecodeError) as exc:
-                return web.json_response({"ok": False, "error": f"Invalid motion clip: {exc}"}, status=400)
-        else:
-            status = runtime.rig.set_idle_clip(None)
-        runtime.config.data["rig"]["idleClip"] = status["id"]
+        async with idle_lock:
+            if cid:
+                clip_path = _motion_path(cid, ".json")
+                if clip_path is None:
+                    return web.json_response({"ok": False, "error": "Invalid clip id"}, status=400)
+                if not await asyncio.to_thread(clip_path.exists):
+                    return web.json_response({"ok": False, "error": "Clip not found"}, status=404)
+                try:
+                    status = await asyncio.to_thread(runtime.rig.set_idle_clip, clip_path,
+                                                     phrase_sec=runtime.config.data["rig"].get("idlePhraseSec", 4.5))
+                except (ValueError, json.JSONDecodeError) as exc:
+                    return web.json_response({"ok": False, "error": f"Invalid motion clip: {exc}"}, status=400)
+            else:
+                status = runtime.rig.set_idle_clip(None)
+            runtime.config.data["rig"]["idleClip"] = status["id"]
         await runtime.config.save_async()
-        return web.json_response({"ok": True, "idleClip": status})
+        return web.json_response({"ok": True, "idleClip": status, "idleGraph": runtime.rig.idle_graph_status(),
+                                  "backchannel": runtime.rig.backchannel_status()})
 
     async def api_plugins_toggle(req):
         body = await req.json()
@@ -2102,6 +2244,106 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         if not _origin_allowed(req.headers.get("Origin")) or not _host_allowed(req.headers.get("Host"), _local_port(req)):
             return web.json_response({"ok": False, "error": "Origin not allowed"}, status=403)
         return None
+
+    # ------------------------------------------------------------------ visual backchannel / vision / profiles
+    async def api_rig_user_audio(req):
+        """POST /api/rig/user-audio {"rms": float} | {"speaking": bool} | {"pause": true}: the viewer's live mic
+        level / VAD edges drive her attentive listening nods (visual backchanneling)."""
+        bad = _origin_guard(req)
+        if bad is not None:
+            return bad
+        body = await _json_body(req.clone(client_max_size=4096))
+        if not isinstance(body, dict):
+            return web.json_response({"ok": False, "error": "Expected a JSON object"}, status=400)
+        if (not body or body.keys() - {"rms", "speaking", "pause"}
+                or any(key in body and not isinstance(body[key], bool) for key in ("speaking", "pause"))
+                or ("rms" in body and (isinstance(body["rms"], bool) or
+                                       not isinstance(body["rms"], (int, float, str))))):
+            return web.json_response({"ok": False, "error": "Invalid audio level or VAD flags"}, status=400)
+        triggered = False
+        if "rms" in body:
+            triggered = bool(runtime.rig.note_user_audio(_finite(body.get("rms"), 0.0, 0.0, 1.0)))
+        if "speaking" in body:
+            runtime.rig.note_user_speech(_truthy(body.get("speaking"), False))
+        if _truthy(body.get("pause"), False):
+            runtime.rig.note_user_pause()
+            triggered = True
+        return web.json_response({"ok": True, "triggered": triggered, "backchannel": runtime.rig.backchannel_status()})
+
+    async def api_vision_capture(req):
+        """POST /api/vision/capture: one on-demand screenshot (downscaled JPEG data URL; nothing stored)."""
+        bad = _origin_guard(req)
+        if bad is not None:
+            return bad
+        cap, status = await capture_screen()
+        return web.json_response(cap, status=status)
+
+    async def api_fish_status(req):
+        bad = _origin_guard(req)
+        if bad is not None:
+            return bad
+        return web.json_response({"ok": True, **runtime.fish_status()})
+
+    async def api_profiles_list(req):
+        bad = _origin_guard(req)
+        if bad is not None:
+            return bad
+        return web.json_response({"ok": True, "profiles": await asyncio.to_thread(runtime.profiles.list_profiles)})
+
+    async def api_profiles_save(req):
+        bad = _origin_guard(req)
+        if bad is not None:
+            return bad
+        body = await _json_body(req.clone(client_max_size=4096))
+        if not isinstance(body, dict):
+            return web.json_response({"ok": False, "error": "Expected a JSON object"}, status=400)
+        name, pid = body.get("name"), body.get("id")
+        if (name is not None and not isinstance(name, str)) or (pid is not None and
+                (not isinstance(pid, str) or not re.fullmatch(r"[a-z0-9-]{0,48}", pid))):
+            return web.json_response({"ok": False, "error": "Invalid profile name or id"}, status=400)
+        async with profile_lock:
+            cfg = runtime.config.data
+            try:
+                prof = await asyncio.to_thread(
+                    runtime.profiles.save_from_config, name if isinstance(name, str) else "", copy.deepcopy(cfg),
+                    profile_id=pid if isinstance(pid, str) else "",
+                    puppet_id=str(cfg.get("stage", {}).get("activeModel") or runtime.active_model_id))
+            except ValueError as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=400)
+            profiles = await asyncio.to_thread(runtime.profiles.list_profiles)
+            await runtime.broadcast_json({"type": "profiles", "profiles": profiles})
+            return web.json_response({"ok": True, "profile": prof, "profiles": profiles})
+
+    async def api_profiles_activate(req):
+        bad = _origin_guard(req)
+        if bad is not None:
+            return bad
+        pid = req.match_info.get("profile_id", "")
+        try:
+            async with profile_lock, idle_lock:
+                prof = await runtime.activate_profile(pid)
+        except KeyError:
+            return web.json_response({"ok": False, "error": f"Unknown profile {pid!r}"}, status=404)
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=409)
+        except Exception as exc:
+            print(f"[Hikari Studio] Profile activate error: {exc.__class__.__name__}: {exc}", flush=True)
+            return web.json_response({"ok": False, "error": f"Could not activate profile ({exc.__class__.__name__})"},
+                                     status=500)
+        return web.json_response({"ok": True, "profile": prof, "profiles": await asyncio.to_thread(runtime.profiles.list_profiles),
+                                  "config": public_config(runtime.config.data)})
+
+    async def api_profiles_delete(req):
+        bad = _origin_guard(req)
+        if bad is not None:
+            return bad
+        pid = req.match_info.get("profile_id", "")
+        async with profile_lock:
+            if not await asyncio.to_thread(runtime.profiles.delete, pid):
+                return web.json_response({"ok": False, "error": f"Unknown profile {pid!r}"}, status=404)
+            profiles = await asyncio.to_thread(runtime.profiles.list_profiles)
+            await runtime.broadcast_json({"type": "profiles", "profiles": profiles})
+            return web.json_response({"ok": True, "profiles": profiles})
 
     async def api_models_abilities(req):
         """GET /api/models/abilities: the live puppet's auto-discovered abilities / props / effects."""
@@ -2416,7 +2658,7 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             clean, tag, act = parse_emotion_and_clean(text)
             # Live call turns are latency-critical: a model only if chosen explicitly or auto resolves to Clef.
             d = await runtime.decisions.decide(text, source, allow_llm=runtime.decisions.fast_model_ok())
-            if not TAG_RE.search(text):
+            if not explicit_cue_tag(text):
                 tag = d.tag
                 if tag == "wave" and not d.wave:
                     tag = "happy"                # no authored [wave] and no decided wave: arms stay down
@@ -2546,6 +2788,14 @@ def build_app(runtime: StudioRuntime) -> web.Application:
     app.router.add_post("/api/vfx", api_vfx_post)
     app.router.add_get("/api/config", api_get_config)
     app.router.add_get("/api/decision", api_decision_status)
+    app.router.add_get("/api/decisions/status", api_decision_status)
+    app.router.add_get("/api/fish/status", api_fish_status)
+    app.router.add_post("/api/rig/user-audio", api_rig_user_audio)
+    app.router.add_post("/api/vision/capture", api_vision_capture)
+    app.router.add_get("/api/profiles", api_profiles_list)
+    app.router.add_post("/api/profiles", api_profiles_save)
+    app.router.add_post("/api/profiles/{profile_id}/activate", api_profiles_activate)
+    app.router.add_delete("/api/profiles/{profile_id}", api_profiles_delete)
     app.router.add_get("/api/deciders/models", api_decider_models)
     app.router.add_post("/api/decision/test", api_decision_test)
     app.router.add_get("/api/fish/voices", api_fish_voices)

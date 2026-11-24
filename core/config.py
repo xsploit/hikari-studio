@@ -133,6 +133,7 @@ _NUM_LIMITS: dict[tuple[str, str], tuple[float, float]] = {
     ("rig", "jiggleScale"): (0.0, 2.5), ("rig", "emissiveGlow"): (0.0, 2.0), ("rig", "chibiMode"): (0.0, 1.0),
     ("rig", "gloom"): (0.0, 1.0), ("rig", "blinkRate"): (0.05, 6.0), ("rig", "breathAmp"): (0.0, 3.0),
     ("rig", "idleSway"): (0.0, 3.0), ("rig", "idleClipMix"): (0.0, 2.0), ("rig", "mouseLookStrength"): (0.0, 2.0), ("rig", "autoGazeLiveliness"): (0.0, 3.0),
+    ("rig", "idlePhraseSec"): (3.0, 6.0), ("rig", "prosodyGain"): (0.0, 2.5), ("rig", "backchannelGain"): (0.0, 2.5),
 }
 _SECTION_DEFAULT_LIMIT: dict[str, tuple[float, float]] = {
     "shader": (-10.0, 10.0), "rig": (-100.0, 100.0), "camera": (-4000.0, 4000.0), "stage": (-100.0, 100.0),
@@ -342,6 +343,9 @@ def public_config(data: dict[str, Any]) -> dict[str, Any]:
     """Config for the browser: every saved key override masked (server env keys are never in config)."""
     out = dict(data)
     out["ai"] = mask_secrets(data.get("ai") or {})
+    if isinstance(out.get("customizer"), dict):
+        out["customizer"] = {key: value for key, value in out["customizer"].items()
+                             if key in DEFAULT_CUSTOMIZER_CFG and isinstance(value, (str, int, float, bool))}
     return out
 
 
@@ -506,6 +510,12 @@ def default_config() -> dict[str, Any]:
             "idleSway": 1.0,
             "idleClip": "",              # Motion Lab clip id looped as her idle (whole-body sway / torso / drift)
             "idleClipMix": 1.0,
+            "idleMotionGraph": True,     # walk the idle clip as a pose-matched motion graph (False = classic linear loop)
+            "idlePhraseSec": 4.5,        # target motion-phrase length for the idle motion graph (3..6 s)
+            "causalProsody": True,       # stressed syllables -> micro-nods, rising pitch -> brow lift, emphasis -> lean-in
+            "prosodyGain": 1.0,
+            "visualBackchannel": True,   # listening: attentive nods / brow / lean-in on user micro-pauses
+            "backchannelGain": 1.0,
             "autoGaze": True,
             "autoGazeLiveliness": 1.0,
             "mouseLookAt": True,
@@ -528,7 +538,8 @@ def default_config() -> dict[str, Any]:
         },
         "lipsync": copy.deepcopy(DEFAULT_LIPSYNC_CFG),
         "visemes": copy.deepcopy(DEFAULT_VISEMES),
-        "ai": copy.deepcopy(DEFAULT_AI_CFG),
+        "ai": {**copy.deepcopy(DEFAULT_AI_CFG), "fishVocalTags": DEFAULT_AI_CFG.get("fishVocalTags", True)},
+        "vision": {"enabled": True},
         "customizer": copy.deepcopy(DEFAULT_CUSTOMIZER_CFG),
         "memory": copy.deepcopy(DEFAULT_MEMORY_CFG),
         "plugins": {},

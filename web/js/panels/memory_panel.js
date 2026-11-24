@@ -253,6 +253,10 @@ export function renderMemoryPanel(store) {
             desc: [f.pinned ? 'Pinned — always in context' : '', f.evidence ? `“${f.evidence}”` : ''].filter(Boolean).join(' · '),
             cls: `fact-row${f.pinned ? ' pinned' : ''}`,
             control: [
+              f.temporalLabel ? el('span', {
+                class: `badge temporal-pill t-${String(f.temporalKind || 'dated').replace(/[^a-z_-]/gi, '')}`,
+                title: f.eventDate ? `Dated memory · ${f.eventDate}` : 'Dated memory', text: f.temporalLabel,
+              }) : null,
               el('span', { class: `badge cat cat-${f.category}`, text: CATEGORY_LABELS[f.category] || f.category }),
               el('button', {
                 type: 'button', class: `icon-pin${f.pinned ? ' on' : ''}`, html: PIN_ICON,

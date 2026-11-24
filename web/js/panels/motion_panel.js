@@ -1,5 +1,5 @@
 /** MOTION & EMOTIONS — Expression FX & blend shapes, Motion Lab (video-to-VTuber retarget, clip library & blend). */
-import { btn, el, group, noteRow, row, slider, toggle } from '../ui.js';
+import { btn, el, group, noteRow, row, slider, switchEl, toggle } from '../ui.js';
 
 const postMotion = (url, body) => fetch(url, {
   method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
@@ -20,7 +20,6 @@ const VFX_PARAMS = [
 const BLEND_PARAMS = [
   ['Eye Star', 'Star Eyes'],
   ['Eye Heart', 'Heart Eyes'],
-  ['Cheek Puff', 'Cheek Puff'],
   ['Cat Mouth', 'Cat Mouth :3'],
   ['Pupil Shrink', 'Pupil Shrink'],
 ];
@@ -113,7 +112,7 @@ export function renderExpressionFx(store) {
       onChange: (v) => store.patch('rig', { autoVfx: v }),
     }),
     row({ title: 'Expression VFX', desc: 'Sparkles, hearts, sweatdrop, anger vein, shock lines, music notes', stack: true, control: fxPills(VFX_PARAMS) }),
-    row({ title: 'Blend shapes', desc: 'Star eyes, heart eyes, cheek puff, cat mouth :3, pupil shrink (shocked)', stack: true, control: fxPills(BLEND_PARAMS) }),
+    row({ title: 'Blend shapes', desc: 'Star eyes, heart eyes, cat mouth :3, pupil shrink (shocked) · cheek puff lives in Face FX', stack: true, control: fxPills(BLEND_PARAMS) }),
     el('div', { class: 's-row' }, [
       el('div', { class: 's-row-text' }, [
         el('div', { class: 's-title', text: 'Reset FX' }),
@@ -157,7 +156,7 @@ export function renderMotionPanel(store) {
       control: [
         btn(isIdle ? 'Idle ✓' : 'Use as idle', async () => {
           const r = await (await postMotion('/api/motion/idle', { id: isIdle ? '' : c.id })).json();
-          if (r.ok) store.idleClip = r.idleClip;
+          if (r.ok) { store.idleClip = r.idleClip; if (r.idleGraph) store.idleGraph = r.idleGraph; }
           else statusEl.textContent = `Error: ${r.error}`;
           store.rerenderPanel();
         }, isIdle ? 'primary' : ''),
@@ -185,7 +184,40 @@ export function renderMotionPanel(store) {
     ]),
   ]);
 
+  const rig = store.config.rig || {};
+  const ig = store.idleGraph || {};
+  const graphOn = rig.idleMotionGraph ?? true;
+  const phraseBadge = graphOn && ig.active && ig.phraseCount
+    ? el('span', { class: 'live-badge', title: `${ig.transitions ?? 0} pose-matched transitions`, text: `${ig.phraseCount} phrases` })
+    : null;
+  const bc = store.backchannel || {};
+  const livingMotion = group('Living Motion', [
+    row({
+      title: 'Motion Graph (non-repeating phrases)',
+      desc: idleId
+        ? 'Walks her idle clip as pose-matched motion phrases so the loop never visibly repeats'
+        : 'Pick “Use as idle” on a clip below — its phrases are re-ordered so the idle never repeats',
+      control: [phraseBadge, switchEl({
+        checked: graphOn, label: 'Motion Graph (non-repeating phrases)',
+        onChange: (v) => { store.patch('rig', { idleMotionGraph: v }); store.rerenderPanel(); },
+      })],
+    }),
+    toggle({
+      label: 'Causal Prosody-to-Body',
+      desc: 'Micro-nods on stressed syllables, question brows on rising pitch, emphasis leans from her voice',
+      checked: rig.causalProsody ?? true,
+      onChange: (v) => store.patch('rig', { causalProsody: v }),
+    }),
+    toggle({
+      label: 'Visual Backchanneling',
+      desc: `Attentive nods & lean-ins during your pauses while she listens${bc.count ? ` · ${bc.count} so far` : ''}`,
+      checked: rig.visualBackchannel ?? true,
+      onChange: (v) => store.patch('rig', { visualBackchannel: v }),
+    }),
+  ], { desc: 'Idle phrases, voice-driven body language and listening cues' });
+
   return [
+    livingMotion,
     group('Motion Lab', [
       extractRow,
       ...(clipRows.length ? clipRows : [noteRow('No extracted clips yet — upload a video or extract the demo.')]),

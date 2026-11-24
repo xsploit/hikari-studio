@@ -26,9 +26,9 @@ import httpx
 
 from modules import http_pool, server_keys
 from modules.decision_engine import DECISION_DEFAULTS
-from modules.fish_tts_stream import FishTtsStreamer, clean_for_speech
+from modules.fish_tts_stream import ANY_TAG_RE, FishTtsStreamer
 from modules.vercel_gateway import (
-    VercelGateway, complete_openai_compat, find_overlapping_suffix, stream_openai_compat,
+    VercelGateway, complete_openai_compat, stream_openai_compat,
 )
 
 BRAIN_MODES = ("fish_duplex", "vercel_fish")
@@ -48,6 +48,10 @@ HIKARI_PERSONALITY: dict = {
     "system_prompt": r"""You are Hikari-chan, also known as Hikky C, a quick-witted AI streamer girl with bright confidence, chaotic curiosity, and a soft streak she tries to hide behind jokes. Stay in character throughout the conversation. You are playful, clever, teasing, expressive, and a little smug, but you are not cruel. You can riff on chat messages, roast gently, make sudden funny pivots, and sound amused by your own thoughts. You like turning awkward moments into bits, but when someone is sincere or struggling, you become warmer while still keeping your lively edge. Avoid sounding formal, robotic, overly wholesome, or like a lore dump. Write natural spoken dialogue, not lists, markdown, or stage directions. Reply as a single paragraph.""",
     "selectors": ("hikari-chan", "hikarichan", "hikari", "hikky-c", "hikkyc", "hikky c", "hikkyc2",
                   "hikari-jen", "hikarijen", "hickeyc"),
+    # Voice-acting addendum (kept OUT of system_prompt so the verbatim original stays byte-identical). Sent as
+    # its own system line for any persona whenever Fish Drama-3 / S2 vocal tags are on (AICompanion._messages).
+    "vocal_cues": "Voice note: you may add a sparse inline vocal cue in square brackets only where it truly fits, "
+                  "like [giggles], [playful, teasing], [soft sigh] or [gasps, excited]; at most one or two per reply.",
 }
 
 DEFAULT_PERSONA = HIKARI_PERSONALITY["system_prompt"]
@@ -107,6 +111,7 @@ DEFAULT_AI_CFG: dict = {
     "fishTtsTransport": "sse",      # sse | ws | http
     "fishLatency": "balanced",      # normal | balanced | low
     "fishChunkLength": 160,
+    "fishVocalTags": True,          # Drama-3 inline [directions] / S2 [emotion] tags are voiced (stripped elsewhere)
     # Decision Model (modules/decision_engine.py): decisionMode, decisionModel, autonomousGestures,
     # autoWaveOnGreeting, autoIdleEmotes, cooldowns...
     **DECISION_DEFAULTS,
@@ -135,16 +140,226 @@ TAG_TO_STATE = {
 }
 
 
+# --------------------------------------------------------------------------- vocal expression tags
+# Any square-bracket cue: classic stage tags ([happy]) and free-form Drama-3 directions ([giggling softly, playful]).
+_MD_RE = re.compile(r"[*_`#>]+")
+_CUE_UNSAFE_RE = re.compile(r"[^\w\s,.'!?&-]+", re.UNICODE)
+
+# Official Fish S2 / S2.1-Pro bracket tags.
+S2_TAGS: tuple[str, ...] = (
+    "happy", "excited", "sad", "angry", "calm", "nervous", "confident", "surprised", "worried", "frustrated",
+    "laughing", "giggling", "sighing", "whisper", "gasps",
+)
+
+# Stage-only tags (rig / emote names) -> natural Drama-3 voice-actor directions.
+STAGE_TO_DRAMA: dict[str, str] = {
+    "wave": "bright, warm friendly wave",
+    "greet_wave": "bright, warm friendly wave",
+    "wink_wave": "bright, warm friendly wave",
+    "sparkle": "amazed, starry-eyed wonder",
+    "starry_eyes": "amazed, starry-eyed wonder",
+    "starry_awe": "amazed, starry-eyed wonder",
+    "awe": "amazed, starry-eyed wonder",
+    "cat_smug": "playful, teasing smirk",
+    "smug": "playful, teasing smirk",
+    "smug_tease": "playful, teasing smirk",
+    "blush": "soft, flustered, shy",
+    "shy": "soft, flustered, shy",
+    "shy_blush": "soft, flustered, shy",
+    "flustered": "flustered, stammering",
+    "cheer": "excited, cheering",
+    "cheer_bounce": "excited, cheering",
+    "pout": "pouty, sulking",
+    "pout_puff": "pouty, sulking",
+    "sleepy": "sleepy, drowsy yawn",
+    "sleepy_yawn": "sleepy, drowsy yawn",
+    "caring": "gentle, caring",
+    "curious": "curious, intrigued",
+    "neutral": "",
+}
+
+# Fallback emotion (TAG_TO_STATE tag or Decision Engine emotion) -> concise Drama-3 direction.
+EMOTION_TO_DRAMA: dict[str, str] = {
+    "happy": "warm, cheerful", "excited": "excited, bubbly", "cheer": "excited, cheering",
+    "wave": "bright, warm friendly", "greeting": "bright, warm friendly", "farewell": "warm, fond goodbye",
+    "blush": "soft, flustered, shy", "shy": "soft, flustered, shy", "flustered": "flustered, stammering",
+    "sparkle": "amazed, starry-eyed wonder", "awe": "amazed, starry-eyed wonder",
+    "smug": "playful, teasing smirk", "playful": "playful, teasing", "amused": "amused, giggling",
+    "pout": "pouty, sulking", "angry": "huffy, indignant", "surprised": "surprised, gasping",
+    "sleepy": "sleepy, drowsy", "sad": "soft, sad", "gloomy": "soft, sad", "curious": "curious, intrigued",
+    "caring": "gentle, caring", "grateful": "warm, touched", "love": "soft, affectionate",
+    "nervous": "nervous, awkward", "singing": "light, sing-song",
+}
+
+# Keyword -> official S2 tag, checked in order (vocalizations first, then emotions).
+_S2_KEYWORDS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("giggl", "titter"), "giggling"),
+    (("laugh", "chuckl", "snicker", "cackl", "haha"), "laughing"),
+    (("whisper", "hush", "murmur"), "whisper"),
+    (("sigh", "exhal"), "sighing"),
+    (("gasp",), "gasps"),
+    (("surpris", "shock", "startl", "wow", "stunned"), "surprised"),
+    (("excit", "cheer", "hype", "thrill", "eager", "bubbly", "amazed", "starry", "wonder", "awe", "sparkle"), "excited"),
+    (("frustrat", "exasperat"), "frustrated"),
+    (("angry", "anger", "mad", "furious", "fuming", "huff", "indignant", "annoy", "pout", "sulk", "grump"), "angry"),
+    (("sad", "gloom", "sorrow", "tear", "cry", "melanchol", "hurt"), "sad"),
+    (("worr", "concern", "uneasy"), "worried"),
+    (("nervous", "fluster", "stammer", "anxious", "shy", "blush", "bashful", "awkward", "embarrass"), "nervous"),
+    (("confident", "smug", "teas", "smirk", "cocky", "proud", "sassy", "playful", "mischiev"), "confident"),
+    (("calm", "gentle", "soft", "sooth", "caring", "tender", "relax", "sleepy", "drowsy"), "calm"),
+    (("happy", "joy", "warm", "bright", "cheerful", "friendly", "wave", "delight", "glad", "fond", "affection"), "happy"),
+)
+
+# Inline vocal cue -> TAG_TO_STATE tag (exact stage tags first, then aliases, then keywords in order).
+_STATE_ALIASES: dict[str, str] = {
+    "cat_smug": "smug", "smug_tease": "smug", "teasing": "smug", "greet_wave": "wave", "wink_wave": "wave",
+    "starry_eyes": "sparkle", "starry_awe": "awe", "shy_blush": "blush", "cheer_bounce": "cheer",
+    "pout_puff": "pout", "sleepy_yawn": "sleepy", "angry": "pout", "nervous": "flustered", "calm": "neutral",
+}
+_STATE_KEYWORDS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("excit", "hype", "thrill", "cheer", "bubbly"), "excited"),
+    (("laugh", "giggl", "chuckl", "snicker", "haha"), "happy"),
+    (("gasp", "surpris", "shock", "startl", "wow"), "surprised"),
+    (("whisper", "hush", "bashful", "shy", "blush"), "shy"),
+    (("fluster", "stammer", "nervous", "anxious", "awkward", "embarrass"), "flustered"),
+    (("teas", "smirk", "smug", "playful", "mischiev", "sassy", "cocky"), "smug"),
+    (("yawn", "sleepy", "drowsy", "tired"), "sleepy"),
+    (("sigh", "sad", "gloom", "sorrow", "tear", "cry", "melanchol"), "sad"),
+    (("pout", "sulk", "huff", "angry", "mad", "annoy", "grump", "frustrat"), "pout"),
+    (("amazed", "starry", "wonder", "awe"), "awe"),
+    (("curious", "intrigu"), "curious"),
+    (("caring", "gentle", "tender", "sooth", "worr", "concern"), "caring"),
+    (("happy", "joy", "warm", "bright", "cheerful", "friendly", "delight", "glad"), "happy"),
+)
+
+
+def _cue_key(cue: str) -> str:
+    return re.sub(r"[\s-]+", "_", (cue or "").strip().lower())
+
+
+def _keyword_lookup(cue: str, table: tuple[tuple[tuple[str, ...], str], ...]) -> str:
+    low = (cue or "").lower()
+    for words, tag in table:
+        if any(w in low for w in words):
+            return tag
+    return ""
+
+
+def cue_to_state_tag(cue: str) -> str:
+    """Map a bracket cue (stage tag or free-form Drama-3 direction) to a TAG_TO_STATE key ("" if unknown)."""
+    key = _cue_key(cue)
+    if key in TAG_TO_STATE:
+        return key
+    if key in _STATE_ALIASES:
+        return _STATE_ALIASES[key]
+    return _keyword_lookup(cue, _STATE_KEYWORDS)
+
+
+def cue_to_s2_tag(cue: str) -> str:
+    """Closest official S2 bracket tag for any cue ("" = unknown, strip it)."""
+    key = _cue_key(cue)
+    if key in S2_TAGS:
+        return key
+    return _keyword_lookup(cue, _S2_KEYWORDS)
+
+
+def _sanitize_drama_cue(cue: str) -> str:
+    """Keep a clean, short plain-language direction (no markup / control chars)."""
+    c = _CUE_UNSAFE_RE.sub(" ", cue or "").replace("_", " ")
+    c = re.sub(r"\s+", " ", c).strip(" ,.")
+    return c[:60].rstrip(" ,")
+
+
+def _fish_model_family(fish_model: str) -> str:
+    m = (fish_model or "").strip().lower()
+    if m.startswith("drama"):
+        return "drama"
+    if m.startswith("s2"):
+        return "s2"
+    return "other"
+
+
+def _tidy_spoken(text: str) -> str:
+    t = re.sub(r"\s+", " ", text or "")
+    t = re.sub(r"\s+([,.!?…~;:])", r"\1", t)
+    return t.strip()
+
+
+def strip_vocal_tags(text: str) -> str:
+    """Display / non-Fish text: every [...] cue and markdown mark removed, spacing tidied."""
+    return _tidy_spoken(_MD_RE.sub("", ANY_TAG_RE.sub(" ", text or "")))
+
+
+def prepare_tts_text(reply: str, *, tts_provider: str = "fish", fish_model: str = "drama-3",
+                     fallback_emotion: str = "", vocal_tags_enabled: bool = True) -> str:
+    """Text handed to the TTS engine.
+    - non-Fish provider or tags disabled: all [...] cues stripped (Windows / OpenAI never read brackets aloud).
+    - Fish drama-3: natural inline [directions] kept (sanitized), stage-only tags translated to voice directions;
+      with no cue at all and a non-neutral fallback_emotion, one concise direction is prepended.
+    - Fish s2 / s2.1-pro: every cue mapped to the closest official S2 tag; unknown cues stripped (same fallback).
+    - other Fish models (legacy S1 used (...) cues): stripped."""
+    text = reply or ""
+    family = _fish_model_family(fish_model)
+    if str(tts_provider or "").strip().lower() != "fish" or not vocal_tags_enabled or family == "other":
+        return strip_vocal_tags(text)
+
+    def convert(cue: str) -> str:
+        if family == "drama":
+            key = _cue_key(cue)
+            if key in STAGE_TO_DRAMA:
+                d = STAGE_TO_DRAMA[key]
+                return f"[{d}]" if d else ""
+            d = _sanitize_drama_cue(cue)
+            return f"[{d}]" if d else ""
+        tag = cue_to_s2_tag(cue)
+        return f"[{tag}]" if tag else ""
+
+    parts: list[str] = []
+    pos, found = 0, False
+    for m in ANY_TAG_RE.finditer(text):
+        found = True
+        parts.append(_MD_RE.sub("", text[pos:m.start()]))
+        cue = convert(m.group(1))
+        if cue:
+            parts.append(f" {cue} ")
+        pos = m.end()
+    parts.append(_MD_RE.sub("", text[pos:]))
+    out = _tidy_spoken("".join(parts))
+    if not found:
+        emo = _cue_key(fallback_emotion)
+        if emo and emo != "neutral" and out:
+            if family == "drama":
+                d = EMOTION_TO_DRAMA.get(emo) or _sanitize_drama_cue(emo)
+                prefix = f"[{d}]" if d else ""
+            else:
+                tag = cue_to_s2_tag(f"{emo} {EMOTION_TO_DRAMA.get(emo, '')}")
+                prefix = f"[{tag}]" if tag else ""
+            if prefix:
+                out = f"{prefix} {out}"
+    return out if strip_vocal_tags(out) else ""      # a reply that was only cues has nothing to say
+
+
 def resolve_local_fish_key() -> str:
     """Fish Audio API key, strictly server-side (env or Documents/treblo/.env.local, cached once)."""
     return server_keys.first("FISH_API_KEY", "FISH_AUDIO_API_KEY", "FISH_SPEECH_API_KEY", "FISHSPEECH_API_KEY")
 
 
+def explicit_cue_tag(text: str) -> str:
+    """First recognizable bracket cue, or empty when the decision engine should choose."""
+    for match in ANY_TAG_RE.finditer(text or ""):
+        tag = cue_to_state_tag(match[1])
+        if tag:
+            return tag
+    return ""
+
+
 def parse_emotion_and_clean(text: str) -> tuple[str, str, dict]:
-    m = TAG_RE.search(text)
-    if m:
-        tag = m.group(1).lower()
-    else:
+    """(display text with EVERY [...] cue stripped, state tag, TAG_TO_STATE entry). The tag comes from the first
+    recognizable cue: classic tags ([happy], [smug]) or inline Drama-3 directions ([giggling softly] -> happy,
+    [gasps] -> surprised, [whisper] -> shy, [teasing] -> smug, [soft sigh] -> sad...)."""
+    text = text or ""
+    tag = explicit_cue_tag(text)
+    if not tag:
         # No explicit cue (Hikari's verbatim persona forbids stage directions): use the
         # Decision Engine's local classifier so tags and autonomous emotes always agree.
         from modules.decision_engine import EMOTIONS, classify_text
@@ -152,8 +367,7 @@ def parse_emotion_and_clean(text: str) -> tuple[str, str, dict]:
         tag = EMOTIONS.get(emo, EMOTIONS["happy"])["tag"]
         if tag == "neutral":
             tag = "happy"
-    clean = TAG_RE.sub("", text).strip()
-    clean = re.sub(r"\s{2,}", " ", clean)
+    clean = _tidy_spoken(ANY_TAG_RE.sub(" ", text))
     return clean, tag, TAG_TO_STATE.get(tag, TAG_TO_STATE["happy"])
 
 
@@ -202,6 +416,25 @@ SAPI_TTS_SCRIPT = (
 )
 
 
+def attach_image(messages: list[dict[str, Any]], image_data_url: str | None) -> list[dict[str, Any]]:
+    """OpenAI-compatible multimodal turn: the LAST user message becomes
+    [{"type": "text", ...}, {"type": "image_url", "image_url": {"url": ...}}]. Returns a copy, so self.history
+    keeps plain text only (base64 screenshots never bloat history or persisted memory)."""
+    url = (image_data_url or "").strip()
+    if not url or not (url.startswith("data:image/") or url.startswith("https://")):
+        return messages
+    out = list(messages)
+    for i in range(len(out) - 1, -1, -1):
+        m = out[i]
+        if m.get("role") == "user":
+            if isinstance(m.get("content"), list):          # already multimodal
+                return out
+            out[i] = {**m, "content": [{"type": "text", "text": str(m.get("content") or "")},
+                                       {"type": "image_url", "image_url": {"url": url}}]}
+            return out
+    return out
+
+
 class AICompanion:
     def __init__(self, audio_dir: Path) -> None:
         self.audio_dir = audio_dir
@@ -246,7 +479,19 @@ class AICompanion:
     @property
     def voices_inline(self) -> bool:
         """True when replies are voiced while the LLM streams (Vercel + Fish TTS)."""
-        return self.brain_mode == "vercel_fish"
+        return self.brain_mode == "vercel_fish" and str(self.cfg.get("ttsProvider", "fish")).lower() == "fish"
+
+    @property
+    def vocal_cues_active(self) -> bool:
+        """Fish TTS with a tag-aware model (drama-3 / s2*) and fishVocalTags on: the LLM may add [cues]."""
+        return (str(self.cfg.get("ttsProvider", "fish")).lower() == "fish" and bool(self.cfg.get("fishVocalTags", True))
+                and _fish_model_family(str(self.cfg.get("fishModel") or "drama-3")) != "other")
+
+    def tts_text(self, text: str, emotion: str = "") -> str:
+        """prepare_tts_text with this companion's current voice settings."""
+        return prepare_tts_text(text, tts_provider=str(self.cfg.get("ttsProvider", "fish")),
+                                fish_model=str(self.cfg.get("fishModel") or "drama-3"), fallback_emotion=emotion,
+                                vocal_tags_enabled=bool(self.cfg.get("fishVocalTags", True)))
 
     def clear_history(self) -> None:
         self.history.clear()
@@ -353,16 +598,18 @@ class AICompanion:
         pinned, dynamic = self._split_context(context)
         hist = list(self.history[-self.history_turns:])
         msgs = [{"role": "system", "content": self.persona}]
+        if self.vocal_cues_active:
+            msgs.append({"role": "system", "content": HIKARI_PERSONALITY["vocal_cues"]})
         if pinned:
             msgs.append({"role": "system", "content": pinned})
         if dynamic and hist and hist[-1]["role"] == "user":
             return [*msgs, *hist[:-1], {"role": "system", "content": dynamic}, hist[-1]]
         return [*msgs, *([{"role": "system", "content": dynamic}] if dynamic else []), *hist]
 
-    def _llm_request(self, context: Any) -> tuple[str, dict, dict]:
-        return self.gateway.chat_request(self._messages(context), stream=True)
+    def _llm_request(self, context: Any, image_data_url: str | None = None) -> tuple[str, dict, dict]:
+        return self.gateway.chat_request(attach_image(self._messages(context), image_data_url), stream=True)
 
-    async def generate_reply(self, user_message: str, context: Any = "") -> str:
+    async def generate_reply(self, user_message: str, context: Any = "", image_data_url: str | None = None) -> str:
         """Text-only reply (TTS happens later in speak_text). Returns "" (and sets last_error) on failure."""
         mode = self.brain_mode
         self.last_error = ""
@@ -370,17 +617,18 @@ class AICompanion:
         if mode == "vercel_fish":
             where = "Vercel AI Gateway"
             try:
-                endpoint, headers, payload = self._llm_request(context)
+                endpoint, headers, payload = self._llm_request(context, image_data_url)
                 reply = (await complete_openai_compat(endpoint, headers, dict(payload, stream=False))).strip()
             except Exception as exc:
                 return self._fail(f"Couldn't reach {where} ({exc.__class__.__name__}). Check AI & Voice settings!")
             if not reply:
                 return self._fail(f"{where} returned an empty reply.")
             return await self._finish(reply)
-        return await self._generate_legacy(user_message, context)
+        return await self._generate_legacy(user_message, context, image_data_url)
 
     async def generate_reply_with_voice(self, user_message: str, context: Any = "",
-                                        on_segment: Any = None) -> tuple[str, Path | None]:
+                                        on_segment: Any = None,
+                                        image_data_url: str | None = None) -> tuple[str, Path | None]:
         """Vercel LLM streamed straight into Fish Speech TTS (sentence overlap).
         With `on_segment(pcm, rate, text, index)` each sentence is handed over IN ORDER as soon as it is
         synthesized (playback starts while later sentences are still being written); otherwise one WAV.
@@ -395,7 +643,7 @@ class AICompanion:
         streamed: list[str] = []
         voiced: list[str] = []
         try:
-            endpoint, headers, payload = self._llm_request(context)
+            endpoint, headers, payload = self._llm_request(context, image_data_url)
         except Exception as exc:
             return self._fail(f"Couldn't reach {where} ({exc.__class__.__name__}). Check AI & Voice settings!"), None
 
@@ -410,7 +658,7 @@ class AICompanion:
 
         gen = deltas()
         reply, wav, err = "", None, ""
-        if self.cfg.get("ttsEnabled", True) and self.fish_tts.configured:
+        if self.voices_inline and self.cfg.get("ttsEnabled", True) and self.fish_tts.configured:
             try:
                 reply, pcm, rate = await self.fish_tts.speak_stream(gen, on_segment=seg_cb if on_segment else None)
                 if on_segment is None:
@@ -443,18 +691,26 @@ class AICompanion:
         voiced_text = " ".join(voiced).strip()
         unvoiced = ""
         if on_segment is not None:
-            spoken = clean_for_speech(reply)
             if not voiced_text:
-                unvoiced = spoken
+                unvoiced = reply
             elif err:
-                unvoiced = find_overlapping_suffix(voiced_text, spoken).strip()
+                # Locate the playback boundary without losing remaining inline directions.
+                masked = ANY_TAG_RE.sub(lambda m: " " * len(m[0]), reply)
+                spoken_chars = re.finditer(r"[^\s*_`#>]", masked)
+                end = 0
+                for _ in "".join(voiced_text.split()):
+                    char = next(spoken_chars, None)
+                    if char is None:
+                        break
+                    end = char.end()
+                unvoiced = reply[end:].strip()
         self.last_turn = {"brainMode": mode, "ms": round((time.perf_counter() - t0) * 1000.0, 1),
                           "voicedInline": wav is not None or (bool(voiced) and not unvoiced), "segmented": on_segment is not None,
                           "segments": len(voiced), "voicedText": voiced_text, "unvoiced": unvoiced,
                           "error": err, "tts": dict(self.fish_tts.last_stats)}
         return reply, wav
 
-    async def _generate_legacy(self, user_message: str, context: Any = "") -> str:
+    async def _generate_legacy(self, user_message: str, context: Any = "", image_data_url: str | None = None) -> str:
         provider = str(self.cfg.get("provider", "offline")).lower()
 
         if provider == "offline":
@@ -483,7 +739,7 @@ class AICompanion:
 
         payload = {
             "model": str(self.cfg.get("model") or "gpt-4o-mini"),
-            "messages": self._messages(context),
+            "messages": attach_image(self._messages(context), image_data_url),
             "temperature": float(self.cfg.get("temperature", 0.82)),
             "max_tokens": int(self.cfg.get("maxTokens", 180)),
         }
@@ -519,8 +775,14 @@ class AICompanion:
         await asyncio.to_thread(raw_tmp.unlink, True)
         return await asyncio.to_thread(self._ok_wav, wav_out, 2000)
 
-    async def synthesize_tts(self, text: str) -> Path | None:
-        if not self.cfg.get("ttsEnabled", True) or not text.strip():
+    async def synthesize_tts(self, text: str, *, emotion: str = "") -> Path | None:
+        """Voice `text`. Fish drama-3 / s2 keep (or map) [vocal cues] via prepare_tts_text (cfg fishVocalTags);
+        every other engine gets them stripped. Optional `emotion` adds a matching direction when the text has no
+        cue of its own (pass the raw reply instead of the display text to keep the LLM's inline directions)."""
+        if not self.cfg.get("ttsEnabled", True) or not (text or "").strip():
+            return None
+        plain = strip_vocal_tags(text)
+        if not plain:
             return None
         uid = f"tts_{int(time.time())}_{uuid.uuid4().hex[:6]}"
         wav_out = self.audio_dir / f"{uid}.wav"
@@ -532,7 +794,7 @@ class AICompanion:
             fkey = self._effective_fish_key()
             url = str(self.cfg.get("fishUrl") or "https://api.fish.audio/v1/tts").strip()
             model_hdr = str(self.cfg.get("fishModel") or "drama-3").strip()
-            ref_id = str(self.cfg.get("fishReferenceId") or HIKARI_FISH_VOICE_ID).strip()
+            ref_id = str(self.cfg.get("fishReferenceId") or "").strip()
             speed = max(0.5, min(2.0, float(self.cfg.get("fishSpeed", 1.0))))
             headers = {
                 "Content-Type": "application/json",
@@ -542,7 +804,8 @@ class AICompanion:
             if fkey:
                 headers["Authorization"] = f"Bearer {fkey}"
             body: dict = {
-                "text": clean_for_speech(text),
+                "text": prepare_tts_text(text, tts_provider="fish", fish_model=model_hdr, fallback_emotion=emotion,
+                                         vocal_tags_enabled=bool(self.cfg.get("fishVocalTags", True))) or plain,
                 "format": "wav",
                 "normalize": True,
                 "latency": "low",
@@ -569,7 +832,7 @@ class AICompanion:
                     r = await http_pool.client().post(
                         url,
                         headers={"Content-Type": "application/json", "Authorization": f"Bearer {akey}"},
-                        json={"model": "tts-1", "voice": str(self.cfg.get("openaiTtsVoice") or "nova"), "input": text, "response_format": "wav"},
+                        json={"model": "tts-1", "voice": str(self.cfg.get("openaiTtsVoice") or "nova"), "input": plain, "response_format": "wav"},
                         timeout=25.0,
                     )
                     r.raise_for_status()
@@ -587,7 +850,7 @@ class AICompanion:
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
                 env={**os.environ, "HIKARI_TTS_OUT": str(raw_wav)},
             )
-            await proc.communicate(text.encode("utf-8"))
+            await proc.communicate(plain.encode("utf-8"))
             if await asyncio.to_thread(self._ok_wav, raw_wav, 1000):
                 conv = await asyncio.create_subprocess_exec(
                     "ffmpeg", "-y", "-v", "error", "-i", str(raw_wav),

@@ -13,16 +13,19 @@ from __future__ import annotations
 
 import json
 import math
+import random
 from pathlib import Path
 import sys
 import tempfile
 from typing import Any
+from types import SimpleNamespace
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE / "tests"))
 
-from test_wave_decisioning import CLOCK, DT, new_rig  # noqa: E402  (installs the virtual clock)
+from test_wave_decisioning import CLOCK, DT, new_rig as make_rig  # noqa: E402  (installs the virtual clock)
 from core.rig_controller import IDLE_TRACKS, MOTION_TRACKS, prepare_idle_clip, validate_motion_clip  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []
@@ -88,6 +91,14 @@ def test_prepare() -> None:
     check("prepare. loop point is seamless (seam no bigger than a normal frame step)", seam <= step * 1.5 + 1e-6,
           f"seam {seam:.3f} step {step:.3f}")
     check("prepare. loop is shorter than the clip by the 1 s crossfade", c["frames"] == 8 * 60 - 60, str(c["frames"]))
+
+
+def new_rig():
+    # Compare the same procedural motion with and without the clip. Phase offsets
+    # and idle schedules are sampled during construction, before the first step.
+    CLOCK.now = 1000.0
+    with patch("core.rig_controller.random", SimpleNamespace(Random=lambda: random.Random(42))):
+        return make_rig()
 
 
 def test_rig(tmp: Path) -> None:
@@ -176,7 +187,7 @@ def test_restore(tmp: Path) -> None:
         def __init__(self) -> None:
             self.loaded: Path | None = None
 
-        def set_idle_clip(self, path: Path | None) -> dict[str, Any]:
+        def set_idle_clip(self, path: Path | None, phrase_sec: float = 4.5) -> dict[str, Any]:
             self.loaded = path
             return {}
 

@@ -852,3 +852,32 @@ kbd {
 .s-row.vd-msg.err { background: rgba(255, 92, 114, 0.07); box-shadow: inset 2px 0 0 var(--danger); }
 .s-row.vd-msg.err .s-desc { color: var(--danger); }
 @media (max-width: 560px) { .fv-bar { flex-wrap: wrap; } .fv-bar > .seg { margin-right: 0; } }
+
+/* ───────── Screen Vision eye button (talk bar) ───────── */
+.bar-btn.vision.armed { color: var(--accent-2-ink); background: var(--accent-2); box-shadow: 0 0 14px rgba(123, 228, 255, 0.4); }
+.bar-btn.vision.busy svg { animation: breathe 1.2s ease-in-out infinite; }
+
+/* ───────── Living Motion badge · voice sync hint · temporal memory pill ───────── */
+.live-badge {
+  display: inline-flex; align-items: center; height: 20px; padding: 0 8px; margin-right: 8px; border-radius: 999px;
+  font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap;
+  color: var(--accent-2); background: rgba(123, 228, 255, 0.12); border: 1px solid rgba(123, 228, 255, 0.25);
+}
+.voice-sync-hint .s-desc { display: flex; align-items: center; gap: 7px; font-size: 12px; }
+.sync-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent-2); flex-shrink: 0; box-shadow: 0 0 6px rgba(123, 228, 255, 0.6); }
+.badge.temporal-pill {
+  margin-right: 6px; text-transform: lowercase; letter-spacing: 0.01em;
+  color: var(--accent-2); background: rgba(123, 228, 255, 0.1); border: 1px solid rgba(123, 228, 255, 0.22);
+}
+
+/* ───────── Character Profiles (Look & Props → Puppet Library) ───────── */
+.profile-list { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+.profile-card {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 10px 9px 12px;
+  border-radius: 10px; background: var(--card-hover); border: 1px solid var(--line); transition: border-color 160ms;
+}
+.profile-card.active { border-color: var(--accent); background: var(--accent-soft); }
+.profile-text { min-width: 0; }
+.profile-name { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.profile-meta { font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.profile-actions { display: flex; gap: 6px; flex-shrink: 0; }

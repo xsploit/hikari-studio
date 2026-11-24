@@ -20,6 +20,7 @@ harmonic vowel spectra.
 from __future__ import annotations
 
 from collections import deque
+from functools import lru_cache
 import copy
 import json
 import math
@@ -366,6 +367,248 @@ def default_calibration(analyzer: MfccAnalyzer | None = None) -> dict[str, list[
 
 
 # ===========================================================================
+# Causal prosody (Super Star / EchoAvatar 2026 style prosody-to-body features)
+# ===========================================================================
+
+PROSODY_FIELDS = ("pitchNorm", "pitchSlope", "stressOnset", "speechRate", "emphasis")
+PROSODY_WINDOW_SEC = 0.043          # causal analysis window: the newest ~43 ms, never any future sample
+_PROSODY_RATE = 12_000              # decimated pitch-analysis rate
+_PROSODY_F0 = (80.0, 620.0)
+@lru_cache(maxsize=16)
+def _prosody_window(n: int) -> np.ndarray:
+    return np.hanning(n).astype(np.float32)
+
+
+class CausalProsody:
+    """Strictly causal, zero-lookahead prosody tracker (one call per 60 FPS frame, well under 0.5 ms).
+
+    ``update(frame, sr, dt)`` takes the NEWEST samples only (the window ends "now") and returns:
+      pitchNorm   -1..+1  F0 in semitones relative to a running speaker median (+ = above her usual pitch)
+      pitchSlope  -1..+1  smoothed derivative of pitchNorm (+ = rising / question intonation)
+      stressOnset  0..1   positive energy-derivative impulse (stressed syllable attack), decays in ~90 ms
+      speechRate   0..1   smoothed syllable-onset rate (1.0 ~= 7 syllables / s)
+      emphasis     0..1   sustained loud + expressive phrase emphasis
+    Every field is exactly 0.0 while silent (backwards compatible defaults)."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.pitch_norm = 0.0
+        self.pitch_slope = 0.0
+        self.stress_onset = 0.0
+        self.speech_rate = 0.0
+        self.emphasis = 0.0
+        self.f0_hz = 0.0
+        self.median_st: float | None = None
+        self._voiced_time = 0.0
+        self._unvoiced_for = 1.0
+        self._pn_raw = 0.0
+        self._prev_pn: float | None = None
+        self._st_hist: deque[float] = deque(maxlen=3)
+        self._fast = 0.0
+        self._slow = 0.0
+        self._silent_for = 1.0
+        self._t = 0.0
+        self._last_syl = -1.0
+        self._syl_times: deque[float] = deque(maxlen=32)
+        self.cpu_ms = 0.0
+
+    def values(self) -> dict[str, float]:
+        return {"pitchNorm": self.pitch_norm, "pitchSlope": self.pitch_slope, "stressOnset": self.stress_onset,
+                "speechRate": self.speech_rate, "emphasis": self.emphasis}
+
+    @staticmethod
+    def estimate_f0(frame: np.ndarray, sr: int) -> float | None:
+        """Causal autocorrelation F0 (Hz) of the newest window, decimated to ~12 kHz; None when unvoiced."""
+        q = max(1, int(round(sr / _PROSODY_RATE)))
+        x = np.asarray(frame, dtype=np.float32)
+        if q > 1:
+            n = (len(x) // q) * q
+            x = x[len(x) - n:].reshape(-1, q).mean(axis=1)      # box anti-alias + decimate
+        rate = sr / q
+        n = len(x)
+        if n < 128:
+            return None
+        x = x - float(x.mean())
+        x = x * _prosody_window(n)
+        nfft = 1 << int(math.ceil(math.log2(2 * n)))
+        f = np.fft.rfft(x, nfft)
+        ac = np.fft.irfft(f.real * f.real + f.imag * f.imag, nfft)[: n // 2 + 2]
+        if ac[0] <= 1e-9:
+            return None
+        ac = ac / ac[0]
+        lo = max(2, int(rate / _PROSODY_F0[1]))
+        hi = min(len(ac) - 2, int(rate / _PROSODY_F0[0]))
+        if hi <= lo + 2:
+            return None
+        seg = ac[lo:hi]
+        best = float(seg.max())
+        if best < 0.40:
+            return None
+        mid = seg[1:-1]
+        peaks = np.nonzero((mid >= seg[:-2]) & (mid >= seg[2:]) & (mid >= 0.90 * best))[0]
+        k = int(peaks[0] + 1 + lo) if len(peaks) else int(np.argmax(seg) + lo)
+        a, b, c = float(ac[k - 1]), float(ac[k]), float(ac[k + 1])
+        den = a - 2.0 * b + c
+        lag = k + (0.5 * (a - c) / den if abs(den) > 1e-9 else 0.0)
+        return rate / max(1.0, lag)
+
+    def update(self, frame: np.ndarray | None, sr: int, dt: float, gate: float = 0.008,
+               gain: float = 1.0) -> dict[str, float]:
+        t0 = time.perf_counter()
+        dt = max(1e-4, min(0.1, float(dt)))
+        self._t += dt
+        level = 0.0
+        f0 = None
+        if frame is not None and sr > 0 and len(frame) >= 64:
+            w = np.asarray(frame, dtype=np.float32)
+            tail = w[-min(len(w), max(64, int(0.021 * sr))):]
+            rms = float(np.sqrt(np.mean(tail * tail) + 1e-12))
+            level = min(1.0, max(0.0, (rms - gate) * gain * 4.2))
+            if level > 0.04:
+                try:
+                    f0 = self.estimate_f0(w, sr)
+                except Exception:
+                    f0 = None
+
+        # --- energy envelopes -> stressed-syllable onsets + speech rate
+        self._fast += (level - self._fast) * (1.0 - math.exp(-dt / 0.015))
+        self._slow += (level - self._slow) * (1.0 - math.exp(-dt / 0.14))
+        impulse = max(0.0, min(1.0, 2.4 * (self._fast - self._slow) - 0.03))
+        self.stress_onset = max(impulse, self.stress_onset * math.exp(-dt / 0.09))
+        if impulse > 0.28 and self._t - self._last_syl > 0.11:
+            self._last_syl = self._t
+            self._syl_times.append(self._t)
+        while self._syl_times and self._t - self._syl_times[0] > 2.5:
+            self._syl_times.popleft()
+        rate_t = min(1.0, (len(self._syl_times) / 2.5) / 7.0)
+        self.speech_rate += (rate_t - self.speech_rate) * (1.0 - math.exp(-dt / 0.35))
+
+        # --- pitch relative to a running speaker median (semitones)
+        if f0 is not None:
+            self.f0_hz = f0
+            st = 12.0 * math.log2(f0 / 100.0)
+            if self._unvoiced_for > 0.2:
+                self._st_hist.clear()
+                self._prev_pn = None
+            if self._st_hist and abs(st - self._st_hist[-1]) > 7.0:     # octave error / glitch: hold
+                st = self._st_hist[-1]
+            self._st_hist.append(st)
+            st_m = sorted(self._st_hist)[len(self._st_hist) // 2]
+            if self.median_st is None:
+                self.median_st = st_m
+            else:
+                speed = 3.0 if self._voiced_time < 1.5 else 1.2          # semitones / s (stochastic median)
+                d = st_m - self.median_st
+                self.median_st += math.copysign(min(abs(d), speed * dt), d)
+            self._voiced_time += dt
+            self._unvoiced_for = 0.0
+            pn_t = max(-1.0, min(1.0, (st_m - self.median_st) / 6.0))
+            self._pn_raw += (pn_t - self._pn_raw) * (1.0 - math.exp(-dt / 0.05))
+            if self._prev_pn is not None:
+                dpn = (self._pn_raw - self._prev_pn) / dt
+                sl_t = max(-1.0, min(1.0, dpn * 0.6))
+                self.pitch_slope += (sl_t - self.pitch_slope) * (1.0 - math.exp(-dt / 0.15))
+            self._prev_pn = self._pn_raw
+        else:
+            self._unvoiced_for += dt
+            self.pitch_slope *= math.exp(-dt / 0.2)
+            if self._unvoiced_for > 0.2:
+                self._pn_raw *= math.exp(-dt / 0.15)
+        self.pitch_norm = self._pn_raw
+
+        # --- sustained loud + expressive emphasis
+        loud = max(0.0, min(1.0, (self._slow - 0.28) / 0.5))
+        expr = min(1.0, 0.45 + 1.2 * abs(self.pitch_norm) + 1.5 * abs(self.pitch_slope))
+        e_t = loud * expr
+        tau = 0.5 if e_t > self.emphasis else 0.35
+        self.emphasis += (e_t - self.emphasis) * (1.0 - math.exp(-dt / tau))
+
+        # --- exact zeros in silence
+        if level <= 0.0:
+            self._silent_for += dt
+        else:
+            self._silent_for = 0.0
+        if self._silent_for > 0.6:                          # speech ended: the syllable window empties
+            self._syl_times.clear()
+            for name in ("pitch_norm", "pitch_slope", "stress_onset", "speech_rate", "emphasis", "_pn_raw"):
+                if abs(getattr(self, name)) < 2e-3 or self._silent_for > 1.0:
+                    setattr(self, name, 0.0)
+        if self.median_st is None:
+            self.pitch_norm = self.pitch_slope = 0.0
+        self.cpu_ms = (time.perf_counter() - t0) * 1000.0
+        return self.values()
+
+
+class UserVoiceActivity:
+    """Tiny user-voice VAD for visual backchanneling: feed mic / call RMS, get speech -> micro-pause pulses.
+
+    A pulse fires ONCE when the user has talked >= 0.4 s and then paused for 0.25 s (well inside a 0.25-0.6 s
+    micro-pause, before a full turn end). Consumers compare ``pulses`` with their last seen count: no polling."""
+
+    PAUSE_FIRE_SEC = 0.25
+    MIN_SPEECH_SEC = 0.4
+
+    def __init__(self) -> None:
+        self.energy = 0.0
+        self.floor = 0.004
+        self.active = False
+        self.speech_since = 0.0
+        self.speech_len = 0.0
+        self.silent_since = 0.0
+        self.pulses = 0
+        self.last_pulse_t = 0.0
+        self._armed = False
+        self._last_t: float | None = None
+
+    def feed(self, rms: float, t: float) -> bool:
+        """Returns True when this sample fired a micro-pause pulse."""
+        try:
+            rms = float(rms)
+        except (TypeError, ValueError):
+            rms = 0.0
+        rms = max(0.0, rms) if math.isfinite(rms) else 0.0
+        dt = 0.016 if self._last_t is None else max(1e-4, min(0.25, t - self._last_t))
+        self._last_t = t
+        self.energy += (rms - self.energy) * (1.0 - math.exp(-dt / 0.04))
+        if not self.active:                                   # noise floor follows the quiet level only
+            k = 0.5 if self.energy < self.floor else 0.02
+            self.floor += (self.energy - self.floor) * min(1.0, k * dt * 10.0)
+        self.floor = max(0.002, min(0.05, self.floor))
+        on_th = max(0.012, self.floor * 3.0)
+        off_th = on_th * 0.6
+        if not self.active and self.energy > on_th:
+            self.note(True, t)
+        elif self.active and self.energy < off_th:
+            self.note(False, t)
+        return self.tick(t)
+
+    def note(self, active: bool, t: float) -> None:
+        if active and not self.active:
+            self.active = True
+            self.speech_since = t
+        elif not active and self.active:
+            self.active = False
+            self.speech_len = t - self.speech_since
+            self.silent_since = t
+            self._armed = self.speech_len >= self.MIN_SPEECH_SEC
+
+    def tick(self, t: float) -> bool:
+        if self._armed and not self.active and t - self.silent_since >= self.PAUSE_FIRE_SEC:
+            self._armed = False
+            self.pulses += 1
+            self.last_pulse_t = t
+            return True
+        return False
+
+    def state(self, t: float) -> dict[str, Any]:
+        return {"active": self.active, "energy": round(self.energy, 5), "pulses": self.pulses,
+                "pauseFor": round(t - self.silent_since, 3) if not self.active else 0.0,
+                "speakingFor": round(t - self.speech_since, 3) if self.active else 0.0}
+
+
+# ===========================================================================
 # Live engine
 # ===========================================================================
 
@@ -442,7 +685,12 @@ class LiveLipSyncEngine:
             "open": 0.0, "form": 0.08, "funnel": 0.0, "x": 0.0, "shrug": 0.0, "tongue": 0.0,
             "press": 0.0, "energy": 0.0, "stress": 0.0, "onset": 0.0,
             "pitch": 0.42, "voiced": 0.0, "brightness": 0.5,
+            "pitchNorm": 0.0, "pitchSlope": 0.0, "stressOnset": 0.0, "speechRate": 0.0, "emphasis": 0.0,
         }
+        # Causal prosody-to-body features (zero lookahead) + user-voice VAD for visual backchanneling
+        self.prosody = CausalProsody()
+        self._prosody_snapshot = self._prosody_status_snapshot()
+        self.user_voice = UserVoiceActivity()
 
     # ------------------------------------------------------------------ config
     def update_config(self, patch: dict) -> None:
@@ -1034,6 +1282,8 @@ class LiveLipSyncEngine:
         self.live_onset = 0.0
         self._frame_pitch = None
         self._frame_bright = None
+        pros_frame: np.ndarray | None = None          # newest samples only (window ends "now"): strictly causal
+        pros_sr = 0
 
         if hold and hold in visemes:
             code = hold
@@ -1044,6 +1294,7 @@ class LiveLipSyncEngine:
         elif fish_active and fish_ring is not None:
             # Live Fish Audio Drama 3 / Live 3 remote 48 kHz PCM stream
             ordered = np.roll(fish_ring, -fish_pos)
+            pros_frame, pros_sr = ordered[-int(PROSODY_WINDOW_SEC * 48000):], 48000
             long_n = self.mfcc.window_len(48000)
             code, rms, bands, tgt, probs = self.analyze_frame(
                 ordered[-1024:], 48000, ordered[-long_n:] if need_long and long_n else None, engine)
@@ -1056,6 +1307,7 @@ class LiveLipSyncEngine:
                     self._playing = False
             else:
                 idx = int(elapsed * sr)
+                pros_frame, pros_sr = pcm[max(0, idx - int(PROSODY_WINDOW_SEC * sr)):idx], sr
                 win_n = 1024
                 i0 = max(0, idx - win_n // 2)
                 chunk = pcm[i0:i0 + win_n]
@@ -1099,6 +1351,7 @@ class LiveLipSyncEngine:
                     probs = spec_probs
         elif mic_on and mic_ring is not None:
             ordered = np.roll(mic_ring, -mic_pos)
+            pros_frame, pros_sr = ordered[-int(PROSODY_WINDOW_SEC * self._mic_sr):], self._mic_sr
             long_n = self.mfcc.window_len(self._mic_sr)
             code, rms, bands, tgt, probs = self.analyze_frame(
                 ordered[-1024:], self._mic_sr, ordered[-long_n:] if need_long and long_n else None, engine)
@@ -1162,6 +1415,12 @@ class LiveLipSyncEngine:
         elif self._unvoiced_for > 0.4:
             self._bright_s += (0.5 - self._bright_s) * (1.0 - math.exp(-dtc / 0.6))
 
+        try:
+            pros = self.prosody.update(pros_frame, pros_sr, dt, float(cfg["noiseGate"]), float(cfg["gain"]))
+        except Exception:                                  # never let prosody break lip-sync
+            pros = {k: 0.0 for k in PROSODY_FIELDS}
+        self._prosody_snapshot = self._prosody_status_snapshot()
+
         self.active_viseme = code
         self.active_source = source
         self.live_rms = rms
@@ -1172,10 +1431,43 @@ class LiveLipSyncEngine:
             "press": pr, "energy": en, "stress": st, "onset": self.live_onset,
             "pitch": max(0.0, min(1.0, self._pitch_s)), "voiced": max(0.0, min(1.0, self._voiced_s)),
             "brightness": max(0.0, min(1.0, self._bright_s)),
+            **pros,
         }
         ms = (time.perf_counter() - t_start) * 1000.0
         self.frame_ms = ms if self.frame_ms == 0.0 else self.frame_ms * 0.9 + ms * 0.1
         return self.live_axes
+
+    def sample(self) -> dict[str, float]:
+        """Latest frame dict (same as the last step() result): mouth axes + energy / pitch + the 5 prosody fields."""
+        return dict(self.live_axes)
+
+    def prosody_status(self) -> dict[str, Any]:
+        return dict(self._prosody_snapshot)
+
+    def _prosody_status_snapshot(self) -> dict[str, Any]:
+        pr = self.prosody
+        return {**{k: round(v, 4) for k, v in pr.values().items()}, "f0Hz": round(pr.f0_hz, 1),
+                "medianHz": round(100.0 * 2.0 ** (pr.median_st / 12.0), 1) if pr.median_st is not None else 0.0,
+                "cpuMs": round(pr.cpu_ms, 4)}
+
+    # --------------------------------------------------- user voice (backchannel)
+    def feed_user_energy(self, rms: float, t: float | None = None) -> bool:
+        """Live mic / call RMS of the USER (not her voice). True when a speech -> micro-pause pulse fired."""
+        with self.lock:
+            return self.user_voice.feed(rms, time.perf_counter() if t is None else t)
+
+    def note_user_speech(self, active: bool, t: float | None = None) -> None:
+        """Explicit user VAD edge (e.g. from the duplex call's own VAD)."""
+        with self.lock:
+            now = time.perf_counter() if t is None else t
+            self.user_voice.note(bool(active), now)
+            self.user_voice.tick(now)
+
+    def user_voice_state(self) -> dict[str, Any]:
+        with self.lock:
+            now = time.perf_counter()
+            self.user_voice.tick(now)
+            return self.user_voice.state(now)
 
     # ----------------------------------------------------------------- status
     def status(self) -> dict[str, Any]:
@@ -1193,6 +1485,7 @@ class LiveLipSyncEngine:
             "onset": round(self.live_onset, 3),
             "axes": {k: round(v, 4) for k, v in self.live_axes.items()},
             "frameMs": round(self.frame_ms, 3),
+            "prosody": self.prosody_status(),
             "mfccReady": self._profile is not None,
             "mfccError": self._profile_err,
             "lastMfcc": [round(float(x), 3) for x in self.last_mfcc] if self.last_mfcc is not None else None,

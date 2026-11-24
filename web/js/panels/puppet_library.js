@@ -554,6 +554,127 @@ function renderParamsMore(store) {
   return m;
 }
 
+/* ───────── 1-click Character Profiles (GET/POST/DELETE /api/profiles) ─────────
+ * A profile = puppet + look + Fish voice/model + personality + idle clip + camera. Keys are never stored. */
+const PROFILES_KW = 'character profiles character profile profiles profile preset presets save current activate persona voice';
+const prof = { busy: '', status: '', kind: '', confirmDelete: null, name: '' };
+
+function profileStatus(store, text, kind = '') {
+  prof.status = text;
+  prof.kind = kind;
+  store.rerenderPanel();
+}
+
+async function activateProfile(store, p) {
+  if (prof.busy) return;
+  prof.busy = p.id;
+  profileStatus(store, `Activating ${p.name}…`, 'pending');
+  try {
+    const r = await api(`/api/profiles/${encodeURIComponent(p.id)}/activate`, { method: 'POST' });
+    store.profiles = r.profiles || store.profiles;
+    store.activeProfileId = p.id;
+    lib.fetchedAt = 0;                         // puppet may have switched: refetch the model list
+    invalidateAbilities();
+    await store.refreshState();
+    prof.busy = '';
+    profileStatus(store, `${p.name} is live ✓`, 'ok');
+  } catch (error) {
+    prof.busy = '';
+    profileStatus(store, `Couldn’t activate ${p.name}: ${error.message}`, 'error');
+  }
+}
+
+async function deleteProfile(store, p) {
+  if (prof.busy) return;
+  if (prof.confirmDelete !== p.id) {
+    prof.confirmDelete = p.id;
+    store.rerenderPanel();
+    setTimeout(() => { if (prof.confirmDelete === p.id) { prof.confirmDelete = null; store.rerenderPanel(); } }, 3500);
+    return;
+  }
+  prof.confirmDelete = null;
+  prof.busy = p.id;
+  store.rerenderPanel();
+  try {
+    const r = await api(`/api/profiles/${encodeURIComponent(p.id)}`, { method: 'DELETE' });
+    store.profiles = r.profiles || [];
+    if (store.activeProfileId === p.id) store.activeProfileId = '';
+    prof.busy = '';
+    profileStatus(store, `Deleted ${p.name}`, 'ok');
+  } catch (error) {
+    prof.busy = '';
+    profileStatus(store, `Delete failed: ${error.message}`, 'error');
+  }
+}
+
+async function saveProfile(store) {
+  if (prof.busy) return;
+  const name = prof.name.trim();
+  if (!name) { profileStatus(store, 'Give the profile a name first', 'error'); return; }
+  prof.busy = '__save';
+  store.rerenderPanel();
+  try {
+    const r = await api('/api/profiles', json({ name }));
+    store.profiles = r.profiles || store.profiles;
+    store.activeProfileId = r.profile?.id || store.activeProfileId;
+    prof.name = '';
+    prof.busy = '';
+    profileStatus(store, `Saved “${r.profile?.name || name}” ✓`, 'ok');
+  } catch (error) {
+    prof.busy = '';
+    profileStatus(store, `Save failed: ${error.message}`, 'error');
+  }
+}
+
+function profileCard(store, p) {
+  const isActive = store.activeProfileId === p.id;
+  const confirming = prof.confirmDelete === p.id;
+  const bits = [modelName(p.puppetId), p.fishModel, p.fishReferenceId ? 'custom voice' : 'default voice'];
+  if (p.idleClip) bits.push('idle clip');
+  return el('div', { class: `profile-card${isActive ? ' active' : ''}`, 'data-profile': p.id }, [
+    el('div', { class: 'profile-text' }, [
+      el('div', { class: 'profile-name', text: p.name }),
+      el('div', { class: 'profile-meta', text: bits.filter(Boolean).join(' · ') }),
+    ]),
+    el('div', { class: 'profile-actions' }, [
+      btn(prof.busy === p.id ? 'Activating…' : (isActive ? 'Active ✓' : 'Activate'), () => activateProfile(store, p),
+        isActive ? 'primary' : '', { disabled: Boolean(prof.busy), title: `Load ${p.name} (puppet, look, voice, personality, idle)` }),
+      btn(confirming ? 'Confirm?' : 'Delete', () => deleteProfile(store, p), confirming ? 'danger' : '',
+        { disabled: Boolean(prof.busy), title: confirming ? 'Click again to delete' : `Delete ${p.name}` }),
+    ]),
+  ]);
+}
+
+function renderProfilesRows(store) {
+  const list = Array.isArray(store.profiles) ? store.profiles : [];
+  const cards = list.length
+    ? el('div', { class: 'profile-list', role: 'group', 'aria-label': 'Character profiles' }, list.map((p) => profileCard(store, p)))
+    : el('div', { class: 's-desc', text: 'No profiles yet — save the current character below.' });
+  const listRow = row({
+    title: 'Character Profiles', stack: true,
+    desc: '1-click characters: puppet, look, Fish voice, personality, idle clip & camera (API keys never saved)',
+    control: cards,
+  });
+  listRow.dataset.searchKw = PROFILES_KW;
+  const nameIn = el('input', {
+    class: 'text-in', type: 'text', placeholder: 'Profile name (e.g. Cozy Hikari)', value: prof.name, maxlength: 60,
+    'aria-label': 'Profile name', 'data-focus-key': 'profiles.name',
+    oninput: (e) => { prof.name = e.target.value; },
+    onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); saveProfile(store); } },
+  });
+  const saveRow = row({
+    title: 'Save Current Profile', desc: 'Snapshot what’s on stage now as a reusable character',
+    cls: 'wide-ctrl',
+    control: [nameIn, btn(prof.busy === '__save' ? 'Saving…' : 'Save Current Profile', () => saveProfile(store), 'primary',
+      { disabled: Boolean(prof.busy) })],
+  });
+  saveRow.dataset.searchKw = PROFILES_KW;
+  const statusRow = prof.status
+    ? el('div', { class: 's-row note' }, [el('div', { class: `apply-status ${prof.kind}`.trim(), role: 'status', text: prof.status })])
+    : null;
+  return [listRow, saveRow, statusRow];
+}
+
 /** The "Puppet Library" settings group (top of Look & Props). */
 export function renderPuppetLibrary(store) {
   const stale = !lib.data || Date.now() - lib.fetchedAt >= CACHE_MS;
@@ -605,8 +726,9 @@ export function renderPuppetLibrary(store) {
   const abilRow = renderAbilitiesRow();
   const paramsMore = renderParamsMore(store);
 
-  const g = group('Puppet Library', [libRow, capsRow, abilRow, paramsMore, importRow, statusRow], { desc: 'Switch avatars or import any rig' });
-  g.dataset.searchKw = `${SEARCH_KW} ${IMPORT_KW} ${CAPS_KW} ${ABIL_KW} ${PARAMS_KW}`;
+  const g = group('Puppet Library', [libRow, ...renderProfilesRows(store), capsRow, abilRow, paramsMore, importRow, statusRow],
+    { desc: 'Switch avatars, load a saved character or import any rig' });
+  g.dataset.searchKw = `${SEARCH_KW} ${IMPORT_KW} ${CAPS_KW} ${ABIL_KW} ${PARAMS_KW} ${PROFILES_KW}`;
   return g;
 }
 

@@ -306,10 +306,26 @@ export function renderAiPanel(store) {
       'fish voices voice picker my voices community reference voice');
   };
 
+  /* Subtle Live Call voice sync hint: chat TTS uses the voice at once, Fish calls on the next connect. */
+  const voiceSyncHint = () => {
+    const cur = String(ai.fishReferenceId || '');
+    if (!cur) return null;
+    let text = 'Applies immediately to chat TTS and on the next Live Call';
+    if (fc?.connected) {
+      text = fs.voiceStatus?.sessionVoiceId === cur
+        ? 'Chat TTS and the current Live Call use this voice'
+        : 'Chat TTS uses this voice now. The next Live Call will request it.';
+    }
+    return el('div', { class: 's-row note voice-sync-hint', 'data-voice-sync': '' }, [
+      el('div', { class: 's-desc' }, [el('span', { class: 'sync-dot', 'aria-hidden': 'true' }), text]),
+    ]);
+  };
+
   /* A designed voice was saved: adopt the server's ai config, select it, refresh the voice list. */
   const onVoiceSaved = (res) => {
     const v = res?.voice || {};
     if (res?.ai && typeof res.ai === 'object') Object.assign(store.config.ai, res.ai);
+    if (res?.voiceSync && typeof res.voiceSync === 'object') store.fishStatus = { ...(store.fishStatus || {}), voiceSync: res.voiceSync };
     if (v.id) {
       if (res.applied) store.config.ai.fishReferenceId = res.ai?.fishReferenceId || v.id;
       else store.patch('ai', { fishReferenceId: v.id });
@@ -327,7 +343,14 @@ export function renderAiPanel(store) {
       control: el('span', { class: `badge ${fs.keyReady ? 'ok' : 'warn'}`, text: fs.keyReady ? 'Ready' : 'Missing' }),
     }),
     selectRow({ label: 'Fish model', desc: 'Voice model for chat replies', items: FISH_MODELS, value: ai.fishModel, onChange: (v) => set({ fishModel: v }) }),
+    tagged(toggle({
+      label: 'Fish vocal expression tags',
+      desc: 'Keep Drama-3 performance directions and S2 tags like [giggles], [whisper] in Fish speech',
+      checked: ai.fishVocalTags ?? true,
+      onChange: (v) => set({ fishVocalTags: v }),
+    }), 'vocal tags drama 3 s2 giggles whisper'),
     fishVoiceRow(),
+    voiceSyncHint(),
     tagged(row({ title: 'Custom voice ID', desc: 'Paste any Fish voice / reference ID — the dropdown above follows it', cls: 'wide-ctrl',
       control: textIn({ placeholder: 'Paste a Fish voice ID', value: ai.fishReferenceId || '', 'aria-label': 'Custom voice ID',
         'data-focus-key': 'fish.customVoice', spellcheck: 'false',
@@ -511,6 +534,12 @@ export function renderAiPanel(store) {
       toggle({ label: 'Speak replies aloud', desc: 'Voice text-chat replies with TTS', checked: ai.ttsEnabled, onChange: (v) => set({ ttsEnabled: v }) }),
       selectRow({ label: 'TTS engine', desc: 'Push-to-talk always uses Fish ASR', items: TTS, value: ai.ttsProvider, onChange: (v) => { set({ ttsProvider: v }); store.rerenderPanel(); } }),
       ...fishRows,
+      tagged(toggle({
+        label: 'Screen Vision',
+        desc: 'Allow on-demand screen look via the stage eye button or saying "look at my screen"',
+        checked: store.config.vision?.enabled ?? true,
+        onChange: (v) => store.patch('vision', { enabled: v }),
+      }), 'screen vision look at my screen screenshot'),
       row({ title: 'Sample voice take', desc: 'Play a test line through the lip-sync pipeline', control: btn('Play', () => store.playSample()) }),
     ]),
 

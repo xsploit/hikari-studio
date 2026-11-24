@@ -59,6 +59,10 @@ const store = {
   motions: [],
   motionStatus: {},
   idleClip: {},
+  idleGraph: {},
+  backchannel: {},
+  profiles: [],
+  activeProfileId: '',
   fishStatus: {},
   fishCall: null,
   telemetry: { viseme: 'X', bands: [] },
@@ -105,6 +109,10 @@ const store = {
 
   async refreshState() {
     const st = await (await fetch('/api/state')).json();
+    this.applyState(st);
+  },
+
+  applyState(st) {
     this.config = st.config;
     this.shaderPresets = st.shaderPresets || {};
     this.expressionPresets = st.expressionPresets || [];
@@ -116,6 +124,9 @@ const store = {
     this.motions = st.motions || [];
     this.motionStatus = st.motionStatus || {};
     this.idleClip = st.idleClip || {};
+    this.idleGraph = st.idleGraph || {};
+    this.backchannel = st.backchannel || {};
+    this.profiles = Array.isArray(st.profiles) ? st.profiles : [];
     this.fishStatus = st.fishStatus || {};
     this.setRoomTitle(this.config.stage.room);
     this.setPuppetBadge(this.config.stage.activeModel || 'hikari', this.config.stage.activeModelName);
@@ -186,6 +197,7 @@ async function boot() {
   let draggingAvatar = false, dragLastX = 0, dragLastY = 0;
   let subTimeout = null;
   let wsOnline = false;
+  let lastFishSession = '';
   let fishUserPost = Promise.resolve(); // last viewer-transcript POST (agent turns wait on it)
 
   function showSubtitle(tag, text, durationSec = 5.5) {
@@ -227,6 +239,18 @@ async function boot() {
         btnMic.classList.remove('active');
       }
       updateStatus();
+      try { syncUserAudioMeter(st); } catch { stopUserAudioMeter(); }
+      const sessionId = st.connected ? store.fishCall.sessionId : '';
+      if (sessionId && sessionId !== lastFishSession) {
+        fetch('/api/fish/status', { cache: 'no-store' }).then(async (resp) => {
+          if (!resp.ok) return;
+          const status = await resp.json();
+          if (lastFishSession !== sessionId) return;
+          store.fishStatus = status;
+          if (store.activeTab === 'voice') store.rerenderPanel();
+        }).catch(() => {});
+      }
+      lastFishSession = sessionId;
       if (store.activeTab === 'voice') store.rerenderPanel();
     },
     onMessage: async ({ role, text }) => {
@@ -706,6 +730,14 @@ async function boot() {
         // Keep locally-set sections an older server doesn't know about yet (e.g. memory).
         if (store.config?.memory && msg.config && !msg.config.memory) msg.config.memory = store.config.memory;
         store.config = msg.config;
+      } else if (msg.type === 'profiles') {
+        store.profiles = Array.isArray(msg.profiles) ? msg.profiles : store.profiles;
+        if (store.activeTab === 'look') store.rerenderPanel();
+      } else if (msg.type === 'state' && msg.state?.config) {
+        // A Character Profile was activated (maybe from another tab): adopt the full state.
+        store.activeProfileId = '';
+        store.applyState(msg.state);
+        store.rerenderPanel();
       }
     };
     ws.onclose = () => { wsOnline = false; updateStatus(); setTimeout(connectWs, 1000); };
@@ -719,19 +751,109 @@ async function boot() {
   let pttChunks = [];
   let pttStream = null;
 
-  async function sendChatText(message) {
+  async function sendChatText(message, { includeScreen = false } = {}) {
     if (!message) return;
-    if (store.fishCall.connected) {
+    const look = includeScreen || visionArmed;
+    if (look) setVisionArmed(false);           // one look per arm
+    if (store.fishCall.connected && !look) {
       store.fishCall.sendMessage(message);
       showSubtitle('you', message, 3.5);
       return;
     }
-    showSubtitle('thinking', '…', 10.0);
-    await fetch('/api/chat', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message }),
-    });
+    showSubtitle(look ? 'looking' : 'thinking', look ? 'Looking at your screen…' : '…', 10.0);
+    btnVision.classList.toggle('busy', look);
+    try {
+      const response = await fetch('/api/chat', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(look ? { message, includeScreen: true } : { message }),
+      });
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({}));
+        throw new Error(result.error || `Studio returned HTTP ${response.status}`);
+      }
+    } catch (error) {
+      showSubtitle('chat error', error.message, 6);
+    } finally {
+      btnVision.classList.remove('busy');
+    }
   }
+
+  /* ───────── Screen Vision (eye button): empty input → look now; otherwise arm it for the next message ───────── */
+  const btnVision = document.getElementById('btn-vision');
+  let visionArmed = false;
+  function setVisionArmed(on) {
+    visionArmed = Boolean(on);
+    btnVision.classList.toggle('armed', visionArmed);
+    btnVision.setAttribute('aria-pressed', String(visionArmed));
+    btnVision.title = visionArmed ? 'Screen look armed — your next message includes your screen (click to cancel)' : 'Look at my screen';
+  }
+  btnVision.addEventListener('click', () => {
+    if (store.config?.vision && store.config.vision.enabled === false) {
+      showSubtitle('vision off', 'Screen Vision is off — enable it in Voice & Brain → Chat & Speech', 4.0);
+      return;
+    }
+    const text = document.getElementById('chat-input').value.trim();
+    if (visionArmed) { setVisionArmed(false); return; }
+    if (!text) { sendChatText('Look at my screen', { includeScreen: true }); return; }
+    setVisionArmed(true);
+  });
+
+  /* ───────── Live Call → visual backchanneling: throttled (~4 Hz) mic RMS to /api/rig/user-audio ───────── */
+  let meter = null;
+  function stopUserAudioMeter() {
+    if (!meter) return;
+    clearInterval(meter.timer);
+    meter.controller.abort();
+    meter.source.disconnect();
+    meter.analyser.disconnect();
+    meter = null;
+  }
+
+  function syncUserAudioMeter(st) {
+    const call = store.fishCall;
+    const room = call?.session?.getRoom();
+    const pub = st.connected && !st.connecting && !st.micMuted
+      ? room?.localParticipant.getTrackPublication('microphone') : null;
+    const track = pub?.track?.mediaStreamTrack;
+    if (track && track === meter?.track) return;
+    stopUserAudioMeter();
+    if (!track || !call.output) return;
+
+    // Tap the published mic track. The call retains ownership of mic mute and release.
+    const ctx = call.output.context;
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    const buf = new Float32Array(analyser.fftSize);
+    const source = ctx.createMediaStreamSource(new MediaStream([track]));
+    source.connect(analyser);
+    const controller = new AbortController();
+    let pending = false, quietSends = 0;
+    const timer = setInterval(async () => {
+      if (pending || !call.connected || call.micMuted || !track.enabled || track.readyState !== 'live'
+          || !(store.config?.rig?.visualBackchannel ?? true)) return;
+      analyser.getFloatTimeDomainData(buf);
+      let sum = 0;
+      for (const sample of buf) sum += sample * sample;
+      const rms = Math.sqrt(sum / buf.length);
+      if (rms >= 0.012) quietSends = 6;
+      else if (quietSends > 0) quietSends -= 1;
+      else return;
+      pending = true;
+      try {
+        const resp = await fetch('/api/rig/user-audio', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rms: +rms.toFixed(4) }),
+          signal: controller.signal,
+        });
+        if (resp.ok) {
+          const result = await resp.json();
+          if (!controller.signal.aborted && result.backchannel) store.backchannel = result.backchannel;
+        }
+      } catch { /* Metering is optional. */ }
+      finally { pending = false; }
+    }, 250);
+    meter = { track, source, analyser, timer, controller };
+  }
+  window.addEventListener('pagehide', stopUserAudioMeter);
 
   // In a live call → toggles WebRTC mic mute. Outside a call → Fish ASR push-to-talk that auto-sends chat.
   btnMic.addEventListener('click', async () => {

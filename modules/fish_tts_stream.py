@@ -14,6 +14,7 @@ event loop). HTTP uses the shared pooled httpx client; WS uses one `websockets` 
 from __future__ import annotations
 
 import asyncio
+import copy
 import base64
 import json
 from pathlib import Path
@@ -36,24 +37,47 @@ REMOTE_TTS_TIMEOUT = 45.0
 MAX_AUDIO_BYTES = 32 * 1024 * 1024
 DEFAULT_PCM_RATE = 44100
 
-_TAG_RE = re.compile(r"\[[^\]]{0,48}\]")
-_MD_RE = re.compile(r"[*_`#>]+")
+ANY_TAG_RE = re.compile(r"\[([^\[\]\n]*)\]")
 _SENT_END_RE = re.compile(r"([.!?…~。！？]+[\"')\]]*)(\s+|$)")
 
 
-def clean_for_speech(text: str) -> str:
-    t = _TAG_RE.sub(" ", text or "")
-    t = _MD_RE.sub("", t)
-    return re.sub(r"\s+", " ", t).strip()
+def _strip_tags(text: str) -> str:
+    from modules.ai_companion import strip_vocal_tags
+    return strip_vocal_tags(text)
+
+
+def fish_model_supports_tags(model: str) -> bool:
+    """Fish Drama-3 (inline [directions]) and S2 / S2.1 ([official tags]) voice bracket cues; S1 does not."""
+    m = str(model or "").strip().lower()
+    return m.startswith("drama") or m.startswith("s2")
+
+
+def clean_for_speech(text: str, *, preserve_vocal_tags: bool = False, fish_model: str = "drama-3") -> str:
+    """Text for the TTS engine. Default: every [...] cue + markdown stripped (backwards compatible).
+    preserve_vocal_tags=True (Fish Drama-3 / S2 with ai.fishVocalTags): cues are kept / normalized through
+    ai_companion.prepare_tts_text (Drama-3 directions sanitized, S2 cues mapped to official tags)."""
+    if not preserve_vocal_tags:
+        return _strip_tags(text)
+    from modules.ai_companion import prepare_tts_text   # lazy: ai_companion imports this module
+    return prepare_tts_text(text or "", tts_provider="fish", fish_model=fish_model or "drama-3",
+                            vocal_tags_enabled=True).strip()
 
 
 class SentenceChunker:
     """Incremental phrase splitter for streamed LLM text (WebWaifu4 splitTextForStreaming
-    thresholds: min ~20, soft ~90, hard ~180 chars). Holds back an unclosed [tag]."""
+    thresholds: min ~20, soft ~90, hard ~180 chars). Holds back an unclosed [tag].
+    With preserve_vocal_tags=True, phrases keep their (normalized) Fish vocal cues; length thresholds are
+    always measured on the tag-free text."""
 
-    def __init__(self, min_chars: int = 20, soft_chars: int = 90, max_chars: int = 180) -> None:
+    def __init__(self, min_chars: int = 20, soft_chars: int = 90, max_chars: int = 180, *,
+                 preserve_vocal_tags: bool = False, fish_model: str = "drama-3") -> None:
         self.buf = ""
         self.min_chars, self.soft_chars, self.max_chars = min_chars, soft_chars, max_chars
+        self.preserve_vocal_tags, self.fish_model = bool(preserve_vocal_tags), fish_model
+
+    def _speech(self, chunk: str) -> str:
+        c = clean_for_speech(chunk, preserve_vocal_tags=self.preserve_vocal_tags, fish_model=self.fish_model)
+        return c if _strip_tags(c) else ""          # a cue-only fragment has nothing to say
 
     def feed(self, delta: str) -> list[str]:
         self.buf += delta
@@ -62,7 +86,7 @@ class SentenceChunker:
             chunk = self._take()
             if chunk is None:
                 break
-            c = clean_for_speech(chunk)
+            c = self._speech(chunk)
             if c:
                 out.append(c)
         return out
@@ -73,22 +97,33 @@ class SentenceChunker:
             b_scan = b[: b.rfind("[")]                  # don't split inside a pending [tag]
         else:
             b_scan = b
-        for m in _SENT_END_RE.finditer(b_scan):
-            end = m.end()
-            if len(clean_for_speech(b_scan[:end])) >= self.min_chars:
-                self.buf = b[end:]
-                return b[:end]
-        if len(b_scan) >= self.max_chars:
-            window = b_scan[: self.max_chars + 1]
-            cut = max(window.rfind(", "), window.rfind("; "), window.rfind(" "))
-            cut = cut + 1 if cut > self.min_chars else self.max_chars
-            self.buf = b[cut:]
-            return b[:cut]
-        return None
+        # Each cue occupies a single space while choosing a boundary. Then map the cut
+        # back to the original reply, keeping directions attached to the following phrase.
+        plain = ANY_TAG_RE.sub(" ", b_scan)
+        cut = None
+        for match in _SENT_END_RE.finditer(plain):
+            if len(plain[:match.end(1)].strip()) >= self.min_chars:
+                cut = match.end(1)
+                break
+        if cut is None and len(plain) >= self.max_chars:
+            window = plain[:self.max_chars + 1]
+            space = window.rfind(" ")
+            cut = space if space > self.min_chars else self.max_chars
+        if cut is None:
+            return None
+        cut = len(plain[:cut].rstrip())
+        if not cut:
+            return None
+        for cue in ANY_TAG_RE.finditer(b_scan):
+            if cue.start() >= cut:
+                break
+            cut += len(cue[0]) - 1
+        self.buf = b[cut:].lstrip()
+        return b[:cut]
 
     def flush(self) -> list[str]:
         rest, self.buf = self.buf, ""
-        c = clean_for_speech(rest)
+        c = self._speech(rest)
         return [c] if c else []
 
 
@@ -219,13 +254,23 @@ class FishTtsStreamer:
             body["reference_id"] = ref
         return body
 
+    @property
+    def fish_model(self) -> str:
+        return str(self.cfg.get("fishModel") or "drama-3")
+
+    @property
+    def preserve_vocal_tags(self) -> bool:
+        """Fish Drama-3 / S2 with ai.fishVocalTags on: streamed phrases keep their [vocal cues]."""
+        return (str(self.cfg.get("ttsProvider", "fish")).lower() == "fish"
+                and bool(self.cfg.get("fishVocalTags", True)) and fish_model_supports_tags(self.fish_model))
+
     def _headers(self, url: str, accept: str | None = None) -> dict[str, str]:
         """Fish key only for the official api.fish.audio host; localhost gets none; others are refused."""
         key = server_keys.key_for_url(url, "fish", self.key())
         if not key and not server_keys.is_local_url(url):
             raise RuntimeError("Fish Speech TTS requires FISH_SPEECH_API_KEY / FISH_AUDIO_API_KEY "
                                "and the official api.fish.audio endpoint")
-        h = {"Content-Type": "application/json", "model": str(self.cfg.get("fishModel") or "s1")}
+        h = {"Content-Type": "application/json", "model": str(self.cfg.get("fishModel") or "drama-3")}
         if key:
             h["Authorization"] = f"Bearer {key}"
         if accept:
@@ -326,15 +371,28 @@ class FishTtsStreamer:
     async def speak_stream(self, deltas: AsyncIterator[str], *, transport: str | None = None,
                            on_text: Callable[[str], Awaitable[None] | None] | None = None,
                            on_segment: Callable[[bytes, int, str, int], Awaitable[None]] | None = None,
+                           preserve_vocal_tags: bool | None = None,
                            ) -> tuple[str, bytes, int]:
         """Consume LLM deltas, synthesize while streaming, return (full_text, pcm, rate).
         `on_segment(pcm, rate, text, index)` (optional) receives each phrase's audio IN ORDER as soon as it is
         ready, so playback of sentence 1 starts while later sentences are still being written / synthesized.
-        (The live WebSocket transport yields one continuous stream: it is delivered as a single segment.)"""
-        transport = transport or self.transport
+        (The live WebSocket transport yields one continuous stream: it is delivered as a single segment.)
+        preserve_vocal_tags (None = from cfg: Fish Drama-3 / S2 + fishVocalTags) keeps inline [cues] in the text
+        sent to Fish; `on_segment` always receives the tag-free display text."""
+        # Profile changes affect the next reply. All requests for this one use the same voice/model
+        # and transport settings that were used to format its cues.
+        voice = copy.copy(self)
+        voice.cfg = self.cfg.copy()
+        transport = transport or voice.transport
+        if preserve_vocal_tags is None:
+            preserve_vocal_tags = voice.preserve_vocal_tags
+        model = voice.fish_model
         t0 = time.perf_counter()
         full: list[str] = []
-        chunker = SentenceChunker()
+        chunker = SentenceChunker(preserve_vocal_tags=preserve_vocal_tags, fish_model=model)
+
+        def speech(text: str) -> str:
+            return clean_for_speech(text, preserve_vocal_tags=preserve_vocal_tags, fish_model=model)
         first_audio_at: list[float] = []
 
         if transport == "ws":
@@ -347,7 +405,7 @@ class FishTtsStreamer:
                         return
                     yield item
 
-            ws_task = asyncio.create_task(self.stream_ws(phrase_iter()))
+            ws_task = asyncio.create_task(voice.stream_ws(phrase_iter()))
             try:
                 try:
                     async for d in deltas:
@@ -363,9 +421,9 @@ class FishTtsStreamer:
                 await _cancel_all([ws_task])         # LLM failed / timeout / caller cancelled: stop the socket
                 raise
             if on_segment is not None and pcm:
-                await on_segment(pcm, rate, clean_for_speech("".join(full)), 0)
+                await on_segment(pcm, rate, _strip_tags("".join(full)), 0)
         else:
-            synth = self.synth_sse if transport == "sse" else self.synth_http
+            synth = voice.synth_sse if transport == "sse" else voice.synth_http
             sem = asyncio.Semaphore(2)               # bounded concurrent Fish requests per reply
             tasks: list[asyncio.Task] = []
             emit_q: asyncio.Queue = asyncio.Queue()
@@ -380,7 +438,7 @@ class FishTtsStreamer:
                     task, phrase = item
                     seg_pcm, seg_rate = await task
                     if seg_pcm:
-                        await on_segment(seg_pcm, seg_rate, phrase, idx)
+                        await on_segment(seg_pcm, seg_rate, _strip_tags(phrase), idx)
                         idx += 1
 
             def spawn(phrase: str) -> None:
@@ -392,6 +450,8 @@ class FishTtsStreamer:
             async def run(phrase: str) -> tuple[bytes, int]:
                 async with sem:
                     res = await synth(phrase)
+                    if not res[0]:
+                        raise RuntimeError("Fish returned an empty audio segment")
                     if not first_audio_at:
                         first_audio_at.append(time.perf_counter() - t0)
                     return res
@@ -399,11 +459,11 @@ class FishTtsStreamer:
             try:
                 if on_segment is not None:
                     emitter = asyncio.create_task(emit_in_order())
-                if transport == "http" and not self.cfg.get("fishHttpChunked", False):
+                if transport == "http" and not voice.cfg.get("fishHttpChunked", False):
                     async for d in deltas:
                         full.append(d)
-                    text = clean_for_speech("".join(full))
-                    if text:
+                    text = speech("".join(full))
+                    if text and _strip_tags(text):
                         spawn(text)
                 else:
                     async for d in deltas:

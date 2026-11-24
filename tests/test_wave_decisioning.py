@@ -380,7 +380,7 @@ async def test_server(tmp: Path) -> None:
     class _AI:
         last_turn: dict = {}
 
-        async def synthesize_tts(self, text: str) -> None:
+        async def synthesize_tts(self, text: str, *, emotion: str = "") -> None:
             return None
 
     class _Hooks:
@@ -572,11 +572,17 @@ async def test_server(tmp: Path) -> None:
         await hr.apply_decision(Decision(source="fish_user", tag="wave", emote="greet_wave", wave=True,
                                          wave_timing="on_reply"))
         check("http. fish caller on_reply wave waits for her line", hr.rig.emotes == [], str(hr.rig.emotes))
-        hr.decisions._last_emote_at = hr.decisions._clock()     # her line lands inside the emote cooldown
+        # Deterministic: her own greeting line must NOT win a wave of its own (that would cancel the stash and play
+        # a random greet/wink wave instead, so this check would not test the on_reply path at all). The caller's
+        # wave just started the wave cooldown, and her line lands inside the emote cooldown too; seeded RNG.
+        hr.decisions._rng = random.Random(20261124)
+        hr.decisions._last_wave_at = hr.decisions._clock()
+        hr.decisions._last_emote_at = hr.decisions._clock()
         j3 = await (await cl.post("/api/fish/emote", json={"text": "Oh, it's you! Hi!", "role": "agent"})).json()
-        waves = [e for e in hr.rig.emotes if e in ("greet_wave", "wink_wave")]   # her own reply may pick either wave
-        check("http. fish caller on_reply wave fires as her call line starts", len(waves) == 1,
-              f"{hr.rig.emotes} {j3}")
+        waves = [e for e in hr.rig.emotes if e in ("greet_wave", "wink_wave")]
+        check("http. fish caller on_reply wave fires as her call line starts",
+              waves == ["greet_wave"] and j3.get("emote") == "greet_wave"
+              and j3.get("decision", {}).get("wave") is False, f"{hr.rig.emotes} {j3}")
 
 
 # ------------------------------------------------------------------------------------------------ main

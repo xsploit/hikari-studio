@@ -287,6 +287,19 @@ const SEARCH_SYNONYMS = {
   props: ['props', 'abilit'], prop: ['prop', 'abilit'], spells: ['spell', 'magic', 'abilit'], spell: ['spell', 'magic', 'abilit'],
   magic: ['magic', 'spell', 'abilit'], starlight: ['starlight', 'abilit'], explosion: ['explosion', 'abilit'], cast: ['cast', 'abilit'],
   motion: ['motion', 'clip', 'retarget'], video: ['video', 'motion lab'], save: ['save', 'preset'],
+  'motion graph': ['motion graph', 'non repeating', 'phrase'], phrases: ['phrase', 'motion graph'], phrase: ['phrase', 'motion graph'],
+  'non repeating': ['non repeating', 'motion graph'], prosody: ['prosody', 'micro nod', 'emphasis'],
+  'micro nods': ['micro nod', 'prosody'], nod: ['nod', 'prosody', 'backchannel'], nods: ['nod', 'prosody', 'backchannel'],
+  backchannel: ['backchannel', 'attentive', 'listening'], backchanneling: ['backchannel', 'attentive'],
+  listening: ['listening', 'backchannel'],
+  'vocal tags': ['vocal tag', 'vocal expression', 'drama 3'], 'vocal tag': ['vocal tag', 'vocal expression'],
+  'drama 3': ['drama 3', 'vocal expression', 'drama'], drama: ['drama', 'vocal expression'],
+  s2: ['s2', 'vocal expression'], giggles: ['vocal expression', 'giggles'], whisper: ['vocal expression', 'whisper'],
+  'screen vision': ['screen vision', 'look at my screen', 'screen'], vision: ['vision', 'screen'],
+  screen: ['screen', 'vision'], screenshot: ['screen', 'vision'],
+  'character profiles': ['character profile', 'profile'], 'character profile': ['character profile', 'profile'],
+  profiles: ['profile', 'character profile'], profile: ['profile', 'character profile'],
+  temporal: ['temporal', 'upcoming', 'today'], reconsider: ['reconsider', 'held back'],
 };
 const SYN_PHRASES = Object.keys(SEARCH_SYNONYMS).filter((k) => k.includes(' ')).sort((a, b) => b.length - a.length);
 
