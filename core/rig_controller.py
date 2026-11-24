@@ -1328,10 +1328,7 @@ class RigController:
                 _atleast("Eye R Squint", 0.60 * droop)
                 _bump("Left Brow Y", -0.35 * env)
                 _bump("Right Brow Y", -0.35 * env)
-                _atleast("Arm R Pose", yawn * env)
-                _atleast("Arm L Pose", yawn * env)
-                _atleast("Arm R Lift", 0.50 * yawn * env)
-                _atleast("Arm L Lift", 0.50 * yawn * env)
+                p["Breath"] = (_clamp(p["Breath"][0] + 0.55 * yawn * env, 0.0, 1.0), 0.0)
                 yq = yawn * env * quiet
                 p["VB Mouth"] = (-0.10 * yq + p["VB Mouth"][0] * (1.0 - yq), max(p["VB Mouth"][1], 0.85 * yq))
                 p["Jaw Open"] = (max(p["Jaw Open"][0], 0.75 * yq), 0.0)
