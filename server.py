@@ -36,7 +36,7 @@ from core.customizer import CharacterCustomizer
 from core.engine_bridge import NativeEngineBridge
 from core.events import HookRegistry
 from core.plugins import PluginManager
-from core.rig_controller import EMOTE_CATALOG, RigController
+from core.rig_controller import EMOTE_CATALOG, VFX_PARAMS, RigController
 from core.wardrobe import WARDROBE_STYLES
 from modules import http_pool, server_keys
 from modules.ai_companion import (
@@ -402,6 +402,7 @@ class StudioRuntime:
         self._bg_tasks: set[asyncio.Task] = set()
 
         self.rig = RigController(self.param_defaults, self.lipsync, self.hooks)
+        self.sync_rig_flags()
         self.engine = NativeEngineBridge(ENGINE_EXE, SDL_DLL, self.model_path, width=960, height=1080)
         self.engine.start()
 
@@ -541,6 +542,10 @@ class StudioRuntime:
         self.decisions.update_config(self.config.data["ai"])
         self.memory.persona = self.ai.persona
 
+    def sync_rig_flags(self) -> None:
+        """Push controller-held rig switches (rig.autoVfx) from the config into the RigController."""
+        self.rig.set_auto_vfx(bool(self.config.data.get("rig", {}).get("autoVfx", True)))
+
     def apply_memory_config(self) -> None:
         self.memory.update_config(self.config.data["memory"])
         self.ai.set_history_turns(self.memory.history_turns)
@@ -553,6 +558,8 @@ class StudioRuntime:
                 d.skipped, d.emote = "unknown emote", None
         if temp_action:
             self.rig.trigger_temp_action(TAG_TO_STATE.get(d.tag, TAG_TO_STATE["happy"]), duration=hold)
+        # Auto expression VFX follow the decided emotion (neutral / unknown eases them back to calm).
+        self.rig.set_vfx_emotion(d.emotion, hold=max(6.0, hold))
         await self.broadcast_json({"type": "decision", "decision": d.to_dict()})
         return d
 
@@ -915,6 +922,7 @@ class StudioRuntime:
             "persona": self.persona_info(),
             "emotes": emote_list(),
             "emotions": list(EMOTIONS.keys()),
+            "vfx": self.rig.get_vfx_state(),
             "decision": self.decisions.status(),
             "lipsyncStatus": self.lipsync_status(),
             "brain": self.brain_status(),
@@ -990,7 +998,7 @@ def emote_list() -> list[dict[str, Any]]:
     original = {"excited_hop", "shy_blush", "wink_wave", "gloom_shake", "curious_lean", "chibi_pop", "pout_puff", "heart_sparkle"}
     return [
         {"id": eid, "label": m["label"], "duration": m["duration"], "category": m["category"],
-         "description": m["desc"], "new": eid not in original}
+         "description": m["desc"], "new": eid not in original, "vfx": list(m.get("vfx", ()))}
         for eid, m in EMOTE_CATALOG.items()
     ]
 
@@ -1114,6 +1122,8 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             runtime.apply_ai_config(vals)
         elif sec == "memory":
             runtime.apply_memory_config()
+        elif sec == "rig":
+            runtime.sync_rig_flags()
 
     async def index(_req):
         return web.FileResponse(WEB_DIR / "index.html")
@@ -1155,6 +1165,50 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             "emotions": {k: {"tag": v["tag"], "emotes": v["emotes"], "description": v["desc"]} for k, v in EMOTIONS.items()},
             "active": runtime.rig.emote_status(),
         })
+
+    def _vfx_payload() -> dict[str, Any]:
+        st = runtime.rig.get_vfx_state()
+        return {"ok": True, "autoVfx": st["autoVfx"], "params": st["params"], "available": st["available"],
+                "overrides": st["overrides"], "active": st["active"], "emotion": st["emotion"]}
+
+    async def api_vfx_get(_req):
+        """Expression VFX layer: param list, auto switch, manual overrides and live animated values."""
+        return web.json_response(_vfx_payload())
+
+    async def api_vfx_post(req):
+        """{"param": "VFX Sparkles", "value": 1.0} (value <= 0 / null toggles it off) | {"overrides": {...}}
+        (replaces all overrides) | {"clear": true}. Unknown param -> 400; nothing is applied on a bad request."""
+        try:
+            body = await req.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"ok": False, "error": "Body must be a JSON object"}, status=400)
+        updates: list[tuple[str, Any]] = []
+        replace = False
+        if "overrides" in body:
+            ovr = body["overrides"]
+            if not isinstance(ovr, dict):
+                return web.json_response({"ok": False, "error": "overrides must be an object"}, status=400)
+            updates.extend((str(k), v) for k, v in ovr.items())
+            replace = True
+        if "param" in body:
+            updates.append((str(body.get("param") or ""), body.get("value", 1.0)))
+        if not updates and not body.get("clear"):
+            return web.json_response({"ok": False, "error": "Send param+value, overrides or clear"}, status=400)
+        for name, val in updates:
+            if name not in VFX_PARAMS:
+                return web.json_response({"ok": False, "error": f"Unknown VFX param: {name[:64]}",
+                                          "params": list(VFX_PARAMS)}, status=400)
+            if val is not None and (isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val)):
+                return web.json_response({"ok": False, "error": f"Invalid value for {name}"}, status=400)
+        if body.get("clear") or replace:
+            runtime.rig.clear_vfx_overrides()
+        for name, val in updates:
+            runtime.rig.set_vfx_override(name, val)
+        payload = _vfx_payload()
+        await runtime.broadcast_json({"type": "vfx", "vfx": {k: payload[k] for k in ("autoVfx", "overrides")}})
+        return web.json_response(payload)
 
     async def api_decision_status(_req):
         return web.json_response({"ok": True, **runtime.decisions.status()})
@@ -1537,6 +1591,8 @@ def build_app(runtime: StudioRuntime) -> web.Application:
                 await asyncio.to_thread(runtime.lipsync.update_config, val)
             elif sec == "visemes":
                 runtime.lipsync.update_visemes(val)
+            elif sec == "rig":
+                runtime.sync_rig_flags()
         await runtime.config.save_async()
         await runtime.broadcast_json({"type": "config_sync", "config": public_config(runtime.config.data)})
         return web.json_response({"ok": True, "config": public_config(runtime.config.data)})
@@ -1842,6 +1898,8 @@ def build_app(runtime: StudioRuntime) -> web.Application:
     app.router.add_post("/api/fish/end", api_fish_session_end)
     app.router.add_post("/api/emote", api_emote)
     app.router.add_get("/api/emotes", api_emotes)
+    app.router.add_get("/api/vfx", api_vfx_get)
+    app.router.add_post("/api/vfx", api_vfx_post)
     app.router.add_get("/api/config", api_get_config)
     app.router.add_get("/api/decision", api_decision_status)
     app.router.add_get("/api/deciders/models", api_decider_models)

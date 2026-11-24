@@ -24,6 +24,14 @@ from core.texture_upscaler import (
     smooth_premul_silhouette_png,
 )
 
+from core.vfx_rig import (
+    WAVE_TEXTURES,
+    apply_midori_arms,
+    apply_vfx_rig,
+    bake_midori_arms,
+    build_vfx_textures,
+    midori_bake_key,
+)
 from core.wardrobe import SHOE_TEXTURES, TOP_TEXTURE, Wardrobe
 
 DEFAULT_VRM_PATH = Path(r"D:\Waifu Studio\assets\characters\models\a4f45d37bdbb-hikari-refined.vrm")
@@ -1824,10 +1832,47 @@ class CharacterCustomizer:
         key = tag + (len(header), hash(header))
         out = cache.get(key)
         if out is None:
-            if len(cache) > 12:
+            if len(cache) > 48:          # ~6 passes per outfit variant: keep every outfit's chain warm
                 cache.clear()
             out = cache[key] = build(header)
         return out
+
+    def _promote_midori_arms(self, header: bytes, out_texs: list[tuple[int, bytes]]) -> bytes:
+        """Swap the rigid raised wave arms for the Midori single-mesh DEFORM arms (core/vfx_rig.py). The bake depends
+        only on the final wave textures + wave node layout: cached in RAM and on disk (_midori_cache), so outfit
+        switches just append the two baked textures and reuse the cached header pass."""
+        if len(out_texs) <= max(WAVE_TEXTURES):
+            return header
+        mem: dict[tuple[Any, ...], dict[str, Any]] = self.__dict__.setdefault("_midori_mem", {})
+        tkey = tuple((len(out_texs[t][1]), hash(out_texs[t][1])) for t in WAVE_TEXTURES)
+        bake = mem.get(tkey)
+        if bake is None:
+            key = midori_bake_key(header, out_texs)
+            if key is None:
+                return header
+            bake = bake_midori_arms(header, out_texs, key)
+            mem.clear()
+            mem[tkey] = bake
+        tids = {}
+        for side in ("R", "L"):
+            tids[side] = len(out_texs)
+            out_texs.append((0, bake[side]["png"]))
+        blank = _transparent_png((4, 4))
+        for t in WAVE_TEXTURES:                       # the rigid wave-arm textures are unreferenced now
+            out_texs[t] = (0, blank)
+        return self._cached_header(("midori", bake["key"], tids["R"], tids["L"]), header,
+                                   lambda h: apply_midori_arms(h, bake, tids))
+
+    def _attach_vfx(self, header: bytes, out_texs: list[tuple[int, bytes]]) -> bytes:
+        """Expression VFX ('tiddlywinks') + Eye Star / Eye Heart / Cheek Puff / Cat Mouth (core/vfx_rig.py)."""
+        tid_of: dict[str, int] = {}
+        sizes: dict[str, tuple[float, float]] = {}
+        for slot, png, w, h in build_vfx_textures(out_texs[51][1]):
+            tid_of[slot] = len(out_texs)
+            out_texs.append((0, png))
+            sizes[slot] = (w, h)
+        return self._cached_header(("vfx", tuple(sorted(tid_of.items()))), header,
+                                   lambda h: apply_vfx_rig(h, tid_of, sizes))
 
     def _feathered_top(self, premul_png: bytes) -> tuple[bytes, bytes | None, bytes | None]:
         """Cached shoulder-tab feather + corner carve for whichever topwear texture is active:
@@ -2122,6 +2167,10 @@ class CharacterCustomizer:
             out_texs.append((0, shoulder_lines[1]))
             header = self._cached_header(("shoulder-lines", tid_r, tid_l), header,
                                          lambda h: _attach_shoulder_line_overlays(h, tid_r, tid_l))
+
+        # v29: Midori single-mesh DEFORM raised wave arms + expression VFX / micro-expression rig (every outfit).
+        header = self._promote_midori_arms(header, out_texs)
+        header = self._attach_vfx(header, out_texs)
 
         tmp = out_inp.with_suffix(".tmp")
         tmp.write_bytes(_pack_inp(header, out_texs, self._trailing))

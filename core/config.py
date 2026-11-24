@@ -511,6 +511,7 @@ def default_config() -> dict[str, Any]:
             "cheekPuff": 0.0,
             "tongueOut": 0.0,
             "eyeSquint": 0.0,
+            "autoVfx": True,              # emotion-driven anime VFX + micro-expressions (sparkles, hearts, :3 ...)
             "overrides": {},
         },
         "lipsync": copy.deepcopy(DEFAULT_LIPSYNC_CFG),

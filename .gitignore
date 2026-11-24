@@ -27,6 +27,10 @@ models/Hikari-v28-BaseHD-v4.inp
 models/Hikari-v28-HD.inp
 models/Hikari-v28-WaveHD-Preview.inp
 models/Hikari-v28-Custom.inp
+models/Hikari-v28-RigidBackup.inp
+models/Hikari-v29-MidoriDeform.inp
+assets/hd_parts/_vfx_cache/
+assets/hd_parts/wave/_midori_cache/
 
 # Native D engine build intermediates
 engine/.dub/

@@ -1,6 +1,7 @@
 /** MOTION & EMOTIONS — emotes, expression, face FX, physics & head-pat, arms, gaze. ADVANCED — param inspector. */
 import { btn, chipsRow, el, group, more, noteRow, row, segRow, slider, toggle } from '../ui.js';
 import { EMOTES, emoteGrid } from './emotes.js';
+import { renderExpressionFx } from './motion_panel.js';
 
 let paramFilter = '';
 
@@ -54,6 +55,8 @@ export function renderRigPanel(store) {
         rs('Tongue out', 'tongueOut', 0, 1, 0.02, 0),
       ]),
     ]),
+
+    renderExpressionFx(store),
 
     group('Arms', [
       segRow({

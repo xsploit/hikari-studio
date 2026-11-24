@@ -5,6 +5,8 @@ Combines cleanly in strict layered priority:
   2. Interaction state layer (idle | listening | thinking | speaking) + mood momentum (valence, arousal)
   3. Autonomous gaze + mouse look-at (eyes lead, head follows)
   4. Spring-smoothed Expression Preset + asymmetric brow micro-life + cheek blush
+     + Expression VFX layer (VFX Sparkles / Hearts / Sweat / Anger / Shock / Music, Eye Star / Heart, Cheek Puff,
+       Cat Mouth): auto emotion mapping (rig.autoVfx) < emote VFX < manual Studio overrides; :3 ducks while talking
   5. Arms: the original seamless resting arms sway with body / breath physics (Arm L/R Swing); the raised wave arms
      (Right Wave / Left Gesture / Both Cheer) come up for emotes, AI actions and real excited peaks in speech
   6. Live 6-axis VBridger lip-sync + syllable-onset head beats + pitch-coupled brows / chin
@@ -41,7 +43,7 @@ EMOTE_CATALOG: dict[str, dict[str, Any]] = {
     "gloom_shake":   {"label": "Gloom Shake",   "duration": 3.0, "category": "sad",      "kick": (0.0, 8.0, 0.0),   "desc": "Dramatic gloom shiver, glow dims"},
     "curious_lean":  {"label": "Curious Lean",  "duration": 2.8, "category": "curious",  "kick": (0.0, 0.0, 0.0),   "desc": "Head tilt and lean-in with raised brow"},
     "chibi_pop":     {"label": "Chibi Pop",     "duration": 2.6, "category": "joy",      "kick": (11.5, 0.0, 9.0),  "desc": "Pops into chibi proportions and back"},
-    "pout_puff":     {"label": "Pout Puff",     "duration": 3.0, "category": "annoyed",  "kick": (0.0, 0.0, 0.0),   "desc": "Turns away with puffed cheeks"},
+    "pout_puff":     {"label": "Pout Puff",     "duration": 2.6, "category": "annoyed",  "kick": (0.0, 2.5, 0.0),   "desc": "Puffed cheeks, pouty brows, side glance and a little huff", "vfx": ["Cheek Puff"]},
     "heart_sparkle": {"label": "Heart Sparkle", "duration": 3.0, "category": "love",     "kick": (11.5, 0.0, 9.0),  "desc": "Sparkly-eyed affectionate sway"},
     # --- New expressive emotes (inspired by Waifu Studio's affect set) ---
     "greet_wave":    {"label": "Greet Wave",    "duration": 2.9, "category": "greeting", "kick": (6.0, 2.0, 4.0),   "desc": "Big friendly right-arm wave with a head tilt and bounce"},
@@ -51,7 +53,56 @@ EMOTE_CATALOG: dict[str, dict[str, Any]] = {
     "flustered_shy": {"label": "Flustered Shy", "duration": 3.0, "category": "shy",      "kick": (7.0, 3.0, 10.0),  "desc": "Max blush, eyes darting, flustered little head shakes"},
     "sleepy_yawn":   {"label": "Sleepy Yawn",   "duration": 3.6, "category": "sleepy",   "kick": (6.0, 0.0, 0.0),   "desc": "Big stretch-yawn, then droopy eyes"},
     "gentle_nod":    {"label": "Gentle Nod",    "duration": 3.0, "category": "caring",   "kick": (0.0, 0.0, 0.0),   "desc": "Soft sympathetic tilt with two slow nods"},
+    # --- Mao / Neuro-style expression-VFX emotes (VFX layer params; skipped cleanly on rigs without them) ---
+    "starry_eyes":   {"label": "Starry Eyes",   "duration": 2.8, "category": "joy",      "kick": (9.0, 0.0, 6.0),   "desc": "Sparkles, star pupils, an excited bounce and a bright smile", "vfx": ["VFX Sparkles", "Eye Star"]},
+    "heart_crush":   {"label": "Heart Crush",   "duration": 3.0, "category": "love",     "kick": (4.0, 1.5, 3.0),   "desc": "Floating hearts, heart eyes, warm blush and a gentle head tilt", "vfx": ["VFX Hearts", "Eye Heart"]},
+    "cat_smug":      {"label": "Cat Smug",      "duration": 2.8, "category": "smug",     "kick": (0.0, 3.0, 1.5),   "desc": ":3 cat mouth, smug droopy lids, cocky tilt and a little wink-lean", "vfx": ["Cat Mouth"]},
+    "anime_sweat":   {"label": "Anime Sweat",   "duration": 2.6, "category": "nervous",  "kick": (0.0, 2.0, 2.0),   "desc": "Glossy sweatdrop, nervous side-eye, awkward smile and a tiny shiver", "vfx": ["VFX Sweat"]},
+    "anger_vein":    {"label": "Anger Vein",    "duration": 2.5, "category": "angry",    "kick": (3.0, 6.0, 4.0),   "desc": "Throbbing anger vein, fierce brows, stern scowl and a head jolt", "vfx": ["VFX Anger"]},
+    "vibe_music":    {"label": "Vibe Music",    "duration": 3.2, "category": "music",    "kick": (3.0, 0.0, 0.0),   "desc": "Floating music notes, rhythmic head-bob sway and happy eyes", "vfx": ["VFX Music"]},
 }
+
+# Expression VFX & blend-shape params (1D, 0..1, default 0) built into Hikari-v28-Custom.inp.
+VFX_PARAMS: tuple[str, ...] = (
+    "VFX Sparkles", "VFX Hearts", "VFX Sweat", "VFX Anger", "VFX Shock", "VFX Music",
+    "Eye Star", "Eye Heart", "Cheek Puff", "Cat Mouth",
+)
+# Lively animation while active: (low, frequency Hz). Output = level * osc with osc in [low, 1]; low 1.0 = clean ease.
+VFX_MOTION: dict[str, tuple[float, float]] = {
+    "VFX Sparkles": (0.78, 1.7),    # twinkle / shimmer
+    "VFX Hearts":   (0.82, 1.1),    # gentle bob
+    "VFX Anger":    (0.72, 3.5),    # brisk throbbing vein
+    "VFX Music":    (0.80, 2.2),    # rhythmic bob
+}
+CAT_MOUTH_DUCK_OPEN = 0.15          # Cat Mouth fades out while the lip-sync mouth is open wider than this
+
+# Emotion (decision engine emotions + expression presets + aliases) -> auto VFX targets.
+EMOTION_VFX: dict[str, dict[str, float]] = {
+    "excited":   {"VFX Sparkles": 0.85, "Eye Star": 1.0},
+    "awe":       {"VFX Sparkles": 0.85, "Eye Star": 1.0},
+    "amused":    {"VFX Sparkles": 0.45},
+    "happy":     {"VFX Sparkles": 0.45},          # peak happy only (scaled by mood valence)
+    "love":      {"VFX Hearts": 0.9, "Eye Heart": 1.0},
+    "flustered": {"VFX Hearts": 0.65},
+    "shy":       {"VFX Hearts": 0.65},
+    "blush":     {"VFX Hearts": 0.65},
+    "grateful":  {"VFX Hearts": 0.65},
+    "angry":     {"VFX Anger": 0.95},
+    "annoyed":   {"VFX Anger": 0.95, "Cheek Puff": 0.55},
+    "pout":      {"VFX Anger": 0.95, "Cheek Puff": 0.55},
+    "nervous":   {"VFX Sweat": 0.95},
+    "embarrassed": {"VFX Sweat": 0.95},
+    "awkward":   {"VFX Sweat": 0.95},
+    "sweat":     {"VFX Sweat": 0.95},
+    "surprised": {"VFX Shock": 0.9},
+    "shocked":   {"VFX Shock": 0.9},
+    "smug":      {"Cat Mouth": 1.0},
+    "playful":   {"Cat Mouth": 1.0},
+    "teasing":   {"Cat Mouth": 1.0},
+    "singing":   {"VFX Music": 0.95},
+    "vibing":    {"VFX Music": 0.95},
+}
+SMUG_EMOTIONS = frozenset(("smug", "playful", "teasing"))
 
 
 def _smooth(x: float) -> float:
@@ -351,6 +402,18 @@ class RigController:
         self._motion_mix: float = 0.85
         self._motion_playing: bool = False
 
+        # Expression VFX / blend-shape layer (auto emotion mapping + manual Studio overrides)
+        self.auto_vfx = True
+        self.vfx_overrides: dict[str, float] = {}
+        self._vfx_emotion = ""
+        self._vfx_emotion_until = 0.0
+        self._vfx_level = {k: Spring2nd(0.0) for k in VFX_PARAMS}
+        self._vfx_phase = {k: rnd.uniform(0.0, 6.28) for k in VFX_PARAMS}
+        self.vfx_active: dict[str, float] = {k: 0.0 for k in VFX_PARAMS}
+        self._cat_duck = 1.0                      # 1 = :3 shown, 0 = ducked for open talking vowels
+        self._cat_duck_hold = 0.0
+        self.sp_smug_look = Spring2nd(0.0)
+
         # Live telemetry snapshot
         self.last_params: dict[str, tuple[float, float]] = dict(self.defaults)
         self.last_shader: dict[str, Any] = {}
@@ -412,6 +475,53 @@ class RigController:
             self.sp_chest_x.v += kx
             self.sp_eye_jelly.v += ke * 0.25
         return {"ok": True, "emote": eid, "duration": self._emote_dur}
+
+    # ------------------------------------------------------------------ expression VFX layer
+    def set_auto_vfx(self, enabled: bool) -> None:
+        """rig.autoVfx: emotion-driven VFX on/off (manual overrides and emote VFX keep working either way)."""
+        with self.lock:
+            self.auto_vfx = bool(enabled)
+
+    def set_vfx_emotion(self, emotion: str, hold: float = 6.0) -> None:
+        """Emotion the auto-VFX layer reacts to (decision engine / reply tag), held for `hold` seconds then
+        eased back to calm. Unknown / neutral emotions clear it."""
+        emo = str(emotion or "").strip().lower()
+        with self.lock:
+            self._vfx_emotion = emo if emo in EMOTION_VFX else ""
+            self._vfx_emotion_until = time.perf_counter() + _clamp(_ff(hold, 6.0), 0.5, 60.0)
+
+    def set_vfx_override(self, param: str, value: float | None) -> None:
+        """Manual Studio toggle: value > 0 pins the param at that level (beats auto-emotion values) until
+        toggled off; value <= 0 or None removes the override (auto takes over again). Raises KeyError / ValueError."""
+        if param not in VFX_PARAMS:
+            raise KeyError(param)
+        if value is None:
+            v = 0.0
+        else:
+            v = _ff(value, float("nan"))
+            if v != v:
+                raise ValueError("VFX value must be a finite number")
+        with self.lock:
+            if v > 0.0:
+                self.vfx_overrides[param] = _clamp(v, 0.0, 1.0)
+            else:
+                self.vfx_overrides.pop(param, None)
+
+    def clear_vfx_overrides(self) -> None:
+        with self.lock:
+            self.vfx_overrides.clear()
+
+    def get_vfx_state(self) -> dict[str, Any]:
+        with self.lock:
+            emo = self._vfx_emotion if time.perf_counter() < self._vfx_emotion_until else ""
+            return {
+                "autoVfx": self.auto_vfx,
+                "params": list(VFX_PARAMS),
+                "available": [k for k in VFX_PARAMS if k in self._known],
+                "overrides": dict(self.vfx_overrides),
+                "active": {k: round(v, 4) for k, v in self.vfx_active.items()},
+                "emotion": emo,
+            }
 
     def emote_status(self) -> dict[str, Any]:
         with self.lock:
@@ -601,6 +711,9 @@ class RigController:
             istate = self._istate
             think_side_t = self._think_side
             listen_side_t = self._listen_side
+            auto_vfx = self.auto_vfx
+            vfx_ovr = dict(self.vfx_overrides)
+            vfx_emo = self._vfx_emotion if t_now < self._vfx_emotion_until else ""
 
         # 2.5 Mood momentum + interaction-state blend weights (eased, never pop)
         k_mood = 1.0 - math.exp(-dt / 2.4)
@@ -1111,6 +1224,8 @@ class RigController:
         chibi_tgt = _clamp(_ff(rig_cfg.get("chibiMode", 0.0), 0.0), 0.0, 1.0)
         gloom_tgt = _clamp(_ff(rig_cfg.get("gloom", 0.0), 0.0), 0.0, 1.0)
         em_glow_boost = 0.0
+        em_vfx: dict[str, float] = {}             # emote-driven VFX targets (eased by the VFX layer below)
+        em_smug = 0.0
 
         if em_id and em_dur > 0.1:
             u_t = _clamp(em_el / em_dur, 0.0, 1.0)
@@ -1128,6 +1243,12 @@ class RigController:
                 if name in p:
                     p[name] = (_clamp(max(p[name][0], value), 0.0, 1.0), p[name][1])
 
+            def _wrist(side: str, follow: float) -> None:
+                """Midori single-mesh wrist follow-through (clean up to ~±18° -> ±0.65), blended in by env."""
+                name = f"Arm {side} Wrist"
+                if self._has_raised_joints and name in p:
+                    p[name] = (_clamp(p[name][0] * (1.0 - env) + follow * env, -0.65, 0.65), p[name][1])
+
             if em_id == "excited_hop":
                 hop = math.sin(u_t * math.pi * 4.0)
                 body_y += 8.2 * env * hop
@@ -1140,8 +1261,12 @@ class RigController:
                 _atleast("Arm L Pose", env)
                 p["Arm R Gesture"] = (0.45 * math.sin(u_t * math.pi * 6.0) * env, 0.0)
                 p["Arm L Gesture"] = (0.45 * math.sin(u_t * math.pi * 6.0 + 0.5) * env, 0.0)
+                _wrist("R", 0.55 * math.sin(u_t * math.pi * 6.0 - 1.1))
+                _wrist("L", 0.55 * math.sin(u_t * math.pi * 6.0 + 0.5 - 1.1))
                 _bump("Left Brow Y", 0.30 * env)
                 _bump("Right Brow Y", 0.30 * env)
+                if auto_vfx:
+                    em_vfx["VFX Sparkles"] = 0.6 * env
                 em_glow_boost = 0.65 * env
             elif em_id == "shy_blush":
                 head_x -= 11.0 * env
@@ -1167,6 +1292,7 @@ class RigController:
                 _atleast("Eye L Smile", 0.55 * env)
                 _atleast("Arm R Pose", env)
                 p["Arm R Gesture"] = ((0.30 + 0.55 * math.sin(u_t * math.pi * 6.0)) * env, 0.0)
+                _wrist("R", 0.60 * math.sin(u_t * math.pi * 6.0 - 1.2))
                 _atleast("Sparkle Eyes", 0.75 * env)
                 _bump("Left Brow Y", 0.22 * env)
                 em_glow_boost = 0.40 * env
@@ -1200,9 +1326,15 @@ class RigController:
                 _atleast("Sparkle Eyes", 0.90 * env)
                 em_glow_boost = 0.50 * env
             elif em_id == "pout_puff":
+                huff = math.exp(-((u_t - 0.42) / 0.07) ** 2)            # one little "hmph!" around 40 %
                 head_x += 12.0 * env
                 head_z -= 8.0 * env
+                head_y += 2.5 * huff * env
+                body_y += 2.0 * huff * env
+                p["Breath"] = (_clamp(p["Breath"][0] + 0.35 * huff * env, 0.0, 1.0), 0.0)
+                p["EyeBall"] = (_clamp(p["EyeBall"][0] * (1.0 - env) - 0.45 * env, -1.0, 1.0), p["EyeBall"][1])   # side glance
                 _atleast("Cheek Puff", 1.0 * env)
+                em_vfx["Cheek Puff"] = 1.0 * env
                 _atleast("Anime Blush Lines", 0.65 * env)
                 p["Brow L Form"] = (-0.75 * env + p["Brow L Form"][0] * (1.0 - env), 0.0)
                 p["Brow R Form"] = (-0.75 * env + p["Brow R Form"][0] * (1.0 - env), 0.0)
@@ -1233,6 +1365,7 @@ class RigController:
                 _atleast("Arm R Pose", env)
                 _atleast("Arm R Lift", 0.45 * env)
                 p["Arm R Gesture"] = ((0.20 + 0.62 * wave) * env, 0.0)
+                _wrist("R", 0.65 * math.sin(u_t * math.pi * 8.0 - 1.1))     # hand flicks just behind the wave
                 _atleast("Eye L Smile", 0.80 * env)
                 _atleast("Eye R Smile", 0.80 * env)
                 _atleast("Sparkle Eyes", 0.50 * env)
@@ -1251,11 +1384,15 @@ class RigController:
                 _atleast("Arm L Lift", (0.55 - 0.25 * pump) * env)
                 p["Arm R Gesture"] = (0.35 * pump * env, 0.0)
                 p["Arm L Gesture"] = (-0.35 * pump * env, 0.0)
+                _wrist("R", 0.50 * math.sin(u_t * math.pi * 10.0 - 1.0))
+                _wrist("L", -0.50 * math.sin(u_t * math.pi * 10.0 - 1.0))
                 _atleast("Eye L Smile", 1.0 * env)
                 _atleast("Eye R Smile", 1.0 * env)
                 _atleast("Sparkle Eyes", 1.0 * env)
                 _bump("Left Brow Y", 0.35 * env)
                 _bump("Right Brow Y", 0.35 * env)
+                if auto_vfx:
+                    em_vfx["VFX Sparkles"] = 0.7 * env
                 em_glow_boost = 0.80 * env
             elif em_id == "smug_tease":
                 heh = math.sin(u_t * math.pi * 6.0) * _smooth(u_t / 0.3) * (1.0 - _smooth((u_t - 0.5) / 0.3))
@@ -1314,6 +1451,10 @@ class RigController:
                 _atleast("Arm L Pose", env)
                 p["Arm R Gesture"] = (0.30 * math.sin(u_t * math.pi * 14.0) * env, 0.0)
                 p["Arm L Gesture"] = (0.30 * math.sin(u_t * math.pi * 14.0 + 1.2) * env, 0.0)
+                _wrist("R", 0.40 * math.sin(u_t * math.pi * 14.0 - 1.0))
+                _wrist("L", 0.40 * math.sin(u_t * math.pi * 14.0 + 1.2 - 1.0))
+                if auto_vfx:
+                    em_vfx["VFX Hearts"] = 0.6 * env
                 em_glow_boost = 0.30 * env
             elif em_id == "sleepy_yawn":
                 yawn = math.sin(math.pi * _clamp(u_t / 0.55, 0.0, 1.0))
@@ -1350,12 +1491,122 @@ class RigController:
                     _bump("Brow R Angle", 0.30 * env)
                 _atleast("Anime Blush Lines", 0.30 * env)
                 em_glow_boost = 0.15 * env
+            elif em_id == "starry_eyes":
+                hop = math.sin(u_t * math.pi * 5.0)
+                body_y += 6.5 * max(0.0, hop) * env
+                head_y += 6.0 * env + 4.0 * hop * env
+                head_z += 7.0 * math.sin(u_t * math.pi * 2.0) * env
+                _atleast("Eye L Smile", 0.35 * env)
+                _atleast("Eye R Smile", 0.35 * env)
+                _atleast("Sparkle Eyes", 1.0 * env)
+                _bump("Left Brow Y", 0.45 * env)
+                _bump("Right Brow Y", 0.45 * env)
+                eq = env * quiet
+                p["VB Mouth"] = (p["VB Mouth"][0] + (0.90 - p["VB Mouth"][0]) * eq, max(p["VB Mouth"][1], 0.22 * eq))
+                em_vfx["VFX Sparkles"] = 1.0 * env
+                em_vfx["Eye Star"] = 1.0 * env
+                em_glow_boost = 0.85 * env
+            elif em_id == "heart_crush":
+                sway = math.sin(u_t * math.pi * 2.0)
+                head_z += 10.0 * env + 3.0 * sway * env
+                head_y += 3.0 * env
+                body_lean += 3.0 * env
+                body_z += 2.5 * env
+                _atleast("Anime Blush Lines", 0.95 * env)
+                _atleast("Eye L Smile", 0.55 * env)
+                _atleast("Eye R Smile", 0.55 * env)
+                if self._has_cheek:
+                    _atleast("Cheek", 0.95 * env)
+                if self._has_brow_angle:
+                    _bump("Brow L Angle", 0.35 * env)
+                    _bump("Brow R Angle", 0.35 * env)
+                eq = env * quiet
+                p["VB Mouth"] = (p["VB Mouth"][0] + (0.65 - p["VB Mouth"][0]) * eq, p["VB Mouth"][1])
+                em_vfx["VFX Hearts"] = 1.0 * env
+                em_vfx["Eye Heart"] = 1.0 * env
+                em_glow_boost = 0.70 * env
+            elif em_id == "cat_smug":
+                heh = math.sin(u_t * math.pi * 5.0) * env
+                head_z -= 11.0 * env
+                head_x += 5.0 * env
+                head_y += 1.8 * heh
+                body_lean -= 3.0 * env
+                body_z -= 2.0 * env
+                lid = 1.0 - 0.18 * env
+                p["Left Eye Open"] = (p["Left Eye Open"][0] * lid, 0.0)
+                p["Right Eye Open"] = (p["Right Eye Open"][0] * (lid - 0.22 * env * _smooth((u_t - 0.35) / 0.2) * (1.0 - _smooth((u_t - 0.7) / 0.15))), 0.0)   # wink-lean
+                _atleast("Eye L Smile", 0.40 * env)
+                _atleast("Eye R Smile", 0.40 * env)
+                em_vfx["Cat Mouth"] = 1.0 * env
+                em_smug = env
+                em_glow_boost = 0.25 * env
+            elif em_id == "anime_sweat":
+                shiver = math.sin(em_el * 2.0 * math.pi * 11.0) * env
+                head_x += 1.2 * shiver - 5.0 * env
+                head_y -= 3.0 * env
+                head_z += 4.0 * env
+                body_x += 0.6 * shiver
+                p["EyeBall"] = (_clamp(p["EyeBall"][0] * (1.0 - env) + 0.50 * env, -1.0, 1.0), p["EyeBall"][1])   # side-eye
+                _atleast("Eye L Smile", 0.30 * env)
+                _atleast("Eye R Smile", 0.30 * env)
+                _bump("Left Brow Y", 0.15 * env)
+                _bump("Right Brow Y", 0.15 * env)
+                if self._has_brow_angle:
+                    _bump("Brow L Angle", 0.55 * env)
+                    _bump("Brow R Angle", 0.55 * env)
+                eq = env * quiet
+                p["VB Mouth"] = (p["VB Mouth"][0] + (0.35 - p["VB Mouth"][0]) * eq, p["VB Mouth"][1])   # awkward smile
+                p["Mouth X"] = (_clamp(p["Mouth X"][0] - 0.30 * eq, -1.0, 1.0), 0.0)
+                em_vfx["VFX Sweat"] = 1.0 * env
+                em_glow_boost = 0.05 * env
+            elif em_id == "anger_vein":
+                jolt = math.exp(-u_t * 9.0) * math.sin(u_t * math.pi * 14.0)
+                head_x += 3.5 * jolt * env
+                head_y -= 4.0 * env - 6.0 * jolt * env
+                body_y += 2.5 * jolt * env
+                p["Brow L Form"] = (-0.95 * env + p["Brow L Form"][0] * (1.0 - env), 0.0)
+                p["Brow R Form"] = (-0.95 * env + p["Brow R Form"][0] * (1.0 - env), 0.0)
+                _bump("Left Brow Y", -0.45 * env)
+                _bump("Right Brow Y", -0.45 * env)
+                if self._has_brow_angle:
+                    _bump("Brow L Angle", -0.85 * env)
+                    _bump("Brow R Angle", -0.85 * env)
+                _atleast("Eye L Squint", 0.45 * env)
+                _atleast("Eye R Squint", 0.45 * env)
+                p["Eye L Smile"] = (p["Eye L Smile"][0] * (1.0 - env), 0.0)
+                p["Eye R Smile"] = (p["Eye R Smile"][0] * (1.0 - env), 0.0)
+                eq = env * quiet
+                p["VB Mouth"] = (p["VB Mouth"][0] + (-0.75 - p["VB Mouth"][0]) * eq, p["VB Mouth"][1])   # stern scowl
+                em_vfx["VFX Anger"] = 1.0 * env
+                em_glow_boost = -0.10 * env
+            elif em_id == "vibe_music":
+                beat = abs(math.sin(em_el * math.pi * 2.2))           # 2.2 bobs / second
+                sway = math.sin(em_el * math.pi * 1.1)
+                head_y += (5.5 * beat - 2.0) * env
+                head_z += 8.0 * sway * env
+                body_z += 3.5 * sway * env
+                body_x += 2.5 * sway * env
+                body_y += 2.0 * beat * env
+                _atleast("Eye L Smile", 0.85 * env)
+                _atleast("Eye R Smile", 0.85 * env)
+                _bump("Left Brow Y", 0.20 * env)
+                _bump("Right Brow Y", 0.20 * env)
+                eq = env * quiet
+                p["VB Mouth"] = (p["VB Mouth"][0] + (0.75 - p["VB Mouth"][0]) * eq, p["VB Mouth"][1])
+                em_vfx["VFX Music"] = 1.0 * env
+                em_glow_boost = 0.45 * env
 
             p["Angle"] = (_clamp(head_x, -30.0, 30.0), _clamp(head_y, -24.0, 24.0))
             p["Angle Z"] = (_clamp(head_z, -25.0, 25.0), 0.0)
             p["Body Angle Y"] = (_clamp(body_y, -10.0, 10.0), 0.0)
             p["Body Angle Z"] = (_clamp(body_z, -10.0, 10.0), 0.0)
             p["Body Lean"] = (_clamp(body_lean, -10.0, 10.0), 0.0)
+            p["Body Angle X"] = (_clamp(body_x, -10.0, 10.0), 0.0)
+
+        # 10.3 Expression VFX & blend shapes: auto emotion mapping < emote VFX < manual Studio overrides,
+        #      eased by critically damped springs, then animated (twinkle / bob / throb) while active.
+        self._vfx_step(dt, t_now, p, auto_vfx, vfx_ovr, vfx_emo, temp, em_vfx, em_smug, w_t, mv,
+                       max(vb_open, _ff(lip.get("open", 0.0), 0.0)), quiet)
 
         chibi_val = _clamp(self.sp_chibi.step(chibi_tgt, dt, 12.0, 0.55), 0.0, 1.0)
         gloom_val = _clamp(self.sp_gloom.step(gloom_tgt, dt, 10.0, 0.80), 0.0, 1.0)
@@ -1424,6 +1675,84 @@ class RigController:
             "pitchRel": round(pr, 3),
         }
         return p, shader_cfg, cam_cfg
+
+    def _vfx_step(self, dt: float, t_now: float, p: dict[str, tuple[float, float]], auto_vfx: bool,
+                  overrides: dict[str, float], emotion: str, temp: dict[str, Any] | None, em_vfx: dict[str, float],
+                  em_smug: float, w_think: float, mood_v: float, mouth_open: float, quiet: float) -> None:
+        """Expression VFX layer. Writes only params the loaded rig has (older rigs skip it silently)."""
+        # Auto emotion source: the decided emotion, else the temporary action's expression. Thinking = calm.
+        emo = emotion
+        if not emo and temp:
+            emo = str(temp.get("vfxEmotion") or temp.get("expression") or "").lower()
+        auto: dict[str, float] = {}
+        if auto_vfx and emo in EMOTION_VFX:
+            calm = 1.0 - _clamp(w_think, 0.0, 1.0)
+            # plain "happy" only sparkles at a real high (mood valence well up), never during ordinary chat
+            peak = _smooth((mood_v - 0.30) / 0.35) if emo == "happy" else 1.0
+            for k, v in EMOTION_VFX[emo].items():
+                auto[k] = v * calm * peak
+        smug_t = max(em_smug, 1.0 * (1.0 - _clamp(w_think, 0.0, 1.0)) if (auto_vfx and emo in SMUG_EMOTIONS) else 0.0)
+
+        # Cat Mouth ducks whenever the lip-sync mouth opens (held ~0.3 s across syllable gaps), eases back in pauses.
+        if mouth_open > CAT_MOUTH_DUCK_OPEN:
+            self._cat_duck_hold = t_now + 0.32
+        duck_t = 0.0 if t_now < self._cat_duck_hold else 1.0
+        tau = 0.045 if duck_t < self._cat_duck else 0.22
+        self._cat_duck += (duck_t - self._cat_duck) * (1.0 - math.exp(-dt / tau))
+
+        for k in VFX_PARAMS:
+            tgt = max(auto.get(k, 0.0), _ff(em_vfx.get(k, 0.0), 0.0))
+            if k in overrides:
+                tgt = overrides[k] if k != "Cheek Puff" else max(tgt, overrides[k])
+            tgt = _clamp(tgt, 0.0, 1.0)
+            sp = self._vfx_level[k]
+            omega = 11.0 if tgt > sp.y else 7.0                      # quick to appear, gentle to fade
+            lvl = _clamp(sp.step(tgt, dt, omega, 1.0), 0.0, 1.0)
+            if lvl < 1e-4 and tgt == 0.0:
+                sp.y, sp.v, lvl = 0.0, 0.0, 0.0
+            motion = VFX_MOTION.get(k)
+            if motion is not None and lvl > 0.0:
+                lo, hz = motion
+                ph = 2.0 * math.pi * hz * t_now + self._vfx_phase[k]
+                if k == "VFX Sparkles":                               # irregular twinkle (two detuned sines)
+                    s = 0.5 + 0.3 * math.sin(ph) + 0.2 * math.sin(ph * 1.71 + 1.3)
+                elif k == "VFX Anger":                                # sharp throb
+                    s = (0.5 + 0.5 * math.sin(ph)) ** 2
+                elif k == "VFX Music":                                # bouncy |sin| bob
+                    s = abs(math.sin(0.5 * ph))
+                else:
+                    s = 0.5 + 0.5 * math.sin(ph)
+                out = lvl * (lo + (1.0 - lo) * _clamp(s, 0.0, 1.0))
+            else:
+                out = lvl
+            if k == "Cat Mouth":
+                out *= self._cat_duck
+            out = _clamp(out, 0.0, 1.0)
+            self.vfx_active[k] = out
+            if k in p:
+                if k == "Cheek Puff":                                  # shared with the expression puff
+                    p[k] = (max(p[k][0], out), p[k][1])
+                else:
+                    p[k] = (out, p[k][1])
+
+        # Smug look for :3 moments: asymmetric brow, half-lidded eyes (eased, mouth-safe)
+        sm = _clamp(self.sp_smug_look.step(_clamp(smug_t, 0.0, 1.0), dt, 6.5, 1.0), 0.0, 1.0)
+        if sm > 1e-3:
+            def _add(name: str, amt: float) -> None:
+                if name in p:
+                    p[name] = (_clamp(p[name][0] + amt, -1.0, 1.0), p[name][1])
+            _add("Left Brow Y", 0.32 * sm)
+            _add("Right Brow Y", -0.12 * sm)
+            if self._has_brow_angle:
+                _add("Brow R Angle", -0.25 * sm)
+            for n in ("Eye L Squint", "Eye R Squint"):
+                if n in p:
+                    p[n] = (_clamp(max(p[n][0], 0.42 * sm), 0.0, 1.0), p[n][1])
+            for n in ("Left Eye Open", "Right Eye Open"):
+                if n in p:
+                    p[n] = (p[n][0] * (1.0 - 0.12 * sm), p[n][1])
+            if "Mouth X" in p:
+                p["Mouth X"] = (_clamp(p["Mouth X"][0] + 0.15 * sm * quiet, -1.0, 1.0), p["Mouth X"][1])
 
     def _finalize_params(self, p: dict[str, tuple[float, float]]) -> None:
         if len(p) != len(self.defaults):
