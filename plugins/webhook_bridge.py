@@ -26,8 +26,13 @@ class WebhookBridgePlugin(StudioPlugin):
     async def _on_trigger(self, ctx, payload: dict) -> dict:
         action = str(payload.get("action") or "").lower()
         if action == "wave":
-            ctx.rig.trigger_temp_action({"expression": "happy", "armR": 1.0, "armL": 0.0, "sparkle": 0.7, "blush": 0.35}, duration=float(payload.get("duration", 3.5)))
-            return {"ok": True, "triggered": "wave"}
+            # The real tweened wave clip (elbow wave, rigid wrist), not a raw arm snap. Use for stream
+            # events, e.g. a Twitch bot POSTing {"action": "wave"} when someone joins / follows.
+            emote = "wink_wave" if str(payload.get("style", "")).lower() == "wink" else "greet_wave"
+            res = ctx.rig.trigger_emote(emote, duration=float(payload.get("duration", 2.6)))
+            if res.get("ok") and getattr(ctx, "decisions", None):
+                ctx.decisions.note_manual_emote(res["emote"])
+            return {"ok": bool(res.get("ok")), "triggered": "wave", "emote": emote}
         if action == "cheer":
             ctx.rig.trigger_temp_action({"expression": "excited", "armR": 1.0, "armL": 1.0, "sparkle": 1.0, "blush": 0.65}, duration=float(payload.get("duration", 4.0)))
             return {"ok": True, "triggered": "cheer"}

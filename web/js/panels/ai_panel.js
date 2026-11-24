@@ -582,8 +582,8 @@ export function renderAiPanel(store) {
         onChange: (v) => { set({ autonomousGestures: v }); store.rerenderPanel(); },
       }),
       toggle({
-        label: 'Auto-wave on greetings', desc: 'Wave on hi / bye, and when you come back after a while',
-        checked: ai.autoWaveOnGreeting ?? true, disabled: ai.autonomousGestures === false,
+        label: 'Auto-wave on greetings', desc: 'Let the AI wave on hi / bye (off: waves only come from stream events like a Twitch follow)',
+        checked: ai.autoWaveOnGreeting ?? false, disabled: ai.autonomousGestures === false,
         onChange: (v) => set({ autoWaveOnGreeting: v }),
       }),
       toggle({

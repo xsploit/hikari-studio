@@ -180,7 +180,7 @@ class Clock:
 
 
 def gateway_engine(clock: Clock, answers: dict[str, Any], seen: dict[str, Any]) -> DecisionEngine:
-    de = DecisionEngine({"decisionMode": "gateway"}, clock=clock, rng=random.Random(7))
+    de = DecisionEngine({"decisionMode": "gateway", "autoWaveOnGreeting": True}, clock=clock, rng=random.Random(7))
     de.resolve_decider = lambda: "gateway"      # type: ignore[method-assign]
 
     async def fake_typed(cfg, provider, state, questions, **kw):
@@ -293,7 +293,7 @@ async def test_decisions() -> None:
         check("decide. farewell on cooldown -> gentle non-wave tag", not d4.wave and d4.tag not in ("wave",) and d4.tag == "caring",
               d4.tag)
 
-        hd = DecisionEngine({"decisionMode": "heuristic"}, clock=Clock(), rng=random.Random(1))
+        hd = DecisionEngine({"decisionMode": "heuristic", "autoWaveOnGreeting": True}, clock=Clock(), rng=random.Random(1))
         h1 = await hd.decide("hi hikari!", "user")
         h2 = await hd.decide("hey again", "user")
         check("decide. heuristic greeting waves (now)", h1.wave and h1.wave_timing == "now" and h1.emote in WAVE_EMOTES,
@@ -519,6 +519,7 @@ async def test_server(tmp: Path) -> None:
             self.config.data["ai"]["decisionMode"] = "heuristic"
             self.rig = FakeRig()
             self.lipsync = _Lip()
+            self.config.data["ai"]["autoWaveOnGreeting"] = True     # this suite tests the AI-decided wave
             self.decisions = DecisionEngine(self.config.data["ai"])
             self._shutdown_task = None
             self._fish_ended_on_shutdown = True
@@ -573,7 +574,8 @@ async def test_server(tmp: Path) -> None:
         check("http. fish caller on_reply wave waits for her line", hr.rig.emotes == [], str(hr.rig.emotes))
         hr.decisions._last_emote_at = hr.decisions._clock()     # her line lands inside the emote cooldown
         j3 = await (await cl.post("/api/fish/emote", json={"text": "Oh, it's you! Hi!", "role": "agent"})).json()
-        check("http. fish caller on_reply wave fires as her call line starts", "greet_wave" in hr.rig.emotes,
+        waves = [e for e in hr.rig.emotes if e in ("greet_wave", "wink_wave")]   # her own reply may pick either wave
+        check("http. fish caller on_reply wave fires as her call line starts", len(waves) == 1,
               f"{hr.rig.emotes} {j3}")
 
 

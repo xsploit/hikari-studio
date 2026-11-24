@@ -131,7 +131,7 @@ DECISION_DEFAULTS: dict[str, Any] = {
     "decisionBaseUrl": "",           # empty -> reuse the chat endpoint (and its key)
     "decisionTimeoutMs": 1500,       # strict LLM deadline before local fallback
     "autonomousGestures": True,      # master switch for self-triggered emotes
-    "autoWaveOnGreeting": True,      # wave on hi/hey/welcome/bye/see ya + returning after idle
+    "autoWaveOnGreeting": False,     # off by default: waves come from stream events (POST /api/hook/trigger)
     "autoIdleEmotes": True,          # gentle idle moments while nobody is talking
     "emoteCooldownSec": 6.0,         # global emote cooldown (counts attempts)
     "waveCooldownSec": 45.0,         # separate wave cooldown (never two waves in a short span)
@@ -704,22 +704,27 @@ def rig_ability_label(a: dict[str, Any]) -> str:
     return f"{label} - {desc}" if desc and desc != label else label
 
 
-def hikari_questions(source: str = "user", rig_abilities: list[dict[str, Any]] | tuple = ()) -> list[ChoiceQuestion]:
+def hikari_questions(source: str = "user", rig_abilities: list[dict[str, Any]] | tuple = (),
+                     include_wave: bool = True) -> list[ChoiceQuestion]:
     """Typed decision questions. `rig_abilities`: the live puppet's AI-offered abilities ({id, label, desc}),
-    added to the emote choice as `rig_*: Label - desc` options."""
-    emote_ids = sorted({e for v in EMOTIONS.values() for e in v["emotes"]})
+    added to the emote choice as `rig_*: Label - desc` options. `include_wave=False` (auto-wave off) drops the
+    wave clips and the wave_timing question entirely, so the model is never even asked about waving."""
+    emote_ids = sorted({e for v in EMOTIONS.values() for e in v["emotes"]
+                        if include_wave or e not in WAVE_EMOTES})
     own_line = source in ("reply", "fish_agent")
     rig_opts = tuple((str(a["id"]), rig_ability_label(a)) for a in list(rig_abilities)[:RIG_ABILITY_CAP]
                      if a.get("id") and str(a["id"]) not in emote_ids)
-    return [
+    questions = [
         ChoiceQuestion("emotion", _EMOTION_INSTRUCTIONS_OWN_LINE if own_line else _EMOTION_INSTRUCTIONS,
                        tuple((k, v["desc"]) for k, v in EMOTIONS.items()) + (("abstain", "abstain"),)),
         ChoiceQuestion("emote", _EMOTE_INSTRUCTIONS + (_RIG_ABILITY_INSTRUCTIONS if rig_opts else ""),
                        tuple((e, EMOTE_LABELS.get(e, e.replace("_", " "))) for e in emote_ids) + rig_opts
                        + (("none", "No offered motion suits this moment"),)),
-        ChoiceQuestion("wave_timing", _WAVE_INSTRUCTIONS, WAVE_TIMING_OPTIONS,
-                       legacy_name="wave", legacy_map=(("yes", "now"), ("no", "none"))),
     ]
+    if include_wave:
+        questions.append(ChoiceQuestion("wave_timing", _WAVE_INSTRUCTIONS, WAVE_TIMING_OPTIONS,
+                                        legacy_name="wave", legacy_map=(("yes", "now"), ("no", "none"))))
+    return questions
 
 
 # memory_triage.rs, verbatim instructions and criteria
@@ -1100,7 +1105,7 @@ class DecisionEngine:
         if not self.cfg.get("autonomousGestures", True):
             d.skipped = "autonomousGestures off"
             return
-        if wants_wave and self.cfg.get("autoWaveOnGreeting", True):
+        if wants_wave and self.cfg.get("autoWaveOnGreeting", False):
             if (now - self._last_wave_at) >= self._f("waveCooldownSec"):
                 emote = preferred if preferred in WAVE_EMOTES else ("wink_wave" if self._rng.random() < 0.3 else "greet_wave")
                 d.emote, d.wave, d.tag = emote, True, "wave"
@@ -1314,7 +1319,9 @@ class DecisionEngine:
         counts = self.stats["model"]
         counts[provider] = counts.get(provider, 0) + 1
         timeout = max(0.2, min(10.0, self._f("decisionTimeoutMs") / 1000.0))
-        state, questions = self.decision_state(text, source), hikari_questions(source, self.rig_abilities)
+        state = self.decision_state(text, source)
+        questions = hikari_questions(source, self.rig_abilities,
+                                     include_wave=bool(self.cfg.get("autoWaveOnGreeting", False)))
         route: dict[str, Any] = {}
         t_start = time.perf_counter()
         try:
