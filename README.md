@@ -4,7 +4,7 @@
 
 **Flagship 60 FPS 2.5D Inochi2D AI VTuber Platform**
 
-*Native DLang OpenGL GPU renderer · 4-Engine MFCC + IPA Lip-Sync · Fish Audio Live 3 & Vercel AI Gateway · Google SLEEP Continual Memory · 4.4 MB Rust/Tauri Desktop App*
+*Native DLang OpenGL GPU renderer · 4-Engine MFCC + IPA Lip-Sync · Fish Audio Live 3 & Vercel AI Gateway · Persistent SQLite Memory · 4.4 MB Rust/Tauri Desktop App*
 
 [![FPS](https://img.shields.io/badge/Render-60_FPS_Locked-ff4f9a?style=flat-square)](docs/media/hikari-demo.mp4)
 [![CPU](https://img.shields.io/badge/Active_CPU-~4.7%25_Total-22c55e?style=flat-square)](#performance--footprint)
@@ -14,10 +14,10 @@
 
 <br />
 
-<img src="docs/media/hikari-demo.gif" alt="Hikari Studio Live 60 FPS Demo — Wave, Starry Awe & Smug Emotes" width="760" />
+<img src="docs/media/hikari-demo.gif" alt="Hikari Studio Live Demo — Idle, Wave, Starry Awe & Cat Smug" width="760" />
 
 <p>
-  <sub>Live 60 FPS capture directly from <code>hikari-live-engine.exe</code> — 3-bone rigid toggle wave arm, stencil sparkle eyes, Neuro-style procedural idle, and GLSL 330 rim-light shader. <a href="docs/media/hikari-demo.mp4">Watch full 1280×720 H.264 video →</a></sub>
+  <sub>Live studio capture with procedural idle, a Midori-style continuous-skin wave, Starry Awe, and Cat Smug. <a href="docs/media/hikari-demo.mp4">Watch full 1280×720 H.264 video →</a></sub>
 </p>
 
 </div>
@@ -34,7 +34,7 @@
     </td>
     <td width="50%">
       <img src="docs/media/studio-settings.png" alt="Hikari Studio Left-Docked Settings UI" />
-      <p align="center"><sub><b>Left-Docked Studio Settings</b> — live non-blocking sidebar shifts Hikari cleanly right with zero blur</sub></p>
+      <p align="center"><sub><b>Left-Docked Studio Settings</b> — Voice &amp; Brain with the Fish voice picker, Voice Designer, and Vercel model and provider controls</sub></p>
     </td>
   </tr>
 </table>
@@ -49,10 +49,13 @@ Most AI VTuber stacks glue together heavy Electron apps, paid proprietary Live2D
 - **4-Engine VTS / VBridger Lip-Sync (`modules/lipsync.py`):** Hybrid **12-MFCC + IPA F1/F2 Formants** (`0.28 ms/frame`), standalone uLipSync-style MFCC, IPA Formants, and Classic Amplitude driving an **8-parameter VTS Mouth Mapper** (`jawOpen`, `mouthOpen`, `mouthForm`, `mouthFunnel`, `lipsPress`, `mouthShrug`, `mouthX`, `tongueOut`) with per-voice vowel calibration.
 - **Real-Time Voice & Multi-Brain Routing:**
   - **Fish Audio Real-Time Duplex (`Drama 3` / `Live 3`)** full-duplex WebRTC calls with instant STT & 60 FPS lip-sync.
-  - **Vercel AI Gateway + Fish Speech SSE/WS/HTTP** with strict provider pinning, fallback models, and server-side key isolation.
+  - **Vercel AI Gateway + Fish Speech SSE/WS/HTTP** with live model and provider pinning dropdowns, fallback models, and server-side key isolation.
+  - **Fish Audio Voice Designer** creates and previews voices from a description, with a live dropdown for account and community voices.
   - **Unified Vercel AI Gateway System-1 Deciders (`modules/decision_engine.py`):** Ported straight from Waifu Studio's `evaluation.rs` — pick any live `type: evaluation` model via one single `AI_GATEWAY_API_KEY` (`perplexity/pplx-decider-flash-v1.3`, `openai/gpt-6-luna-decisions`, `typesafe-ai/jev`, `google/gemini-decision-1`, `microsoft/decision-1.1`, `liquid/d1.2`) with automatic Jev fallback and optional direct Cloudflare Clef / Perplexity / OpenAI overrides.
-- **Procedural Life & 15 Spring-Tweened Emotes:** Neuro-style autonomous idle choreographer (`curious_tilt`, `vibe_sway`, `happy_bounce`, `chat_read`, `daydream_sigh`, `cheeky_lean`), true **3-bone rigid toggle arms** (zero finger stretching during waves), and 15 one-click or AI-triggered emotes.
-- **Google Research SLEEP Continual Memory (`modules/sleep_memory.py` + `sleep_lab/`):** SQLite WAL episodic memory + Wake → Sleep consolidation + Dream reflections + a faithful [`arXiv:2606.03979`](sleep_lab/README.md) Colab LoRA training notebook & 2-box Zero-Context A/B Compare Chat.
+- **Procedural Life & 15 Spring-Tweened Emotes:** Neuro-style autonomous idle choreographer (`curious_tilt`, `vibe_sway`, `happy_bounce`, `chat_read`, `daydream_sigh`, `cheeky_lean`), **Midori-style single-mesh continuous-skin deform arms**, and 15 one-click or AI-triggered emotes. The Decision Model decides whether to wave and when to play it (now, on reply, or after a beat).
+- **Universal Puppet Library:** Load Inochi2D `.inp` puppets, import Live2D models through MINT, and feed auto-discovered rig abilities to the Decision Model.
+- **Motion Lab:** A pure-motion video tracker captures 20 channels while leaving lip-sync under the voice pipeline’s control.
+- **Persistent Memory & Context:** SQLite preserves conversation continuity across restarts, and Waifu Studio–style fact memory recalls relevant details. Manage both in the [Memory & Context panel](docs/media/studio-memory.png).
 - **4.4 MB Rust + Tauri v2 Desktop App (`desktop-tauri/`):** System tray, Always-on-Top, frameless transparent OBS window, and Windows Job Object process cleanup so closing the app cleanly shuts down every child process.
 
 ---
@@ -61,7 +64,7 @@ Most AI VTuber stacks glue together heavy Electron apps, paid proprietary Live2D
 
 We built Hikari's entire `.inp` puppet (`v1` → `v28` → HD customizer) programmatically using **AI coding agents (Codex, Claude, Antigravity) + image generation + Python** — zero manual Live2D Cubism required.
 
-- **Human Guide:** [**How We Built & Curated a 60 FPS Inochi2D VTuber with AI Agents**](docs/INOCHI2D_AI_WORKFLOW.md) — covers `.inp` binary structure, premultiplied alpha rules, VRM GLB eye extraction, 3-bone rigid waving arms, skin-safe HSV wardrobe pipelines, and automated visual QA.
+- **Human Guide:** [**How We Built & Curated a 60 FPS Inochi2D VTuber with AI Agents**](docs/INOCHI2D_AI_WORKFLOW.md) — covers `.inp` binary structure, premultiplied alpha rules, VRM GLB eye extraction, the original wave rig, skin-safe HSV wardrobe pipelines, and automated visual QA.
 - **Portable AI Agent Skill:** [**`skills/inochi2d-puppet-builder/SKILL.md`**](skills/inochi2d-puppet-builder/SKILL.md) — drop straight into **Codex CLI, Claude Code, Antigravity, or Cursor** to give your agent our complete Inochi2D `.inp` creation, upscaling, rigging, and visual-verification playbook.
 
 ---
@@ -81,7 +84,7 @@ flowchart LR
         LIP["4-Engine Lip-Sync\n(MFCC + IPA · 0.28ms)"]
         BRAIN["Voice & Brain Router\n(Fish Live 3 / Vercel / Local)"]
         DEC["System-1 Deciders\n(Clef · pplx · Jev · Luna)"]
-        MEM["SLEEP Memory\n(SQLite WAL + Consolidator)"]
+        MEM["Memory & Context\n(SQLite + Fact Recall)"]
         CUST["Live Puppet Customizer\n(.inp Hot-Rebuild < 0.6s)"]
     end
 
@@ -173,7 +176,7 @@ class MyPlugin(StudioPlugin):
 ```
 
 ### Webhook / Stream Deck Trigger API
-Trigger emotes, rigid arm waves, shader presets, or live speech from OBS, Stream Deck, or external scripts:
+Trigger emotes, waves, shader presets, or live speech from OBS, Stream Deck, or external scripts:
 
 ```bash
 curl -X POST http://127.0.0.1:8800/api/hook/trigger \
@@ -192,7 +195,7 @@ Supported actions: `wave`, `cheer`, `expression`, `shader_preset`, `say` (plus `
 | [`server.py`](server.py) | FastAPI + WebSocket studio server, security guards, 60 FPS broadcast loop |
 | [`engine/`](engine/) | Native DLang OpenGL 3.2 + GLSL 330 Inochi2D renderer (`source/app.d`, `hikari-live-engine.exe`) |
 | [`core/`](core/) | Rig controller, VRM eye/outfit customizer, 2× anime upscaler, wardrobe, hook & plugin system |
-| [`modules/`](modules/) | 4-engine lip-sync, Fish duplex & SSE/WS TTS, Vercel AI Gateway, 4 System-1 deciders, SLEEP SQLite memory |
+| [`modules/`](modules/) | 4-engine lip-sync, Fish duplex & SSE/WS TTS, Vercel AI Gateway, System-1 deciders, SQLite conversation continuity and fact memory |
 | [`web/`](web/) | Modular ES-module studio frontend (`index.html`, `obs.html`, WebGL2 stage, left-docked settings) |
 | [`desktop-tauri/`](desktop-tauri/) | 4.4 MB Rust + Tauri v2 desktop wrapper with Win32 Job Object process management |
 | [`sleep_lab/`](sleep_lab/) | Faithful Google Research SLEEP (`arXiv:2606.03979`) Colab LoRA notebook & Zero-Context A/B Compare Chat |
