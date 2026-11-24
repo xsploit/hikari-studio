@@ -31,7 +31,7 @@ import cv2
 import numpy as np
 
 ANALYSIS_W = 640
-MAX_SECONDS = 30.0
+MAX_SECONDS = 180.0
 
 LEGACY_TRACKS = ("AngleX", "AngleY", "AngleZ", "BodyX", "BodyZ", "EyeOpen", "ArmR", "ArmL")
 RICH_TRACKS = ("EyeLOpen", "EyeROpen", "EyeLookX", "EyeLookY", "BrowLY", "BrowRY",
@@ -767,14 +767,15 @@ def _fallback_center(n: int, fps: float) -> dict[str, Any]:
             "metrics": {"frames": n, "fps": fps, "lockRate": 0.0, "firstLockFrame": -1}, "analysisSize": None}
 
 
-def extract_motion_from_video(video_path: Path, out_dir: Path, name: str | None = None) -> dict:
+def extract_motion_from_video(video_path: Path, out_dir: Path, name: str | None = None,
+                              max_seconds: float = MAX_SECONDS) -> dict:
     """Analyze a video clip and save a 60 FPS general-motion clip JSON (no audio / mouth: live lip-sync owns it)."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     clip_id = (name or Path(video_path).stem).strip().replace(" ", "_")
     safe_id = "".join(c for c in clip_id if c.isalnum() or c in ("-", "_"))[:48] or f"clip_{int(time.time())}"
 
-    res = analyze_video(Path(video_path))
+    res = analyze_video(Path(video_path), max_seconds=max_seconds)
     n = res["frames"]
     fps = res["fps"]
     dur = n / float(fps)
