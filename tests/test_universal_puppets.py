@@ -69,9 +69,15 @@ class FakeLipSync:
                 "stress": 0.0, "onset": 0.0, "pitch": 0.5, "voiced": 0.0, "press": 0.0}
 
 
+_HIKARI_DEFAULTS_CACHE: dict | None = None
+
+
 def hikari_defaults() -> dict:
-    from server import _read_param_meta
-    return _read_param_meta(HIKARI)[0]
+    global _HIKARI_DEFAULTS_CACHE
+    if _HIKARI_DEFAULTS_CACHE is None:
+        from server import _read_param_meta
+        _HIKARI_DEFAULTS_CACHE = _read_param_meta(HIKARI)[0]
+    return dict(_HIKARI_DEFAULTS_CACHE)
 
 
 def new_rig() -> RigController:
