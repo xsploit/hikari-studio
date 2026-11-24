@@ -251,6 +251,42 @@ MOTION_OPTIONAL_TRACKS = ("EyeLOpen", "EyeROpen", "EyeLookX", "EyeLookY", "BrowL
 # clip track -> AAA rig-fx param (driven through _rig_fx_step's springs, written only where the rig has it)
 MOTION_FX_TRACKS = (("StageX", "Stage X"), ("StageY", "Stage Y"), ("StageZoom", "Stage Zoom"),
                     ("ShoulderShrug", "Shoulder Shrug"))
+# Idle loop (Motion Lab "Use as idle"): only head / body / whole-body drift is borrowed from the clip, as offsets
+# around the clip's own average pose. Eyes, blinks, brows, arms and mouth always stay Hikari's own.
+IDLE_TRACKS = ("AngleX", "AngleY", "AngleZ", "BodyX", "BodyZ", "StageX", "StageY")
+IDLE_STAGE_TRACKS = (("StageX", "Stage X"), ("StageY", "Stage Y"))
+IDLE_STAGE_GAIN = 0.6          # whole-body drift is the loudest channel; keep it a touch under the clip's own
+IDLE_SPEAKING_W = 0.75         # she keeps swaying while she talks (like Neuro), just a little steadier
+IDLE_LOOP_XFADE_SEC = 1.0      # tail -> head crossfade so the loop has no seam
+
+
+def prepare_idle_clip(data: dict[str, Any]) -> dict[str, Any]:
+    """Turn a validated Motion Lab clip into a seamless idle loop of zero-mean offsets (IDLE_TRACKS only)."""
+    tracks = data["tracks"]
+    n = int(data["frames"])
+    fps = float(data.get("fps", 60.0)) or 60.0
+    xf = int(min(IDLE_LOOP_XFADE_SEC * fps, n // 4))
+    out: dict[str, list[float]] = {}
+    for k in IDLE_TRACKS:
+        tr = tracks.get(k)
+        if tr is None:
+            continue
+        a = [float(v) for v in tr]
+        alpha = 1.0 - math.exp(-1.0 / (0.08 * fps))          # forward-backward low-pass: no jitter, no lag
+        for rng_ in (range(1, n), range(n - 2, -1, -1)):
+            step = 1 if rng_.step > 0 else -1
+            for i in rng_:
+                a[i] = a[i - step] + (a[i] - a[i - step]) * alpha
+        if xf >= 2:                                            # seamless loop: tail crossfades into the head
+            head = [a[j] * (j / xf) + a[n - xf + j] * (1.0 - j / xf) for j in range(xf)]
+            a = head + a[xf:n - xf]
+        mean = sum(a) / len(a)
+        out[k] = [v - mean for v in a]
+    m = len(next(iter(out.values()))) if out else 0
+    if m < 2:
+        raise ValueError("clip has no head / body tracks to loop")
+    return {"id": data["id"], "name": data["name"], "fps": fps, "frames": m, "duration": round(m / fps, 2),
+            "tracks": out}
 
 
 def validate_motion_clip(data: Any) -> dict[str, Any]:
@@ -479,6 +515,11 @@ class RigController:
         self._motion_loop: bool = True
         self._motion_mix: float = 0.85
         self._motion_playing: bool = False
+
+        # Idle loop clip (head / body / drift offsets layered under everything; see prepare_idle_clip)
+        self._idle_clip: dict[str, Any] | None = None
+        self._idle_clip_start: float = now
+        self._idle_layer_w: float = 0.0
 
         # Expression VFX / blend-shape layer (auto emotion mapping + manual Studio overrides)
         self.auto_vfx = True
@@ -847,6 +888,32 @@ class RigController:
             self._motion_playing = False
             self._motion_clip = None
 
+    def set_idle_clip(self, clip_path: Path | None) -> dict[str, Any]:
+        """Install (or clear, with None) the looping idle clip. Validates before touching live state."""
+        if clip_path is None:
+            with self.lock:
+                self._idle_clip = None
+            return self.idle_clip_status()
+        prepared = prepare_idle_clip(validate_motion_clip(json.loads(Path(clip_path).read_text(encoding="utf-8"))))
+        with self.lock:
+            self._idle_clip = prepared
+            self._idle_clip_start = time.perf_counter()
+        return self.idle_clip_status()
+
+    def idle_clip_status(self) -> dict[str, Any]:
+        with self.lock:
+            c = self._idle_clip
+            return {"id": c["id"], "name": c["name"], "duration": c["duration"]} if c else {"id": "", "name": ""}
+
+    @staticmethod
+    def _idle_sample(clip: dict[str, Any], start: float, t_now: float) -> dict[str, float]:
+        n = int(clip["frames"])
+        el = ((t_now - start) * float(clip["fps"])) % n
+        i0 = int(el)
+        i1 = (i0 + 1) % n
+        f = el - i0
+        return {k: tr[i0] * (1.0 - f) + tr[i1] * f for k, tr in clip["tracks"].items()}
+
     def _motion_sample(self, clip: dict[str, Any], start: float, loop: bool, t_now: float) -> dict[str, float]:
         """Linearly interpolated sample of every playable track at t_now (mouth tracks are never sampled)."""
         tracks = clip["tracks"]
@@ -1024,6 +1091,8 @@ class RigController:
             m_start = self._motion_start
             m_loop = self._motion_loop
             m_mix = self._motion_mix
+            idle_clip = self._idle_clip
+            idle_start = self._idle_clip_start
             mood_tv, mood_ta = self._mood_tv, self._mood_ta
             istate = self._istate
             think_side_t = self._think_side
@@ -1061,6 +1130,9 @@ class RigController:
         # 3.2 Held weight-shift postures + micro drift (replaces the fixed sine "screensaver" sway)
         sway = _clamp(_ff(rig_cfg.get("idleSway", 1.0), 1.0), 0.0, 3.0)
         energy_mul = sway * (0.8 + 0.5 * arousal_n)
+        idle_mix = _clamp(_ff(rig_cfg.get("idleClipMix", 0.6), 0.6), 0.0, 1.5) if idle_clip is not None else 0.0
+        if idle_mix > 0.0:                                         # the idle loop carries the life: calmer holds
+            energy_mul *= 1.0 - 0.5 * min(1.0, idle_mix)
         pose = self._posture_step(dt, t_now, energy_mul, max(w_s * 0.6, w_l * 0.5, w_t * 0.7))
         head_x = pose["hx"]
         head_y = pose["hy"]
@@ -1082,7 +1154,7 @@ class RigController:
             self._next_idle_act = t_now + rnd.uniform(4.0, 8.0)
         if sway > 0.05:
             if (not self._idle_act and not idle_block and not speaking and w_t < 0.3 and w_l < 0.3
-                    and t_now >= self._next_idle_act):
+                    and t_now >= self._next_idle_act and idle_mix <= 0.0):
                 choices = ("curious_tilt", "vibe_sway", "happy_bounce", "chat_read", "daydream_sigh", "cheeky_lean")
                 self._idle_act = rnd.choice(choices)
                 self._idle_start = t_now
@@ -1144,6 +1216,22 @@ class RigController:
                         head_y += 2.5 * env * amt
                         idle_brow_boost += 0.18 * env
                         idle_smile_boost += 0.16 * env
+
+        # 3.6 Idle loop clip: head / body / whole-body drift offsets, faded out for emotes and Motion Lab clips
+        idle_fx: dict[str, float] = {}
+        want_idle = 0.0 if (idle_clip is None or idle_block) else (IDLE_SPEAKING_W if speaking else 1.0)
+        self._idle_layer_w += (want_idle - self._idle_layer_w) * (1.0 - math.exp(-dt / 0.35))
+        iw = self._idle_layer_w * idle_mix
+        if idle_clip is not None and iw > 1e-3:
+            s_idle = self._idle_sample(idle_clip, idle_start, t_now)
+            head_x += s_idle.get("AngleX", 0.0) * iw
+            head_y += s_idle.get("AngleY", 0.0) * iw
+            head_z += s_idle.get("AngleZ", 0.0) * iw
+            body_x += s_idle.get("BodyX", 0.0) * iw
+            body_z += s_idle.get("BodyZ", 0.0) * iw
+            for trk, pname in IDLE_STAGE_TRACKS:
+                if trk in s_idle:
+                    idle_fx[pname] = s_idle[trk] * iw * IDLE_STAGE_GAIN
 
         # 3.7 Interaction-state layers
         # Listening: lean in, small attentive nods on a loose rhythm.
@@ -1949,9 +2037,9 @@ class RigController:
         #      eased by critically damped springs, then animated (twinkle / bob / throb) while active.
         self._vfx_step(dt, t_now, p, auto_vfx, vfx_ovr, vfx_emo, temp, em_vfx, em_smug, w_t, mv,
                        max(vb_open, _ff(lip.get("open", 0.0), 0.0)), quiet)
-        if clip_fx:                                    # Motion Lab stage hops / sways / lean-ins + shoulder shrug
+        if clip_fx or idle_fx:                         # Motion Lab stage hops / sways / lean-ins + shoulder shrug
             em_fx = dict(em_fx)
-            for k, v in clip_fx.items():
+            for k, v in list(clip_fx.items()) + list(idle_fx.items()):
                 em_fx[k] = em_fx.get(k, 0.0) + v
         self._rig_fx_step(dt, p, vfx_emo, temp, expr_name, em_fx, w_t, max(vb_open, _ff(lip.get("open", 0.0), 0.0)))
 

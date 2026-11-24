@@ -58,6 +58,7 @@ const store = {
   hooks: {},
   motions: [],
   motionStatus: {},
+  idleClip: {},
   fishStatus: {},
   fishCall: null,
   telemetry: { viseme: 'X', bands: [] },
@@ -114,6 +115,7 @@ const store = {
     this.hooks = st.hooks || {};
     this.motions = st.motions || [];
     this.motionStatus = st.motionStatus || {};
+    this.idleClip = st.idleClip || {};
     this.fishStatus = st.fishStatus || {};
     this.setRoomTitle(this.config.stage.room);
     this.setPuppetBadge(this.config.stage.activeModel || 'hikari', this.config.stage.activeModelName);

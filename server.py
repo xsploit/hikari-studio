@@ -445,6 +445,7 @@ class StudioRuntime:
         self.config.data["stage"]["activeModel"] = self.active_model_id
         # the decision engine offers the live puppet's own discovered abilities from the first turn
         self.decisions.set_rig_abilities(self.rig.get_rig_abilities(), self.active_model_id)
+        self._restore_idle_clip()
 
         self.plugins = PluginManager(HERE / "plugins", self.hooks)
         self.plugins.discover_and_load(self, self.config.data.get("plugins", {}))
@@ -517,6 +518,20 @@ class StudioRuntime:
 
     def model_path_for(self, model_id: str) -> Path | None:
         return self.model_path if model_id == HIKARI_ID else self.library_model_path(model_id)
+
+    def _restore_idle_clip(self) -> None:
+        """Re-install the saved Motion Lab idle loop (rig.idleClip); a missing / broken clip just clears it."""
+        cid = str(self.config.data.get("rig", {}).get("idleClip") or "")
+        if not cid:
+            return
+        path = _motion_path(cid, ".json")
+        try:
+            if path is None or not path.exists():
+                raise FileNotFoundError(cid)
+            self.rig.set_idle_clip(path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"[Hikari Studio] Idle loop clip {cid!r} not loaded ({exc}) - idle loop off", flush=True)
+            self.config.data["rig"]["idleClip"] = ""
 
     def _activate_meta(self, model_id: str, path: Path) -> dict[str, Any]:
         """Point the rig + UI meta at `model_id` (the engine is already running it)."""
@@ -1175,6 +1190,7 @@ class StudioRuntime:
             "hooks": self.hooks.stats(),
             "motions": motions,
             "motionStatus": self.rig.motion_status(),
+            "idleClip": self.rig.idle_clip_status(),
             "history": self.ai.history[-24:],
             "engineSize": [self.engine.width, self.engine.height],
             "fishStatus": {
@@ -1944,6 +1960,28 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         )
         return web.json_response({"ok": True, "status": runtime.rig.motion_status()})
 
+    async def api_motion_idle(req):
+        """POST /api/motion/idle {id}: loop that clip as her idle (head / body / drift only); {id: ""} turns it off."""
+        body = await _json_body(req)
+        if not isinstance(body, dict):
+            return web.json_response({"ok": False, "error": "Expected a JSON object"}, status=400)
+        cid = str(body.get("id") or "")
+        if cid:
+            clip_path = _motion_path(cid, ".json")
+            if clip_path is None:
+                return web.json_response({"ok": False, "error": "Invalid clip id"}, status=400)
+            if not await asyncio.to_thread(clip_path.exists):
+                return web.json_response({"ok": False, "error": "Clip not found"}, status=404)
+            try:
+                status = await asyncio.to_thread(runtime.rig.set_idle_clip, clip_path)
+            except (ValueError, json.JSONDecodeError) as exc:
+                return web.json_response({"ok": False, "error": f"Invalid motion clip: {exc}"}, status=400)
+        else:
+            status = runtime.rig.set_idle_clip(None)
+        runtime.config.data["rig"]["idleClip"] = status["id"]
+        await runtime.config.save_async()
+        return web.json_response({"ok": True, "idleClip": status})
+
     async def api_plugins_toggle(req):
         body = await req.json()
         pid = str(body.get("id") or "")
@@ -2546,6 +2584,7 @@ def build_app(runtime: StudioRuntime) -> web.Application:
     app.router.add_post("/api/motion/demo", api_motion_demo)
     app.router.add_post("/api/motion/play", api_motion_play)
     app.router.add_post("/api/motion/update", api_motion_update)
+    app.router.add_post("/api/motion/idle", api_motion_idle)
     app.router.add_post("/api/plugins", api_plugins_toggle)
     app.router.add_post("/api/hook/trigger", api_hook_trigger)
     app.router.add_post("/api/presets/save", api_save_preset)

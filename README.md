@@ -55,6 +55,7 @@ Most AI VTuber stacks glue together heavy Electron apps, paid proprietary Live2D
 - **Procedural Life & 15 Spring-Tweened Emotes:** Neuro-style autonomous idle choreographer (`curious_tilt`, `vibe_sway`, `happy_bounce`, `chat_read`, `daydream_sigh`, `cheeky_lean`), **Midori-style single-mesh continuous-skin deform arms**, and 15 one-click or AI-triggered emotes. The Decision Model decides whether to wave and when to play it (now, on reply, or after a beat).
 - **Universal Puppet Library:** Load Inochi2D `.inp` puppets, import Live2D models through MINT, and feed auto-discovered rig abilities to the Decision Model.
 - **Motion Lab:** A pure-motion video tracker captures 20 channels while leaving lip-sync under the voice pipeline’s control.
+- **Idle loop:** Any Motion Lab clip can be set as her looping idle (“Use as idle”). Only head, body and drift are borrowed, as seamless offsets on top of her own idle; her eyes, blinks, arms and mouth stay hers, and the loop fades out for emotes. The choice is remembered across restarts.
 - **Persistent Memory & Context:** SQLite preserves conversation continuity across restarts, and Waifu Studio–style fact memory recalls relevant details. Manage both in the [Memory & Context panel](docs/media/studio-memory.png).
 - **4.4 MB Rust + Tauri v2 Desktop App (`desktop-tauri/`):** System tray, Always-on-Top, frameless transparent OBS window, and Windows Job Object process cleanup so closing the app cleanly shuts down every child process.
 

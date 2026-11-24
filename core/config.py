@@ -132,7 +132,7 @@ _NUM_LIMITS: dict[tuple[str, str], tuple[float, float]] = {
     ("shader", "keyAngle"): (-720.0, 720.0),
     ("rig", "jiggleScale"): (0.0, 2.5), ("rig", "emissiveGlow"): (0.0, 2.0), ("rig", "chibiMode"): (0.0, 1.0),
     ("rig", "gloom"): (0.0, 1.0), ("rig", "blinkRate"): (0.05, 6.0), ("rig", "breathAmp"): (0.0, 3.0),
-    ("rig", "idleSway"): (0.0, 3.0), ("rig", "mouseLookStrength"): (0.0, 2.0), ("rig", "autoGazeLiveliness"): (0.0, 3.0),
+    ("rig", "idleSway"): (0.0, 3.0), ("rig", "idleClipMix"): (0.0, 1.5), ("rig", "mouseLookStrength"): (0.0, 2.0), ("rig", "autoGazeLiveliness"): (0.0, 3.0),
 }
 _SECTION_DEFAULT_LIMIT: dict[str, tuple[float, float]] = {
     "shader": (-10.0, 10.0), "rig": (-100.0, 100.0), "camera": (-4000.0, 4000.0), "stage": (-100.0, 100.0),
@@ -504,6 +504,8 @@ def default_config() -> dict[str, Any]:
             "autoBreath": True,
             "breathAmp": 1.0,
             "idleSway": 1.0,
+            "idleClip": "",              # Motion Lab clip id looped as her idle (head / body / drift only)
+            "idleClipMix": 0.6,
             "autoGaze": True,
             "autoGazeLiveliness": 1.0,
             "mouseLookAt": True,

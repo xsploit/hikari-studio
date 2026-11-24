@@ -146,18 +146,28 @@ export function renderMotionPanel(store) {
 
   const ms = store.motionStatus || { playing: false, id: '', mix: 0.85, loop: true };
   const motions = store.motions || [];
+  const idleId = store.idleClip?.id || '';
   const clipRows = motions.map((c) => {
     const active = ms.playing && ms.id === c.id;
+    const isIdle = idleId === c.id;
     return row({
       title: c.name,
-      desc: `${c.duration}s · ${c.hasAudio ? 'Audio + motion' : 'Motion'}${active ? ' · playing' : ''}`,
-      cls: active ? 'live' : '',
-      control: btn(active ? 'Stop' : 'Play', async () => {
-        const r = await (await postMotion('/api/motion/play',
-          active ? { id: '' } : { id: c.id, loop: ms.loop, mix: ms.mix, withAudio: false })).json();
-        store.motionStatus = r.status;
-        store.rerenderPanel();
-      }, active ? 'danger' : ''),
+      desc: `${c.duration}s · ${c.hasAudio ? 'Audio + motion' : 'Motion'}${active ? ' · playing' : ''}${isIdle ? ' · idle loop' : ''}`,
+      cls: active || isIdle ? 'live' : '',
+      control: [
+        btn(isIdle ? 'Idle ✓' : 'Use as idle', async () => {
+          const r = await (await postMotion('/api/motion/idle', { id: isIdle ? '' : c.id })).json();
+          if (r.ok) store.idleClip = r.idleClip;
+          else statusEl.textContent = `Error: ${r.error}`;
+          store.rerenderPanel();
+        }, isIdle ? 'primary' : ''),
+        btn(active ? 'Stop' : 'Play', async () => {
+          const r = await (await postMotion('/api/motion/play',
+            active ? { id: '' } : { id: c.id, loop: ms.loop, mix: ms.mix, withAudio: false })).json();
+          store.motionStatus = r.status;
+          store.rerenderPanel();
+        }, active ? 'danger' : ''),
+      ],
     });
   });
 
@@ -187,6 +197,13 @@ export function renderMotionPanel(store) {
       toggle({
         label: 'Loop clip', desc: 'Repeat the playing clip continuously', checked: ms.loop ?? true,
         onChange: async (v) => { ms.loop = v; await postMotion('/api/motion/update', { loop: v }); },
+      }),
+      slider({
+        label: 'Idle loop strength',
+        desc: idleId ? `Looping “${store.idleClip.name}” under everything: head, body and drift only (her own eyes, blinks, arms and mouth stay hers). Pauses for emotes.`
+          : 'Pick “Use as idle” on a clip to loop its head and body sway as her idle',
+        min: 0, max: 1.5, step: 0.05, value: store.config.rig.idleClipMix ?? 0.6, def: 0.6, suffix: '×',
+        onInput: (v) => store.patch('rig', { idleClipMix: v }),
       }),
     ], { desc: `${motions.length} clip${motions.length === 1 ? '' : 's'} · video-to-VTuber retargeting` }),
   ];
