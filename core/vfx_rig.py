@@ -951,12 +951,15 @@ def apply_vfx_rig(header: bytes, tid_of: dict[str, int], sizes: dict[str, tuple[
 #    Every vertex offset is a smooth function of the vertex's REST world position, so parts that touch at rest
 #    (topwear / resting arms / shoulder lineart, lash / eye white, lips / cavity) move identically at the seam.
 # =================================================================================================================
-PRO_PARAM_IDS = {"Stage X": 54200, "Stage Y": 54201, "Stage Zoom": 54202, "Pupil Shrink": 54203, "Shoulder Shrug": 54204}
+PRO_PARAM_IDS = {"Stage X": 54200, "Stage Y": 54201, "Stage Zoom": 54202, "Pupil Shrink": 54203, "Shoulder Shrug": 54204,
+                 "Stage Roll": 54205}
 PUPPET_ROOT = 1
-STAGE_X = 45.0                    # +-units of whole-body sway at Stage X = +-1
+STAGE_X = 80.0                    # +-units of whole-body sway at Stage X = +-1
 STAGE_Y = (45.0, -55.0)           # t.y at Stage Y = -1 (crouch, down) / +1 (hop, UP: Inochi2D y points down)
 STAGE_ZOOM = (0.92, 1.10)         # root scale at Stage Zoom = -1 (recoil back) / +1 (lean in)
 STAGE_PIVOT_Y = -420.0            # lean pivots on the face so the face stays framed while the body grows / shrinks
+STAGE_ROLL = 0.115                # +-radians (~6.6 deg) whole-body pendulum rock at Stage Roll = +-1
+STAGE_FOOT_Y = 590.0              # ankle/shoe pivot Y so feet stay planted on the floor while the whole body rocks
 PUPIL_SHRINK = 0.68               # iris scale at Pupil Shrink = 1
 SHRUG_UP, SHRUG_DOWN = 14.0, 8.0  # shoulder lift (units) at Shoulder Shrug = +1 / drop at -1
 SHRUG_TORSO = (1005, 53200, 53201, 51001)   # topwear, both shoulder lineart overlays (same mesh), halter collar
@@ -1055,6 +1058,14 @@ def apply_pro_transforms(puppet: dict[str, Any], iris_pngs: dict[str, bytes]) ->
         _bind(zp, PUPPET_ROOT, "transform.s.y", [s0, 1.0, s1])
         # world = s * p + t; t = pivot * (1 - s) keeps the pivot (face) fixed. Both are linear per segment -> exact.
         _bind(zp, PUPPET_ROOT, "transform.t.y", [STAGE_PIVOT_Y * (1 - s0), 0.0, STAGE_PIVOT_Y * (1 - s1)])
+        # Planted-foot whole-body rock: +r.z rotates CW (head right, feet left by -foot_y*sin(r)), so
+        # compensating t.x = +foot_y*sin(r), t.y = foot_y*(1-cos(r)) keeps her feet planted while everything rocks.
+        rp = _ensure_param(params, "Stage Roll", -1)
+        rx = STAGE_FOOT_Y * math.sin(STAGE_ROLL)
+        ry = STAGE_FOOT_Y * (1.0 - math.cos(STAGE_ROLL))
+        _bind(rp, PUPPET_ROOT, "transform.r.z", [-STAGE_ROLL, 0.0, STAGE_ROLL])
+        _bind(rp, PUPPET_ROOT, "transform.t.x", [-rx, 0.0, rx])
+        _bind(rp, PUPPET_ROOT, "transform.t.y", [ry, 0.0, ry])
 
     # ---- 2. Pupil Shrink: vertex scale toward each iris's true art centre (deforms add, so it stays centred
     #         while the gaze / head deforms move the iris). Eye white sits behind -> solid white, no hole.

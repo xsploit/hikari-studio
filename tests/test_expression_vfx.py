@@ -342,6 +342,7 @@ def max_step(s: list[float]) -> float:
 def test_rig_fx() -> None:
     rig, lip, cfg = new_rig()
     cfg["rig"]["expression"] = "happy"                       # no sustained pose: emotes alone drive the channels
+    cfg["rig"]["idleSway"] = 0.0                             # isolate emote / pose AAA channels from idle whole-body rock
     run(rig, cfg, 0.5)
     check("fx. AAA channels rest at 0", all(abs(rig.last_params[k][0]) < 1e-9 for k in FX_ALL))
 

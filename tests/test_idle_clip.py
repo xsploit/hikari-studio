@@ -68,7 +68,7 @@ def run(rig, cfg, seconds: float, lip=None, sink=None) -> list[dict[str, Any]]:
         out.append({"yaw": p["Angle"][0], "roll": p["Angle Z"][0], "bodyx": p["Body Angle X"][0],
                     "bodyy": p["Body Angle Y"][0], "bodyz": p["Body Angle Z"][0], "lean": p["Body Lean"][0],
                     "stageX": p["Stage X"][0], "stageY": p["Stage Y"][0], "stageZoom": p["Stage Zoom"][0],
-                    "shrug": p["Shoulder Shrug"][0],
+                    "stageRoll": p["Stage Roll"][0], "shrug": p["Shoulder Shrug"][0],
                     "armR": p["Arm R Pose"][0], "armL": p["Arm L Pose"][0], "eyeL": p["Left Eye Open"][0],
                     "w": rig._idle_layer_w})
     return out
@@ -96,6 +96,9 @@ def test_rig(tmp: Path) -> None:
 
     rig0, _, cfg0 = new_rig()
     base = run(rig0, cfg0, 12.0)
+    check("rig. procedural Neuro rock drives grounded Stage Roll + torso sway even without an idle clip",
+          stats([f["stageRoll"] for f in base[120:]]) > 0.25 and stats([f["bodyz"] for f in base[120:]]) > 2.0,
+          f"sr={stats([f['stageRoll'] for f in base[120:]]):.2f} bz={stats([f['bodyz'] for f in base[120:]]):.2f}")
 
     rig, lip, cfg = new_rig()
     st = rig.set_idle_clip(clip_path)
@@ -112,12 +115,12 @@ def test_rig(tmp: Path) -> None:
           and stats([f["bodyy"] for f in frames[120:]]) > 1.5
           and stats([f["lean"] for f in frames[120:]]) > 1.2,
           f"bz={stats([f['bodyz'] for f in frames[120:]]):.2f} by={stats([f['bodyy'] for f in frames[120:]]):.2f} lean={stats([f['lean'] for f in frames[120:]]):.2f}")
-    check("rig. idle loop moves whole-body Stage X/Y/Zoom & subtle shoulder bounce",
-          stats([f["stageX"] for f in frames[120:]]) > 0.18
+    check("rig. idle loop moves whole-body Stage Roll/Y/Zoom & subtle shoulder bounce",
+          stats([f["stageRoll"] for f in frames[120:]]) > 0.25
           and stats([f["stageY"] for f in frames[120:]]) > 0.12
           and stats([f["stageZoom"] for f in frames[120:]]) > 0.08
           and max(f["shrug"] for f in frames[120:]) > 0.06,
-          f"sx={stats([f['stageX'] for f in frames[120:]]):.2f} sy={stats([f['stageY'] for f in frames[120:]]):.2f} sz={stats([f['stageZoom'] for f in frames[120:]]):.2f}")
+          f"sr={stats([f['stageRoll'] for f in frames[120:]]):.2f} sy={stats([f['stageY'] for f in frames[120:]]):.2f} sz={stats([f['stageZoom'] for f in frames[120:]]):.2f}")
     check("rig. idle loop never raises an arm (clip had ArmR / ArmL = 1)",
           max(max(f["armR"], f["armL"]) for f in frames) == 0.0)
     check("rig. her own blinks keep happening (clip had eyes shut)",

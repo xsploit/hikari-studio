@@ -111,10 +111,11 @@ SMUG_EMOTIONS = frozenset(("smug", "playful", "teasing"))
 
 # AAA rig transforms built into Hikari-v28-Custom.inp (all 1D, -1..+1, default 0). Older rigs skip them.
 #   Stage X +1 = slide right | Stage Y +1 = hop up, -1 = crouch | Stage Zoom +1 = lean closer, -1 = recoil
+#   Stage Roll +1 = whole-body planted-foot rock right, -1 = rock left
 #   Shoulder Shrug +1 = hunch up, -1 = relax down | L/R mouth corner +1 = lift | Brow L/R X -1 = pinch inward
 #   Eye L/R Form -1 = lower upper lid (smug / sleepy), +1 = lift upper lid (wide-eyed)
 RIG_FX_PARAMS: tuple[str, ...] = (
-    "Stage X", "Stage Y", "Stage Zoom", "Shoulder Shrug", "Left mouth corner", "Right mouth corner",
+    "Stage X", "Stage Y", "Stage Zoom", "Stage Roll", "Shoulder Shrug", "Left mouth corner", "Right mouth corner",
     "Brow L X", "Brow R X", "Eye L Form", "Eye R Form",
 )
 _SMIRK = {"Left mouth corner": 0.65, "Right mouth corner": -0.2, "Eye L Form": -0.55, "Eye R Form": -0.55}
@@ -522,6 +523,9 @@ class RigController:
         self._idle_clip: dict[str, Any] | None = None
         self._idle_clip_start: float = now
         self._idle_layer_w: float = 0.0
+        # Organic Neuro-style whole-body rocking pendulum (planted-foot Stage Roll + lagged waist/head + 2x weight dip)
+        self._rock_phase: float = rnd.uniform(0.0, 6.283)
+        self._rock_w: float = 0.0
 
         # Expression VFX / blend-shape layer (auto emotion mapping + manual Studio overrides)
         self.auto_vfx = True
@@ -1219,8 +1223,34 @@ class RigController:
                         idle_brow_boost += 0.18 * env
                         idle_smile_boost += 0.16 * env
 
-        # 3.6 Idle loop clip: whole-body head / torso / stage sway offsets, faded out for emotes and Motion Lab clips
+        # 3.6 Whole-body Neuro-style rocking pendulum + optional Motion Lab idle loop clip
+        #     Both fade out smoothly for emotes / foreground Motion Lab clips and stay alive (calmer) while speaking.
         idle_fx: dict[str, float] = {}
+        rock_want = 0.0 if (idle_block or sway <= 0.01) else (0.62 if speaking else (0.55 if w_l > 0.5 else 1.0))
+        if idle_mix > 0.0:                                         # harmonize with active idle clip without doubling up
+            rock_want *= 0.65
+        self._rock_w += (rock_want - self._rock_w) * (1.0 - math.exp(-dt / 0.45))
+        rock_tempo = (2.0 * math.pi / 3.9) * (1.0 + 0.11 * math.sin(0.21 * t_now) + 0.06 * math.sin(0.083 * t_now))
+        self._rock_phase = (self._rock_phase + dt * rock_tempo) % (2.0 * math.pi * 100.0)
+        rw = self._rock_w * min(2.0, sway) * (0.80 + 0.20 * math.sin(0.17 * t_now + 1.1)) * (0.88 + 0.24 * arousal_n)
+        if rw > 1e-3:
+            ph = self._rock_phase
+            s1 = math.sin(ph)
+            s_waist = math.sin(ph - 0.28)                          # waist/torso lags ankles -> organic S-curve
+            s_head = math.sin(ph - 0.52)                           # head floats behind torso -> hair trails smoothly
+            dip2 = -math.cos(2.0 * ph)                             # 2x weight-shift bounce as she transfers foot-to-foot
+            lean_wave = math.sin(0.45 * ph + 0.7)                  # slow ~8.5 s breathing lean-in/out
+            rock_roll = (s1 + 0.12 * math.sin(2.0 * ph + 0.5)) * 0.68 * rw
+            idle_fx["Stage Roll"] = idle_fx.get("Stage Roll", 0.0) + rock_roll
+            idle_fx["Stage Y"] = idle_fx.get("Stage Y", 0.0) + dip2 * 0.14 * rw
+            idle_fx["Stage Zoom"] = idle_fx.get("Stage Zoom", 0.0) + lean_wave * 0.08 * rw
+            body_z += s_waist * 6.0 * rw
+            body_x += math.sin(ph - 0.18) * 4.0 * rw
+            body_y += -math.cos(2.0 * ph - 0.2) * 2.4 * rw
+            body_lean += lean_wave * 1.6 * rw
+            head_z += s_head * 2.8 * rw
+            head_x += math.sin(ph - 0.42) * 2.4 * rw
+
         want_idle = 0.0 if (idle_clip is None or idle_block) else (IDLE_SPEAKING_W if speaking else 1.0)
         self._idle_layer_w += (want_idle - self._idle_layer_w) * (1.0 - math.exp(-dt / 0.35))
         iw = self._idle_layer_w * idle_mix
@@ -1243,10 +1273,13 @@ class RigController:
             body_lean += (sz * 16.0 - ay * 0.22) * iw
             for trk, pname in IDLE_STAGE_TRACKS:
                 if trk in s_idle:
-                    idle_fx[pname] = s_idle[trk] * iw * IDLE_STAGE_GAIN
+                    # Keep feet grounded: route horizontal StageX mostly into planted-foot Stage Roll, not floor-sliding
+                    gain = 0.22 if pname == "Stage X" else IDLE_STAGE_GAIN
+                    idle_fx[pname] = idle_fx.get(pname, 0.0) + s_idle[trk] * iw * gain
+            idle_fx["Stage Roll"] = idle_fx.get("Stage Roll", 0.0) + (sx * 1.45 + bz * 0.055) * iw
             shrug_idle = _clamp((sy * 0.65 + max(0.0, ay) * 0.015) * iw, -0.15, 0.38)
             if abs(shrug_idle) > 1e-4:
-                idle_fx["Shoulder Shrug"] = shrug_idle
+                idle_fx["Shoulder Shrug"] = idle_fx.get("Shoulder Shrug", 0.0) + shrug_idle
 
         # 3.7 Interaction-state layers
         # Listening: lean in, small attentive nods on a loose rhythm.
