@@ -37,7 +37,7 @@ export class AvatarGLRenderer {
     if (!gl) throw new Error('WebGL2 required');
     this.gl = gl;
     this._busy = false;
-    this._aspect = 720 / 810;
+    this._aspect = 1440 / 1080;
     this._texW = 0;
     this._texH = 0;
 

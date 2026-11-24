@@ -438,7 +438,7 @@ class StudioRuntime:
         want_path = self.library_model_path(want) if want != HIKARI_ID else None
         if want != HIKARI_ID and want_path is None:
             print(f"[Hikari Studio] Library puppet {want!r} is missing - starting with {HIKARI_LABEL}", flush=True)
-        self.engine = NativeEngineBridge(ENGINE_EXE, SDL_DLL, want_path or self.model_path, width=960, height=1080)
+        self.engine = NativeEngineBridge(ENGINE_EXE, SDL_DLL, want_path or self.model_path, width=1440, height=1080)
         try:
             self.engine.start()
             if want_path is not None:
@@ -448,7 +448,7 @@ class StudioRuntime:
                 raise
             print(f"[Hikari Studio] Puppet {want!r} failed to start ({exc}) - falling back to {HIKARI_LABEL}", flush=True)
             self.engine.stop()
-            self.engine = NativeEngineBridge(ENGINE_EXE, SDL_DLL, self.model_path, width=960, height=1080)
+            self.engine = NativeEngineBridge(ENGINE_EXE, SDL_DLL, self.model_path, width=1440, height=1080)
             self.engine.start()
             self._activate_meta(HIKARI_ID, self.model_path)
         self.config.data["stage"]["activeModel"] = self.active_model_id

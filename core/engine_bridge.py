@@ -38,7 +38,7 @@ STOP_LOCK_WAIT_SEC = 1.0
 
 
 class NativeEngineBridge:
-    def __init__(self, exe_path: Path, sdl_path: Path, model_path: Path, width: int = 960, height: int = 1080) -> None:
+    def __init__(self, exe_path: Path, sdl_path: Path, model_path: Path, width: int = 1440, height: int = 1080) -> None:
         self.exe_path = exe_path
         self.sdl_path = sdl_path
         self.model_path = model_path
