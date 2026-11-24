@@ -48,6 +48,7 @@ def synth_clip(seconds: float = 8.0) -> dict[str, Any]:
         "ArmL": [1.0] * n,
         "StageX": [0.3 * math.sin(2 * math.pi * x / 6.0) for x in t],
         "StageY": [0.2 * math.sin(2 * math.pi * x / 2.9) for x in t],
+        "StageZoom": [0.15 * math.sin(2 * math.pi * x / 4.6) for x in t],
         "ArmRGesture": [1.0] * n,
         "ArmLGesture": [1.0] * n,
     }
@@ -65,6 +66,9 @@ def run(rig, cfg, seconds: float, lip=None, sink=None) -> list[dict[str, Any]]:
         CLOCK.now += DT
         p, _, _ = rig.step(DT, cfg, None)
         out.append({"yaw": p["Angle"][0], "roll": p["Angle Z"][0], "bodyx": p["Body Angle X"][0],
+                    "bodyy": p["Body Angle Y"][0], "bodyz": p["Body Angle Z"][0], "lean": p["Body Lean"][0],
+                    "stageX": p["Stage X"][0], "stageY": p["Stage Y"][0], "stageZoom": p["Stage Zoom"][0],
+                    "shrug": p["Shoulder Shrug"][0],
                     "armR": p["Arm R Pose"][0], "armL": p["Arm L Pose"][0], "eyeL": p["Left Eye Open"][0],
                     "w": rig._idle_layer_w})
     return out
@@ -102,7 +106,18 @@ def test_rig(tmp: Path) -> None:
     check("rig. idle loop adds clearly more head roll than the procedural idle", roll_i > roll_b * 1.5,
           f"idle {roll_i:.2f} vs base {roll_b:.2f}")
     check("rig. idle loop moves the body too",
-          stats([f["bodyx"] for f in frames[120:]]) > 1.0, f"{stats([f['bodyx'] for f in frames[120:]]):.2f}")
+          stats([f["bodyx"] for f in frames[120:]]) > 3.0, f"{stats([f['bodyx'] for f in frames[120:]]):.2f}")
+    check("rig. idle loop moves whole-body torso roll, dip & lean",
+          stats([f["bodyz"] for f in frames[120:]]) > 3.0
+          and stats([f["bodyy"] for f in frames[120:]]) > 1.5
+          and stats([f["lean"] for f in frames[120:]]) > 1.2,
+          f"bz={stats([f['bodyz'] for f in frames[120:]]):.2f} by={stats([f['bodyy'] for f in frames[120:]]):.2f} lean={stats([f['lean'] for f in frames[120:]]):.2f}")
+    check("rig. idle loop moves whole-body Stage X/Y/Zoom & subtle shoulder bounce",
+          stats([f["stageX"] for f in frames[120:]]) > 0.18
+          and stats([f["stageY"] for f in frames[120:]]) > 0.12
+          and stats([f["stageZoom"] for f in frames[120:]]) > 0.08
+          and max(f["shrug"] for f in frames[120:]) > 0.06,
+          f"sx={stats([f['stageX'] for f in frames[120:]]):.2f} sy={stats([f['stageY'] for f in frames[120:]]):.2f} sz={stats([f['stageZoom'] for f in frames[120:]]):.2f}")
     check("rig. idle loop never raises an arm (clip had ArmR / ArmL = 1)",
           max(max(f["armR"], f["armL"]) for f in frames) == 0.0)
     check("rig. her own blinks keep happening (clip had eyes shut)",

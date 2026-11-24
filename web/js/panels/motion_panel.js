@@ -200,9 +200,9 @@ export function renderMotionPanel(store) {
       }),
       slider({
         label: 'Idle loop strength',
-        desc: idleId ? `Looping “${store.idleClip.name}” under everything: head, body and drift only (her own eyes, blinks, arms and mouth stay hers). Pauses for emotes.`
-          : 'Pick “Use as idle” on a clip to loop its head and body sway as her idle',
-        min: 0, max: 1.5, step: 0.05, value: store.config.rig.idleClipMix ?? 0.6, def: 0.6, suffix: '×',
+        desc: idleId ? `Looping “${store.idleClip.name}” under everything: whole-body sway, torso lean, head and drift (her own eyes, blinks, arms and mouth stay hers). Pauses for emotes.`
+          : 'Pick “Use as idle” on a clip to loop its whole-body sway as her idle',
+        min: 0, max: 2.0, step: 0.05, value: store.config.rig.idleClipMix ?? 1.0, def: 1.0, suffix: '×',
         onInput: (v) => store.patch('rig', { idleClipMix: v }),
       }),
     ], { desc: `${motions.length} clip${motions.length === 1 ? '' : 's'} · video-to-VTuber retargeting` }),

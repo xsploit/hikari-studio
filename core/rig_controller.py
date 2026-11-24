@@ -251,11 +251,13 @@ MOTION_OPTIONAL_TRACKS = ("EyeLOpen", "EyeROpen", "EyeLookX", "EyeLookY", "BrowL
 # clip track -> AAA rig-fx param (driven through _rig_fx_step's springs, written only where the rig has it)
 MOTION_FX_TRACKS = (("StageX", "Stage X"), ("StageY", "Stage Y"), ("StageZoom", "Stage Zoom"),
                     ("ShoulderShrug", "Shoulder Shrug"))
-# Idle loop (Motion Lab "Use as idle"): only head / body / whole-body drift is borrowed from the clip, as offsets
-# around the clip's own average pose. Eyes, blinks, brows, arms and mouth always stay Hikari's own.
-IDLE_TRACKS = ("AngleX", "AngleY", "AngleZ", "BodyX", "BodyZ", "StageX", "StageY")
-IDLE_STAGE_TRACKS = (("StageX", "Stage X"), ("StageY", "Stage Y"))
-IDLE_STAGE_GAIN = 0.6          # whole-body drift is the loudest channel; keep it a touch under the clip's own
+# Idle loop (Motion Lab "Use as idle"): whole-body head / torso / stage sway borrowed from the clip, as offsets
+# around the clip's own average pose. Eyes, blinks, brows, raised arms and mouth always stay Hikari's own.
+IDLE_TRACKS = ("AngleX", "AngleY", "AngleZ", "BodyX", "BodyZ", "StageX", "StageY", "StageZoom")
+IDLE_STAGE_TRACKS = (("StageX", "Stage X"), ("StageY", "Stage Y"), ("StageZoom", "Stage Zoom"))
+IDLE_STAGE_GAIN = 1.45         # whole-body stage sway, bounce & lean-in so hips/legs/torso move visibly
+IDLE_BODY_X_GAIN = 1.85        # amplify tracked torso yaw so upper body turns with the head
+IDLE_BODY_Z_GAIN = 1.40        # amplify tracked torso rock so waist & shoulders lean into sways
 IDLE_SPEAKING_W = 0.75         # she keeps swaying while she talks (like Neuro), just a little steadier
 IDLE_LOOP_XFADE_SEC = 1.0      # tail -> head crossfade so the loop has no seam
 
@@ -1130,7 +1132,7 @@ class RigController:
         # 3.2 Held weight-shift postures + micro drift (replaces the fixed sine "screensaver" sway)
         sway = _clamp(_ff(rig_cfg.get("idleSway", 1.0), 1.0), 0.0, 3.0)
         energy_mul = sway * (0.8 + 0.5 * arousal_n)
-        idle_mix = _clamp(_ff(rig_cfg.get("idleClipMix", 0.6), 0.6), 0.0, 1.5) if idle_clip is not None else 0.0
+        idle_mix = _clamp(_ff(rig_cfg.get("idleClipMix", 1.0), 1.0), 0.0, 2.0) if idle_clip is not None else 0.0
         if idle_mix > 0.0:                                         # the idle loop carries the life: calmer holds
             energy_mul *= 1.0 - 0.5 * min(1.0, idle_mix)
         pose = self._posture_step(dt, t_now, energy_mul, max(w_s * 0.6, w_l * 0.5, w_t * 0.7))
@@ -1217,21 +1219,34 @@ class RigController:
                         idle_brow_boost += 0.18 * env
                         idle_smile_boost += 0.16 * env
 
-        # 3.6 Idle loop clip: head / body / whole-body drift offsets, faded out for emotes and Motion Lab clips
+        # 3.6 Idle loop clip: whole-body head / torso / stage sway offsets, faded out for emotes and Motion Lab clips
         idle_fx: dict[str, float] = {}
         want_idle = 0.0 if (idle_clip is None or idle_block) else (IDLE_SPEAKING_W if speaking else 1.0)
         self._idle_layer_w += (want_idle - self._idle_layer_w) * (1.0 - math.exp(-dt / 0.35))
         iw = self._idle_layer_w * idle_mix
         if idle_clip is not None and iw > 1e-3:
             s_idle = self._idle_sample(idle_clip, idle_start, t_now)
-            head_x += s_idle.get("AngleX", 0.0) * iw
-            head_y += s_idle.get("AngleY", 0.0) * iw
-            head_z += s_idle.get("AngleZ", 0.0) * iw
-            body_x += s_idle.get("BodyX", 0.0) * iw
-            body_z += s_idle.get("BodyZ", 0.0) * iw
+            ax = s_idle.get("AngleX", 0.0)
+            ay = s_idle.get("AngleY", 0.0)
+            az = s_idle.get("AngleZ", 0.0)
+            bx = s_idle.get("BodyX", 0.0)
+            bz = s_idle.get("BodyZ", 0.0)
+            sx = s_idle.get("StageX", 0.0)
+            sy = s_idle.get("StageY", 0.0)
+            sz = s_idle.get("StageZoom", 0.0)
+            head_x += ax * iw
+            head_y += ay * iw
+            head_z += az * iw
+            body_x += (bx * IDLE_BODY_X_GAIN + ax * 0.28) * iw
+            body_z += (bz * IDLE_BODY_Z_GAIN + sx * 5.5) * iw
+            body_y += (ay * 0.42 + sy * 12.0) * iw
+            body_lean += (sz * 16.0 - ay * 0.22) * iw
             for trk, pname in IDLE_STAGE_TRACKS:
                 if trk in s_idle:
                     idle_fx[pname] = s_idle[trk] * iw * IDLE_STAGE_GAIN
+            shrug_idle = _clamp((sy * 0.65 + max(0.0, ay) * 0.015) * iw, -0.15, 0.38)
+            if abs(shrug_idle) > 1e-4:
+                idle_fx["Shoulder Shrug"] = shrug_idle
 
         # 3.7 Interaction-state layers
         # Listening: lean in, small attentive nods on a loose rhythm.
