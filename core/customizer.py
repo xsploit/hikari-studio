@@ -716,20 +716,218 @@ def _arm_skin_reference() -> np.ndarray | None:
 
 
 # Topwear UV rows of the vertical shoulder-socket skin tabs (~0.140..0.375, plus the narrow skin tip that runs down
-# to the armpit point). The resting arm only lies underneath from ~0.15 down, so the dissolve eases in over
-# 0.140-0.185 (never revealing background above the arm) and out over 0.360-0.405.
-_TAB_Y0, _TAB_IN, _TAB_OUT, _TAB_Y1 = 0.140, 0.185, 0.360, 0.405
+# to the armpit point). The dissolve is at full strength from 0.150 and eases out over 0.360-0.405; near the top
+# it is additionally limited per pixel to where the resting arm really lies underneath (never a background hole).
+_TAB_Y0, _TAB_IN, _TAB_OUT, _TAB_Y1 = 0.140, 0.150, 0.360, 0.405
+_TAB_ARM_MARGIN_PX = 2.0    # the tab only turns transparent >= this far inside the arm silhouette (+3 px ramp)
 _TAB_DISSOLVE_PX = 40.0     # cubic alpha dissolve from the cut inward (arm skin covers >= 49 px past the cut)
 _TAB_DEFRINGE_PX = 5        # outer px of the cut whose dark / light outline is replaced with skin
 
 
+# Rest-pose world boxes of the meshes involved (used to map the resting-arm silhouette into topwear texture space):
+# ArtMeshTopwear x -92..+93, y -362..-100; right resting arm x -242..-66 / left arm x 65..241, y -323..+121.
+_TOP_WORLD_X0, _TOP_WORLD_W, _TOP_WORLD_Y0, _TOP_WORLD_H = -92.0, 185.0, -362.0, 262.0
+_ARM_R_WORLD_X0, _ARM_L_WORLD_X0, _ARM_WORLD_W, _ARM_WORLD_Y0, _ARM_WORLD_H = -242.0, 65.0, 176.0, -323.0, 444.0
+_CORNER_SPAN_PX = 52.0      # trapezius -> deltoid blend length, from the tab cut toward the neck
+_CORNER_MAX_CUT_PX = 12.0   # never carve the top edge deeper than this
+_CORNER_LINE_PX = 2.6       # lineart width painted along the carved edge (matches the arm's ~3 px outline)
+_ARM_SIL: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+_TEX_NONE = 4294967295
+
+
+def _arm_silhouette() -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """(alpha 0..1, distance-inside-silhouette in px, outline rgb) of the HD resting-arm art, cached."""
+    if _ARM_SIL:
+        return _ARM_SIL[0]
+    if not HD_ARM_RIGHT.exists():
+        return None
+    arr = np.array(Image.open(HD_ARM_RIGHT).convert("RGBA"), dtype=np.float32)
+    a = arr[..., 3] / 255.0
+    dist = cv2.distanceTransform((a > 0.5).astype(np.uint8), cv2.DIST_L2, 5)
+    edge = (dist >= 1.0) & (dist <= 2.5) & (a > 0.9)
+    line = np.median(arr[edge][:, :3], axis=0) if np.any(edge) else np.array([148.0, 96.0, 77.0], np.float32)
+    _ARM_SIL.append((a, dist, line))
+    return _ARM_SIL[0]
+
+
+def _arm_in_top_space(h: int, w: int, flip: bool, xs: np.ndarray, ys: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    """Sample the rest-pose resting arm (alpha, distance inside its silhouette in topwear px) on a grid of one
+    side's topwear texture columns `xs` x rows `ys` (`flip` = the mirrored right tab / left arm)."""
+    sil = _arm_silhouette()
+    if sil is None:
+        return None
+    arm_a, arm_d, _ = sil
+    gx, gy = np.meshgrid(xs.astype(np.float64) + 0.5, ys.astype(np.float64) + 0.5)
+    wx = ((_TOP_WORLD_X0 + _TOP_WORLD_W) - gx / w * _TOP_WORLD_W) if flip else (gx / w * _TOP_WORLD_W + _TOP_WORLD_X0)
+    wy = gy / h * _TOP_WORLD_H + _TOP_WORLD_Y0
+    AH, AW = arm_a.shape
+    u = (1.0 - (wx - _ARM_L_WORLD_X0) / _ARM_WORLD_W) if flip else ((wx - _ARM_R_WORLD_X0) / _ARM_WORLD_W)
+    v = (wy - _ARM_WORLD_Y0) / _ARM_WORLD_H
+    inside = (u >= 0.0) & (u < 1.0) & (v >= 0.0) & (v < 1.0)
+    axi = np.clip((u * AW).astype(np.int64), 0, AW - 1)
+    ayi = np.clip((v * AH).astype(np.int64), 0, AH - 1)
+    # arm texels per topwear texel (both ~4 px / world unit at the shipped sizes)
+    px_ratio = (w / _TOP_WORLD_W) / (AW / _ARM_WORLD_W)
+    alpha = np.where(inside, arm_a[ayi, axi], 0.0)
+    dist = np.where(inside, arm_d[ayi, axi] * px_ratio, 0.0)
+    return alpha, dist
+
+
+def _round_tab_top_corner(A: np.ndarray, C: np.ndarray, flip: bool, line_layer: np.ndarray | None = None) -> None:
+    """Tuck the flat top-outer corner of a shoulder tab under the arm's rounded deltoid (in place, on one side's
+    straight-colour view). Both top edges are measured with sub-pixel precision (column coverage), the carved edge
+    starts exactly on the arm's top contour, tangent to it, eases into the topwear's own trapezius line over
+    _CORNER_SPAN_PX and then hands back to the texture's native soft edge over a further taper. Only pixels ABOVE
+    that curve are removed (never a hole inside the shoulder); the arm's lineart continues along the new edge,
+    fading out toward the neck. With `line_layer` the lineart goes into that alpha layer instead of the topwear
+    colour, so it can live on an overlay that hides together with the resting arm (raised-arm poses)."""
+    sil = _arm_silhouette()
+    if sil is None:
+        return
+    line_rgb = sil[2]
+    h, w = A.shape
+    sx, sy = w / 740.0, h / 1048.0
+    y0, y1 = int(0.10 * h), int(0.24 * h)
+    # The tab's vertical cut at the top of the tab zone (leftmost opaque column over rows 0.14-0.17).
+    cut_rows = A[int(0.14 * h):int(0.17 * h)]
+    cols = np.nonzero((cut_rows > 0.5).any(axis=0))[0]
+    if len(cols) == 0:
+        return
+    x_cut = int(cols[0])
+    span, taper = _CORNER_SPAN_PX * sx, 24.0 * sx
+    xs = np.arange(max(0, x_cut - int(30 * sx)), min(w, x_cut + int(np.ceil(span + taper + 24 * sx)) + 2))
+    ys = np.arange(y0, y1)
+    sampled = _arm_in_top_space(h, w, flip, xs, ys)
+    if sampled is None:
+        return
+    arm_a = np.clip(sampled[0], 0.0, 1.0)
+    top_a = np.clip(A[y0:y1, xs], 0.0, 1.0)
+    big = float(y1 + 100)
+
+    def sub_edge(alpha: np.ndarray) -> np.ndarray:
+        """Sub-pixel top edge per column = rows of missing coverage above the solid body (columns that are not
+        solid at the bottom of the window have no top edge here)."""
+        edge = y0 + np.sum(1.0 - alpha, axis=0)
+        return np.where(alpha[-1] > 0.9, edge, big)
+
+    arm_top = sub_edge(arm_a)
+    top_top = sub_edge(top_a)
+    # Corner = first column (from the cut inward) where the topwear's top edge reaches the arm's top contour:
+    # from there on the flat trapezius edge would stand above the rounding deltoid.
+    ok = (top_top < big) & (arm_top < big)
+    above = np.nonzero((xs >= x_cut) & ok & (top_top <= arm_top + 0.5))[0]
+    if len(above) == 0:
+        return
+    x_c = float(xs[int(above[0])])
+    left = np.nonzero((xs >= x_c - 24 * sx) & (xs <= x_c) & (arm_top < big))[0]
+    if len(left) < 4:
+        return
+    k1, k0 = np.polyfit(xs[left].astype(np.float64), arm_top[left], 1)     # deltoid tangent at the corner
+    y_arm_c = float(k1 * x_c + k0)
+    xf = xs.astype(np.float64)
+    t = np.clip((xf - x_c) / span, 0.0, 1.0)
+    s_w = t * t * (3.0 - 2.0 * t)
+    top_ref = np.where(top_top < big, top_top, y_arm_c)
+    y_t = (1.0 - s_w) * (y_arm_c + k1 * (xf - x_c)) + s_w * top_ref
+    # At / outside the corner follow the arm itself (and remove everything where neither has a top edge).
+    y_t = np.where(xf < x_c, np.where(arm_top < big, np.maximum(arm_top, top_ref), big), y_t)
+    y_t = np.where(top_top < big, np.minimum(np.maximum(y_t, top_top), top_top + _CORNER_MAX_CUT_PX * sy), y_t)
+    inner = (xf >= x_c) & (y_t < big)
+    if inner.sum() > 3:                                                    # smooth out texel raggedness
+        y_t[inner] = cv2.GaussianBlur(y_t[inner].reshape(-1, 1).astype(np.float32), (1, 0), 1.2 * sx).ravel()
+    tp = np.clip((xf - (x_c + span)) / taper, 0.0, 1.0)                   # hand back to the native soft edge
+    tp = tp * tp * (3.0 - 2.0 * tp)
+    line_w = (1.0 - s_w) ** 1.5 * np.clip((y_t - top_ref) / 2.0 + 0.35, 0.0, 1.0) * (1.0 - tp)
+    # Outside the corner the arm draws its own outline: lineart only along the carved edge (from the corner in),
+    # ramping on over 2 px so it joins the arm's outline without a dot.
+    line_w = line_w * np.clip((xf - (x_c - 2.0 * sx)) / (2.0 * sx), 0.0, 1.0)
+    lw = _CORNER_LINE_PX * sy
+    yy = ys.astype(np.float64) + 0.5
+    for j, x in enumerate(xs):
+        if tp[j] >= 0.999:
+            continue
+        yt = float(y_t[j])
+        cover = np.clip(yy - yt + 0.5, 0.0, 1.0) if yt < big else np.zeros_like(yy)
+        A[y0:y1, x] *= cover * (1.0 - tp[j]) + tp[j]
+        if line_w[j] > 0.01 and yt < big:
+            prof = np.clip(1.0 - np.abs(yy - (yt + 0.5 * lw)) / (0.5 * lw + 0.5), 0.0, 1.0) * line_w[j]
+            if line_layer is not None:
+                line_layer[y0:y1, x] = np.maximum(line_layer[y0:y1, x], prof * A[y0:y1, x])
+            else:
+                C[y0:y1, x] = C[y0:y1, x] * (1.0 - prof[:, None]) + line_rgb[None, :] * prof[:, None]
+
+
+SHOULDER_LINE_NODES = {"R": 53200, "L": 53201}
+
+
+def _attach_shoulder_line_overlays(header: bytes, tex_r: int, tex_l: int) -> bytes:
+    """Mount the two shoulder-corner lineart overlays (see _round_tab_top_corner) as Parts that share
+    ArtMeshTopwear's mesh + every one of its deform bindings (so they stay glued to the carved edge in every pose),
+    drawn just in front of it, with opacity cross-fading out exactly like the resting arm on Arm R/L Pose."""
+    puppet = json.loads(header[12:])
+    top = None
+    parent = None
+    stack = [(puppet["nodes"], None)]
+    while stack:
+        n, par = stack.pop()
+        if n.get("uuid") == 1005:
+            top, parent = n, par
+            break
+        stack.extend((c, n) for c in n.get("children", ()))
+    if top is None or parent is None or not top.get("mesh"):
+        return header
+    kids = parent.setdefault("children", [])
+    kids[:] = [c for c in kids if c.get("uuid") not in SHOULDER_LINE_NODES.values()]
+    for side, tid in (("R", tex_r), ("L", tex_l)):
+        uid = SHOULDER_LINE_NODES[side]
+        kids.append({
+            "uuid": uid, "name": f"{'Right' if side == 'R' else 'Left'} shoulder corner lineart", "type": "Part",
+            "enabled": True, "zsort": round(float(top.get("zsort", -7.0)) - 0.02, 4),
+            "transform": json.loads(json.dumps(top.get("transform", {"trans": [0, 0, 0], "rot": [0, 0, 0], "scale": [1, 1]}))),
+            "lockToRoot": False, "textures": [tid, _TEX_NONE, _TEX_NONE], "blend_mode": "Normal",
+            "tint": [1.0, 1.0, 1.0], "screenTint": [0.0, 0.0, 0.0], "mask_threshold": 0.5, "opacity": 1.0, "masks": [],
+            "mesh": json.loads(json.dumps(top["mesh"])), "children": [],
+        })
+    arm_of = {"R": 1046, "L": 1000}
+    for prm in puppet.get("param", []):
+        bs = prm.get("bindings", [])
+        bs[:] = [b for b in bs if b.get("node") not in SHOULDER_LINE_NODES.values()]
+        extra = []
+        for b in bs:
+            if b.get("node") == 1005 and b.get("param_name") == "deform":
+                for uid in SHOULDER_LINE_NODES.values():
+                    nb = json.loads(json.dumps(b))
+                    nb["node"] = uid
+                    extra.append(nb)
+        name = str(prm.get("name") or "")
+        for side in ("R", "L"):
+            if name == f"Arm {side} Pose":
+                ob = next((b for b in bs if b.get("node") == arm_of[side] and b.get("param_name") == "opacity"), None)
+                if ob is not None:
+                    nb = json.loads(json.dumps(ob))
+                    nb["node"] = SHOULDER_LINE_NODES[side]
+                    extra.append(nb)
+        bs.extend(extra)
+    content = json.dumps(puppet, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return header[:8] + len(content).to_bytes(4, "big") + content
+
+
 def _feather_topwear_shoulder_tabs_premul(premul_png: bytes) -> bytes:
+    """Topwear texture with both shoulder tabs carved + feathered and the corner lineart painted in (standalone use).
+    The customizer build uses _feather_topwear_shoulder_tabs_layers so the lineart can hide with the arms."""
+    return _feather_topwear_shoulder_tabs_layers(premul_png, separate_lines=False)[0]
+
+
+def _feather_topwear_shoulder_tabs_layers(premul_png: bytes, separate_lines: bool = True) -> tuple[bytes, bytes | None, bytes | None]:
     """Melt the left / right vertical shoulder-socket skin tabs of ANY topwear texture (original, hikari-stripe,
     refined-vrm) into the resting arm underneath: works on un-premultiplied RGB + alpha, then re-premultiplies.
     Per row (only where the pixels next to the cut are skin, so halter fabric / cyan piping are never touched):
       1. defringe the outer 5 px of outline along the cut with the row's own interior skin colour;
       2. pull the fading skin toward the arm's tone so there is no colour step;
-      3. cubic (smoothstep) alpha dissolve over 40 px from the cut inward, shortened where the skin run is short."""
+      3. cubic (smoothstep) alpha dissolve over 40 px from the cut inward, shortened where the skin run is short.
+    Before that, the tab's flat top-outer corner is carved into the arm's rounded deltoid (_round_tab_top_corner).
+    Returns (topwear, right-arm-side lineart overlay, left-arm-side lineart overlay); overlays are None unless
+    `separate_lines`."""
     im = Image.open(io.BytesIO(premul_png)).convert("RGBA")
     arr = np.array(im, dtype=np.float32)
     h, w = arr.shape[:2]
@@ -760,9 +958,12 @@ def _feather_topwear_shoulder_tabs_premul(premul_png: bytes) -> bytes:
             v = np.min(np.stack([pad[k:k + len(v)] for k in range(2 * erode + 1)]), axis=0)
         return cv2.GaussianBlur(v.reshape(-1, 1).astype(np.float32), (1, 0), sigma).ravel()
 
+    lines = {False: np.zeros((h, w), np.float32), True: np.zeros((h, w), np.float32)} if separate_lines else None
     for flip in (False, True):                       # left tab, then the mirrored right tab (views, edited in place)
         A = a[:, ::-1] if flip else a
         C = rgb[:, ::-1] if flip else rgb
+        # 0. Round the flat top-outer corner of the tab into the arm's deltoid curve (no squared shelf).
+        _round_tab_top_corner(A, C, flip, None if lines is None else lines[flip][:, ::-1] if flip else lines[flip])
         # Pass 1: measure every row (cut position, skin run, interior skin colour).
         n_rows = len(rows)
         xe_r = np.zeros(n_rows, dtype=np.int64)
@@ -788,8 +989,15 @@ def _feather_topwear_shoulder_tabs_premul(premul_png: bytes) -> bytes:
             d_r[k] = float(np.clip(run - 5.0 * sx, 0.0, dis_px))
             skin_r[k] = np.median(C[y, ref_lo:ref_hi], axis=0)
         # Smooth across rows: no row-to-row on/off steps, and the fade narrows gradually where fabric closes in.
-        strength = erode_blur(ok_r * env, int(round(5 * sx)), 2.5 * sx) * ok_r
+        strength = erode_blur(ok_r * env, int(round(2 * sx)), 1.5 * sx) * ok_r
         d_s = np.maximum(erode_blur(d_r, int(round(2 * sx)), 2.0 * sx), 3.0 * sx)
+        # Per-pixel arm coverage under the dissolve band (1 well inside the arm, 0 outside / on its outline).
+        x_hi = min(w, int(xe_r.max() + dis_px + 3)) if ok_r.any() else 0
+        arm_cov = None
+        if x_hi > 0:
+            sampled = _arm_in_top_space(h, w, flip, np.arange(x_hi), rows)
+            if sampled is not None:
+                arm_cov = np.clip((sampled[1] - _TAB_ARM_MARGIN_PX * sx) / (3.0 * sx), 0.0, 1.0)
         # Pass 2: apply.
         for k, y in enumerate(rows):
             st = float(strength[k])
@@ -802,24 +1010,35 @@ def _feather_topwear_shoulder_tabs_premul(premul_png: bytes) -> bytes:
             d = (xx - xe).astype(np.float32)
             t = np.clip(d / d_len, 0.0, 1.0)
             fade = t * t * (3.0 - 2.0 * t)
+            cov = arm_cov[k, xe:xe + len(xx)] if arm_cov is not None else np.ones(len(xx), np.float32)
+            stp = st * cov                                   # per-pixel strength: only over real arm skin
             seg = C[y, xe:xe + len(xx)].copy()
             # 1. defringe: the outer px take the row's interior skin colour
-            k_def = (np.clip(1.0 - (d - fringe + 1.0) / 2.0, 0.0, 1.0) * st)[:, None]
+            k_def = (np.clip(1.0 - (d - fringe + 1.0) / 2.0, 0.0, 1.0) * stp)[:, None]
             seg = seg * (1.0 - k_def) + row_skin[None, :] * k_def
             # 2. tone match toward the arm where the tab is mostly transparent
-            k_tone = (0.6 * (1.0 - fade) * st)[:, None]
+            k_tone = (0.6 * (1.0 - fade) * stp)[:, None]
             seg = seg * (1.0 - k_tone) + target[None, :] * k_tone
             C[y, xe:xe + len(xx)] = seg
             # 3. cubic alpha dissolve
-            A[y, xe:xe + len(xx)] *= (1.0 - st) + st * fade
+            A[y, xe:xe + len(xx)] *= (1.0 - stp) + stp * fade
 
-    out = np.zeros((h, w, 4), dtype=np.uint8)
-    out[..., :3] = np.clip(np.rint(rgb * a[..., None]), 0, 255).astype(np.uint8)
-    out[..., 3] = np.clip(np.rint(a * 255.0), 0, 255).astype(np.uint8)
-    out[out[..., 3] == 0] = 0
-    buf = io.BytesIO()
-    Image.fromarray(out).save(buf, format="PNG", compress_level=6)
-    return buf.getvalue()
+    def _encode(rgb_s: np.ndarray, alpha: np.ndarray) -> bytes:
+        out = np.zeros((h, w, 4), dtype=np.uint8)
+        out[..., :3] = np.clip(np.rint(rgb_s * alpha[..., None]), 0, 255).astype(np.uint8)
+        out[..., 3] = np.clip(np.rint(alpha * 255.0), 0, 255).astype(np.uint8)
+        out[out[..., 3] == 0] = 0
+        buf = io.BytesIO()
+        Image.fromarray(out).save(buf, format="PNG", compress_level=6)
+        return buf.getvalue()
+
+    top_bytes = _encode(rgb, a)
+    if lines is None:
+        return top_bytes, None, None
+    sil = _arm_silhouette()
+    line_rgb = sil[2] if sil is not None else np.array([148.0, 96.0, 77.0], np.float32)
+    solid = np.broadcast_to(line_rgb[None, None, :], (h, w, 3))
+    return top_bytes, _encode(solid, np.clip(lines[False], 0.0, 1.0)), _encode(solid, np.clip(lines[True], 0.0, 1.0))
 
 
 def _add_neck_back_collar_ring(neck_premul_bytes: bytes) -> bytes:
@@ -1451,15 +1670,16 @@ class CharacterCustomizer:
             out = cache[key] = build(header)
         return out
 
-    def _feathered_top(self, premul_png: bytes) -> bytes:
-        """Cached shoulder-tab feather for whichever topwear texture is active."""
-        cache: dict[tuple[Any, ...], bytes] = self.__dict__.setdefault("_tab_cache", {})
+    def _feathered_top(self, premul_png: bytes) -> tuple[bytes, bytes | None, bytes | None]:
+        """Cached shoulder-tab feather + corner carve for whichever topwear texture is active:
+        (topwear, right-shoulder lineart overlay, left-shoulder lineart overlay)."""
+        cache: dict[tuple[Any, ...], tuple[bytes, bytes | None, bytes | None]] = self.__dict__.setdefault("_tab_cache", {})
         key = ("tabs", len(premul_png), hash(premul_png))
         out = cache.get(key)
         if out is None:
             if len(cache) > 8:
                 cache.clear()
-            out = _feather_topwear_shoulder_tabs_premul(premul_png)
+            out = _feather_topwear_shoulder_tabs_layers(premul_png)
             cache[key] = out
         return out
 
@@ -1671,8 +1891,12 @@ class CharacterCustomizer:
                         self._smooth_wardrobe_cache[ckey] = _smooth_raised_upper_arm_cap(out_texs[tid_w][1], is_left=is_l)
                     out_texs[tid_w] = (0, self._smooth_wardrobe_cache[ckey])
         # Seamless shoulders on every outfit: melt the vertical shoulder-socket skin tabs into the arm (pre-tint).
+        shoulder_lines: tuple[bytes, bytes] | None = None
         if out_texs[TOP_TEXTURE][0] == 0:
-            out_texs[TOP_TEXTURE] = (0, self._feathered_top(out_texs[TOP_TEXTURE][1]))
+            top_png, line_r, line_l = self._feathered_top(out_texs[TOP_TEXTURE][1])
+            out_texs[TOP_TEXTURE] = (0, top_png)
+            if line_r is not None and line_l is not None:
+                shoulder_lines = (line_r, line_l)
         if is_high_top:
             for texture_index, paint in zip(SHOE_TEXTURES, self.wardrobe.high_tops, strict=True):
                 out_texs[texture_index] = (0, paint)
@@ -1726,6 +1950,15 @@ class CharacterCustomizer:
             out_texs.append((0, em_top))
         header = self._cached_header(("emissive", tuple(sorted(emissive_map.items()))), header,
                                      lambda h: _attach_emissive_maps(h, emissive_map))
+
+        # Shoulder-corner lineart overlays (glued to ArtMeshTopwear, fade out with the resting arms).
+        if shoulder_lines is not None:
+            tid_r = len(out_texs)
+            out_texs.append((0, shoulder_lines[0]))
+            tid_l = len(out_texs)
+            out_texs.append((0, shoulder_lines[1]))
+            header = self._cached_header(("shoulder-lines", tid_r, tid_l), header,
+                                         lambda h: _attach_shoulder_line_overlays(h, tid_r, tid_l))
 
         tmp = out_inp.with_suffix(".tmp")
         tmp.write_bytes(_pack_inp(header, out_texs, self._trailing))
