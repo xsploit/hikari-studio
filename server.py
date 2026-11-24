@@ -54,7 +54,10 @@ from modules.fish_duplex import FishDuplexController, compose_session_prompt
 from modules.fish_tts_stream import FISH_TRANSPORTS, clean_for_speech
 from modules.lipsync import LiveLipSyncEngine
 from modules.memory_store import CATEGORIES, MemoryStore, PinLimitError
-from modules.vercel_gateway import catalog_entries, evaluation_catalog
+from modules import fish_voices
+from modules.vercel_gateway import (
+    catalog_entries, evaluation_catalog, list_chat_models_and_providers, pick_gateway_model, resolve_gateway_key,
+)
 from modules.video_retarget import extract_motion_from_video
 
 HERE = Path(__file__).resolve().parent
@@ -414,6 +417,11 @@ class StudioRuntime:
         self._memory_task: asyncio.Task | None = None
         self._last_user_activity = time.monotonic()
         self._bg_tasks: set[asyncio.Task] = set()
+        # Decided wave timing (Decision.wave_timing): one cancellable "after_beat" task and one "on_reply" emote
+        # stashed until her spoken reply begins. A newer emote / explicit action / failed turn cancels both.
+        self._wave_task: asyncio.Task | None = None
+        self._pending_reply_emote: str | None = None
+        self._pending_reply_at = 0.0
 
         self.rig = RigController(self.param_defaults, self.lipsync, self.hooks)
         self.sync_rig_flags()
@@ -757,14 +765,56 @@ class StudioRuntime:
         self.memory.update_config(self.config.data["memory"])
         self.ai.set_history_turns(self.memory.history_turns)
 
+    WAVE_AFTER_BEAT_SEC = 0.75       # "after_beat": a brief natural beat before the wave
+    PENDING_REPLY_TTL_SEC = 15.0     # an "on_reply" wave expires if no reply starts within this window
+
+    def cancel_pending_wave(self) -> None:
+        """Drop any deferred wave (after_beat task / on_reply stash): a newer turn or action supersedes it."""
+        task, self._wave_task = self._wave_task, None
+        if task is not None and not task.done():
+            task.cancel()
+        self._pending_reply_emote = None
+
+    def take_pending_reply_emote(self) -> str | None:
+        """The stashed on_reply emote (cleared either way), or None when there is none / it expired."""
+        emote, self._pending_reply_emote = self._pending_reply_emote, None
+        if emote and (time.monotonic() - self._pending_reply_at) <= self.PENDING_REPLY_TTL_SEC:
+            return emote
+        return None
+
+    async def _delayed_emote(self, emote: str, delay: float) -> None:
+        await asyncio.sleep(delay)                      # cancelled -> CancelledError, nothing plays
+        if self._wave_task is asyncio.current_task():
+            self._wave_task = None
+        self.rig.trigger_emote(emote)
+
+    def _fire_pending_reply_emote(self, decision: Decision | None) -> str | None:
+        """Her reply's voice just started: play the viewer turn's on_reply wave unless the reply chose its own emote."""
+        emote = self.take_pending_reply_emote()
+        if emote and not (decision is not None and decision.emote):
+            if self.rig.trigger_emote(emote).get("ok"):
+                return emote
+        return None
+
     async def apply_decision(self, d: Decision, *, temp_action: bool = False, hold: float = 4.2) -> Decision:
-        """Play a decided emote (already cooldown-gated) and tell connected clients."""
+        """Play a decided emote (already cooldown-gated) and tell connected clients. The Decision Model also
+        decided WHEN a wave plays (d.wave_timing): now | after_beat (0.75 s, cancellable) | on_reply (fired by
+        deliver_reply as her spoken reply begins)."""
         if d.emote:
-            res = self.rig.trigger_emote(d.emote)
-            if not res.get("ok"):
-                d.skipped, d.emote = "unknown emote", None
+            self.cancel_pending_wave()                  # a newer emote supersedes any stale deferred wave
+            timing = d.wave_timing if d.wave else "now"
+            if timing == "after_beat":
+                self._wave_task = self.spawn(self._delayed_emote(d.emote, self.WAVE_AFTER_BEAT_SEC))
+            elif (timing == "on_reply" and d.source in ("user", "fish_user")
+                  and not self.lipsync.is_speaking()):
+                self._pending_reply_emote, self._pending_reply_at = d.emote, time.monotonic()
+            else:
+                res = self.rig.trigger_emote(d.emote)
+                if not res.get("ok"):
+                    d.skipped, d.emote = "unknown emote", None
         if temp_action:
-            self.rig.trigger_temp_action(TAG_TO_STATE.get(d.tag, TAG_TO_STATE["happy"]), duration=hold)
+            tag = d.tag if (d.tag != "wave" or d.wave) else "happy"     # never TAG_TO_STATE["wave"] without a wave
+            self.rig.trigger_temp_action(TAG_TO_STATE.get(tag, TAG_TO_STATE["happy"]), duration=hold)
         # Auto expression VFX follow the decided emotion (neutral / unknown eases them back to calm).
         self.rig.set_vfx_emotion(d.emotion, hold=max(6.0, hold))
         await self.broadcast_json({"type": "decision", "decision": d.to_dict()})
@@ -1044,7 +1094,8 @@ class StudioRuntime:
         d = await self._await_decision(task, "reply", "happy")
         if not explicit_tag:
             hold = max(1.5, speech_end - time.monotonic() + 0.6)
-            self.rig.trigger_temp_action(TAG_TO_STATE.get(d.tag, TAG_TO_STATE["happy"]), duration=hold)
+            tag = d.tag if (d.tag != "wave" or d.wave) else "happy"
+            self.rig.trigger_temp_action(TAG_TO_STATE.get(tag, TAG_TO_STATE["happy"]), duration=hold)
         await self.apply_decision(d)
 
     async def deliver_reply(self, reply: str, decision_task: asyncio.Task, *, wav_path: Path | None = None,
@@ -1066,6 +1117,8 @@ class StudioRuntime:
         tag, act = parsed_tag, parsed_act
         if decision is not None and not explicit:
             tag = decision.tag
+            if tag == "wave" and not decision.wave:
+                tag = "happy"                    # no authored [wave] and no decided wave: arms stay down
             act = TAG_TO_STATE.get(tag, TAG_TO_STATE["happy"])
         await self.hooks.emit_async("on_ai_reply", self, {"reply": clean, "tag": tag, "action": act})
         if player is not None:
@@ -1088,6 +1141,9 @@ class StudioRuntime:
         else:
             evt = await self.speak_text(reply, action=act, decision=decision, tag=tag, wav_path=wav_path, synth=False)
             speech_end = time.monotonic() + float(evt.get("duration") or 3.8)
+        fired = self._fire_pending_reply_emote(decision)     # the viewer turn's "on_reply" wave, as she says hi back
+        if fired:
+            evt["emote"] = evt.get("emote") or fired
         if decision is None:
             self.spawn(self._late_decision(decision_task, explicit, speech_end))
         return evt, decision
@@ -1294,6 +1350,16 @@ def build_app(runtime: StudioRuntime) -> web.Application:
     chat_lock = asyncio.Lock()
     framing_sync: dict[str, Any] = {"task": None, "sender": None}
 
+    def _cancel_wave() -> None:
+        """Drop any deferred decided wave (duck-typed runtimes without wave timing are fine)."""
+        cancel = getattr(runtime, "cancel_pending_wave", None)
+        if cancel is not None:
+            cancel()
+
+    def _fire_reply_wave(d: Decision | None) -> str | None:
+        fire = getattr(runtime, "_fire_pending_reply_emote", None)
+        return fire(d) if fire is not None else None
+
     async def _push_framing(sender: Any) -> None:
         await asyncio.sleep(0.06)                 # coalesce slider drags (<= ~16 syncs/s)
         framing_sync["task"] = None
@@ -1446,6 +1512,135 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             "models": catalog_entries(cat["models"]),
         })
 
+    # ------------------------------------------------------------------ Fish voice library + Voice Design
+    def _fish_api_key() -> str:
+        return str(runtime.config.data["ai"].get("fishApiKey") or "").strip() or server_keys.fish_key()
+
+    def _active_voice_id() -> str:
+        return str(runtime.config.data["ai"].get("fishReferenceId") or "").strip()
+
+    def _fish_error(exc: Exception) -> web.Response:
+        if isinstance(exc, fish_voices.FishVoiceError):
+            return web.json_response({"ok": False, "error": str(exc)}, status=exc.status)
+        print(f"[Hikari Studio] Fish voice error: {exc.__class__.__name__}", flush=True)
+        return web.json_response({"ok": False, "error": "Fish Audio request failed"}, status=502)
+
+    async def api_fish_voices(req):
+        """GET /api/fish/voices?scope=self|public|all&q=&page=1&limit=30&force=0 (unconfigured -> empty list)."""
+        bad = _origin_guard(req)
+        if bad is not None:
+            return bad
+        scope = req.query.get("scope", "self")
+        scope = scope if scope in fish_voices.SCOPES else "self"
+        key = _fish_api_key()
+        out = {"ok": True, "configured": bool(key), "scope": scope, "activeVoiceId": _active_voice_id(), "voices": []}
+        if not key:
+            return web.json_response(out)
+        try:
+            page = int(req.query.get("page", "1"))
+            limit = int(req.query.get("limit", "30"))
+        except ValueError:
+            return web.json_response({"ok": False, "error": "page / limit must be integers"}, status=400)
+        try:
+            out["voices"] = await fish_voices.list_voices(key, scope, req.query.get("q", ""), page, limit,
+                                                          force=req.query.get("force") in ("1", "true"))
+        except Exception as exc:
+            return _fish_error(exc)
+        return web.json_response(out)
+
+    async def api_fish_voice_design(req):
+        """POST /api/fish/voice-design {"instruction", "referenceText", "language", "n"} -> playable candidates."""
+        bad = _origin_guard(req)
+        if bad is not None:
+            return bad
+        body = await _json_body(req)
+        if not isinstance(body, dict):
+            return web.json_response({"ok": False, "error": "Expected a JSON object"}, status=400)
+        instruction = body.get("instruction")
+        if not isinstance(instruction, str) or not instruction.strip():
+            return web.json_response({"ok": False, "error": "Describe the voice (instruction is empty)"}, status=400)
+        key = _fish_api_key()
+        if not key:
+            return web.json_response({"ok": False, "error": "Fish Audio API key is not configured"}, status=400)
+        ref = body.get("referenceText")
+        try:
+            res = await fish_voices.design_voice(key, instruction, ref if isinstance(ref, str) else "",
+                                                 str(body.get("language") or "en"), body.get("n", 2),
+                                                 speed=body.get("speed", 1.0))
+        except Exception as exc:
+            return _fish_error(exc)
+        return web.json_response(res)
+
+    async def api_fish_voice_save(req):
+        """POST /api/fish/voices/save {"candidateId" | "audioBase64", "title", "description", "visibility",
+        "applyNow"} -> creates a permanent voice on the Fish account; applyNow makes it the active TTS voice."""
+        bad = _origin_guard(req)
+        if bad is not None:
+            return bad
+        body = await _json_body(req)
+        if not isinstance(body, dict):
+            return web.json_response({"ok": False, "error": "Expected a JSON object"}, status=400)
+        key = _fish_api_key()
+        if not key:
+            return web.json_response({"ok": False, "error": "Fish Audio API key is not configured"}, status=400)
+        cand, audio = body.get("candidateId"), body.get("audioBase64")
+        try:
+            voice = await fish_voices.save_designed_voice(
+                key, str(body.get("title") or ""),
+                candidate_id=cand if isinstance(cand, str) else "",
+                audio_base64=audio if isinstance(audio, str) else "",
+                description=str(body.get("description") or ""),
+                visibility=str(body.get("visibility") or "private"),
+                enhance=_truthy(body.get("enhance"), True))
+        except Exception as exc:
+            return _fish_error(exc)
+        applied = _truthy(body.get("applyNow"), False)
+        if applied:
+            await apply_section("ai", {"fishReferenceId": voice["id"]})
+            await runtime.config.save_async()
+            await runtime.broadcast_json({"type": "config_sync", "config": public_config(runtime.config.data)})
+        return web.json_response({"ok": True, "voice": voice, "applied": applied,
+                                  "activeVoiceId": _active_voice_id(),
+                                  "ai": public_config(runtime.config.data)["ai"]})
+
+    async def api_fish_voice_delete(req):
+        """DELETE /api/fish/voices/{voice_id}: removes the voice model from the Fish account."""
+        bad = _origin_guard(req)
+        if bad is not None:
+            return bad
+        key = _fish_api_key()
+        if not key:
+            return web.json_response({"ok": False, "error": "Fish Audio API key is not configured"}, status=400)
+        try:
+            vid = await fish_voices.delete_voice(key, req.match_info.get("voice_id", ""))
+        except Exception as exc:
+            return _fish_error(exc)
+        return web.json_response({"ok": True, "deleted": vid})
+
+    async def api_vercel_models(req):
+        """GET /api/vercel/models?force=0: live AI Gateway chat models + each model's exact upstream providers."""
+        bad = _origin_guard(req)
+        if bad is not None:
+            return bad
+        ai = runtime.config.data["ai"]
+        key = resolve_gateway_key(ai) or server_keys.get("VERCEL_API_KEY")
+        cat = await list_chat_models_and_providers(key, force=req.query.get("force") in ("1", "true"))
+        order = ai.get("vercelProviderOrder") or []
+        only = ai.get("vercelProviderOnly")
+        only_list = list(order) if only is True else (list(only) if isinstance(only, list) else [])
+        return web.json_response({
+            "ok": True,
+            "configured": bool(key),
+            "activeModel": pick_gateway_model(ai.get("vercelModel")),
+            "activeProvider": (only_list or list(order) or [""])[0],
+            "providerOrder": list(order),
+            "providerOnly": only_list,
+            "source": cat["source"],
+            "error": cat["error"],
+            "models": cat["models"],
+            "providers": cat["providers"],
+        })
+
     async def api_decision_test(req):
         """Ask the Decision Engine what she'd do for a line of text. Dry run unless apply=true
         (a dry run never touches cooldowns)."""
@@ -1551,6 +1746,7 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             await runtime.broadcast_json({"type": "speech", "text": f"({err})", "tag": "error", "audioUrl": "",
                                           "duration": 4.0})
             user_decision = await user_task
+            _cancel_wave()          # no reply is coming: an on_reply wave must not fire later
             return web.json_response({"ok": False, "error": err, "history": runtime.ai.history[-24:],
                                       "decisions": {"user": user_decision.to_dict()}, "brainMode": runtime.ai.brain_mode},
                                      status=502)
@@ -1764,6 +1960,7 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         payload, err = _sanitize_hook_payload(body)
         if payload is None:
             return web.json_response({"ok": False, "error": err}, status=400)
+        _cancel_wave()              # explicit action: drop any deferred decided wave
         try:
             results = await runtime.hooks.emit_async("on_external_trigger", runtime, payload)
             return web.json_response({"ok": True, "results": json.loads(json.dumps(results, default=str))})
@@ -2160,6 +2357,7 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             return web.json_response({"ok": False, "error": "Expected a JSON object"}, status=400)
         eid = str(body.get("emote") or "").strip()[:64]
         dur = _finite(body.get("duration") or 2.6, 2.6, EMOTE_MIN_SEC, EMOTE_MAX_SEC)
+        _cancel_wave()              # an explicit emote supersedes any deferred decided wave
         res = runtime.rig.trigger_emote(eid, duration=dur)
         if res.get("ok"):
             runtime.decisions.note_manual_emote(res["emote"])   # manual choice wins; autonomy waits its cooldown
@@ -2182,10 +2380,16 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             d = await runtime.decisions.decide(text, source, allow_llm=runtime.decisions.fast_model_ok())
             if not TAG_RE.search(text):
                 tag = d.tag
+                if tag == "wave" and not d.wave:
+                    tag = "happy"                # no authored [wave] and no decided wave: arms stay down
                 act = TAG_TO_STATE.get(tag, TAG_TO_STATE["happy"])
             if source == "fish_agent":
                 runtime.rig.trigger_temp_action(act, duration=4.2)
             await runtime.apply_decision(d)
+            if source == "fish_agent":            # her call line started: the caller's on_reply wave plays now
+                fired = _fire_reply_wave(d)
+                if fired and not d.emote:
+                    d.emote = fired
             # Every call transcript line is saved to conversation_turns right now (and the viewer's lines go
             # through immediate memory extraction), so chat and the next call continue from here.
             if source == "fish_user":
@@ -2306,6 +2510,11 @@ def build_app(runtime: StudioRuntime) -> web.Application:
     app.router.add_get("/api/decision", api_decision_status)
     app.router.add_get("/api/deciders/models", api_decider_models)
     app.router.add_post("/api/decision/test", api_decision_test)
+    app.router.add_get("/api/fish/voices", api_fish_voices)
+    app.router.add_post("/api/fish/voice-design", api_fish_voice_design)
+    app.router.add_post("/api/fish/voices/save", api_fish_voice_save)
+    app.router.add_delete("/api/fish/voices/{voice_id}", api_fish_voice_delete)
+    app.router.add_get("/api/vercel/models", api_vercel_models)
     app.router.add_post("/api/fish/agent/persona", api_fish_agent_persona)
     app.router.add_post("/api/fish/emote", api_fish_emote)
     app.router.add_post("/api/stt", api_stt)

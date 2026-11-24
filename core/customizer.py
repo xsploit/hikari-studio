@@ -920,6 +920,99 @@ def _attach_shoulder_line_overlays(header: bytes, tex_r: int, tex_l: int) -> byt
     return header[:8] + len(content).to_bytes(4, "big") + content
 
 
+# Topwear UV box (x0, y0, x1, y1; mirrored for the other side) around the refined-VRM halter's strap-top corner.
+_COLLAR_BOX = (0.25, 0.09, 0.32, 0.13)
+_GUARD_ON_ARM_PX = 2.5      # a tab edge within this distance of the arm's top contour counts as lying on it
+_GUARD_BAND_PX = 4.0        # solid band kept under such an edge (covers the arm's ~3 px outline)...
+_GUARD_RAMP_PX = 4.0        # ...easing back into the dissolve over this many px
+
+
+def _tab_edge_guard(A: np.ndarray, flip: bool, rows: np.ndarray) -> np.ndarray | None:
+    """Per-pixel 0..1 guard (len(rows) x w) that stops the tab dissolve from opening a gap just under the carved
+    shoulder-corner edge. Where that edge lies ON the arm's top contour, the dissolve used to start a few px below it
+    (just inside the arm), so the top 2-4 rows stayed opaque over the arm's outline while the rows under them were
+    already see-through: a floating flap with a gap beneath (the "little mouth" notch + dark spike under the hair,
+    worst on the viewer-right shoulder). The guard keeps a solid _GUARD_BAND_PX band under such an edge that eases
+    into the dissolve over _GUARD_RAMP_PX; the corner lineart overlay carries the outline along it. Column weights
+    are sub-pixel and blurred across columns, so there are no blocks or steps; edges that are the trapezius line
+    above the arm, or the rounded tab corner deep inside the arm, are left alone."""
+    h, w = A.shape
+    sy = h / 1048.0
+    y0 = int(0.10 * h)
+    y1 = int(rows[-1]) + 1
+    win = np.clip(A[y0:y1], 0.0, 1.0)
+    xs = np.arange(w)
+    sampled = _arm_in_top_space(h, w, flip, xs, np.arange(y0, y1))
+    if sampled is None:
+        return None
+    arm = np.clip(sampled[0], 0.0, 1.0)
+
+    def top_edge(al: np.ndarray) -> np.ndarray:
+        """Sub-pixel top edge per column: missing coverage above the first solid (>0.9) row; inf if none."""
+        solid = al > 0.9
+        first = np.where(solid.any(axis=0), np.argmax(solid, axis=0), -1)
+        cum = np.cumsum(1.0 - al, axis=0)
+        edge = y0 + cum[np.maximum(first, 0), xs] - (1.0 - al[np.maximum(first, 0), xs])
+        return np.where(first >= 0, edge, np.inf)
+
+    t_top, t_arm = top_edge(win), top_edge(arm)
+    with np.errstate(invalid="ignore"):
+        gap = np.abs(t_top - t_arm)
+    wcol = np.where(np.isfinite(gap), np.clip(1.0 - (gap - _GUARD_ON_ARM_PX * sy) / (2.0 * sy), 0.0, 1.0), 0.0)
+    wcol = cv2.GaussianBlur(wcol.reshape(1, -1).astype(np.float32), (0, 1), 2.0 * sy).ravel()
+    if wcol.max() < 0.01:
+        return None
+    depth = (rows.astype(np.float32)[:, None] + 0.5) - np.where(np.isfinite(t_top), t_top, 1e9)[None, :]
+    band, ramp = _GUARD_BAND_PX * sy, max(1.0, _GUARD_RAMP_PX * sy)
+    prof = np.clip(1.0 - (depth - band) / ramp, 0.0, 1.0) * (depth > -1.0)
+    return (prof * wcol[None, :]).astype(np.float32)
+
+
+def _crisp_collar_corner_smudge_premul(premul_png: bytes) -> bytes:
+    """Refined-VRM halter: where the collar's black outline meets the shoulder skin at the top of each strap, the VRM
+    bake left a ~4 px soft grey ramp (a dark speck beside the collar under the hair) while the rest of that boundary is
+    a crisp 1-2 px edge. Inside a small box around both strap corners, skin<->outline blend pixels that form a wide
+    (>= 3 px) ramp are remapped onto a crisp edge (straight colour, alpha untouched, re-premultiplied - no halo)."""
+    im = np.array(Image.open(io.BytesIO(premul_png)).convert("RGBA"), dtype=np.float32)
+    h, w = im.shape[:2]
+    a = im[..., 3] / 255.0
+    rgb = np.zeros((h, w, 3), np.float32)
+    m = a > 0.004
+    rgb[m] = np.clip(im[m, :3] / a[m, None], 0.0, 255.0)
+    y0, y1 = int(_COLLAR_BOX[1] * h), int(_COLLAR_BOX[3] * h)
+    changed = False
+    for x0f, x1f in ((_COLLAR_BOX[0], _COLLAR_BOX[2]), (1.0 - _COLLAR_BOX[2], 1.0 - _COLLAR_BOX[0])):
+        x0, x1 = int(x0f * w), int(x1f * w)
+        box, ab = rgb[y0:y1, x0:x1], a[y0:y1, x0:x1]
+        r, g, b = box[..., 0], box[..., 1], box[..., 2]
+        lum = 0.30 * r + 0.59 * g + 0.11 * b
+        skin = (ab > 0.9) & (r > 150) & (r > b + 20) & (lum > 150)
+        dark = (ab > 0.9) & (lum < 60)
+        if skin.sum() < 20 or dark.sum() < 20:
+            continue
+        s_ref, d_ref = np.median(box[skin], axis=0), np.median(box[dark], axis=0)
+        axis = d_ref - s_ref
+        k = np.clip(((box - s_ref) @ axis) / float(axis @ axis), 0.0, 1.0)
+        resid = np.linalg.norm(box - (s_ref + k[..., None] * axis), axis=-1)
+        blend = (ab > 0.9) & (k > 0.03) & (k < 0.97) & (resid < 28.0)
+        # Only WIDE ramps (>= 3 px thick) are the smudge; normal 1-2 px anti-aliased edges and thin art lines stay.
+        core = cv2.erode(blend.astype(np.uint8), np.ones((3, 3), np.uint8))
+        blend = blend & (cv2.dilate(core, np.ones((5, 5), np.uint8)) > 0)
+        kk = np.clip((k - 0.55) / 0.40, 0.0, 1.0)
+        kk = kk * kk * (3.0 - 2.0 * kk)
+        box[blend] = s_ref + kk[blend][:, None] * axis
+        changed = changed or bool(blend.any())
+    if not changed:
+        return premul_png
+    out = np.zeros((h, w, 4), np.uint8)
+    out[..., :3] = np.clip(np.rint(rgb * a[..., None]), 0, 255).astype(np.uint8)
+    out[..., 3] = im[..., 3].astype(np.uint8)
+    out[out[..., 3] == 0] = 0
+    buf = io.BytesIO()
+    Image.fromarray(out).save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
 def _feather_topwear_shoulder_tabs_premul(premul_png: bytes) -> bytes:
     """Topwear texture with both shoulder tabs carved + feathered and the corner lineart painted in (standalone use).
     The customizer build uses _feather_topwear_shoulder_tabs_layers so the lineart can hide with the arms."""
@@ -1006,6 +1099,7 @@ def _feather_topwear_shoulder_tabs_layers(premul_png: bytes, separate_lines: boo
             sampled = _arm_in_top_space(h, w, flip, np.arange(x_hi), rows)
             if sampled is not None:
                 arm_cov = np.clip((sampled[1] - _TAB_ARM_MARGIN_PX * sx) / (3.0 * sx), 0.0, 1.0)
+        guard = _tab_edge_guard(A, flip, rows) if ok_r.any() else None
         # Pass 2: apply.
         for k, y in enumerate(rows):
             st = float(strength[k])
@@ -1028,8 +1122,14 @@ def _feather_topwear_shoulder_tabs_layers(premul_png: bytes, separate_lines: boo
             k_tone = (0.6 * (1.0 - fade) * stp)[:, None]
             seg = seg * (1.0 - k_tone) + target[None, :] * k_tone
             C[y, xe:xe + len(xx)] = seg
-            # 3. cubic alpha dissolve
-            A[y, xe:xe + len(xx)] *= (1.0 - stp) + stp * fade
+            # 3. cubic alpha dissolve (never right under a carved edge that lies on the arm's contour: no flap/gap)
+            keep = (1.0 - stp) + stp * fade
+            if guard is not None:
+                # ...instead a solid band that fades in from the cut over _GUARD_RAMP_PX, so right at the tab tip the
+                # arm's own outline runs through (no light tick where the cut column crosses it)
+                g = guard[k, xe:xe + len(xx)] * st
+                keep = (1.0 - g) * keep + g * np.clip(d / (_GUARD_RAMP_PX * sx), 0.0, 1.0)
+            A[y, xe:xe + len(xx)] *= keep
 
     def _encode(rgb_s: np.ndarray, alpha: np.ndarray) -> bytes:
         out = np.zeros((h, w, 4), dtype=np.uint8)
@@ -2069,7 +2169,13 @@ class CharacterCustomizer:
             out_texs[TOP_TEXTURE] = (0, self.wardrobe.stripe_top)
         elif top_style == "refined-vrm":
             if HD_TOPWEAR_REFINED.exists():
-                out_texs[TOP_TEXTURE] = (0, self._load_premul_cached(HD_TOPWEAR_REFINED))
+                ref_key = HD_TOPWEAR_REFINED.with_name("_topwear_refined_crisp_collar")
+                mtime = HD_TOPWEAR_REFINED.stat().st_mtime
+                cached_ref = self._premul_cache.get(ref_key)
+                if cached_ref is None or cached_ref[0] != mtime:
+                    cached_ref = (mtime, _crisp_collar_corner_smudge_premul(self._load_premul_cached(HD_TOPWEAR_REFINED)))
+                    self._premul_cache[ref_key] = cached_ref
+                out_texs[TOP_TEXTURE] = (0, cached_ref[1])
             else:
                 out_texs[TOP_TEXTURE] = (0, self.wardrobe.refined_top)
             if self._wraparound_collar is None and out_texs[3][0] == 0:

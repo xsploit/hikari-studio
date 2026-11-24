@@ -244,6 +244,13 @@ class MouthParamMapper:
 
 
 MOTION_TRACKS = ("AngleX", "AngleY", "AngleZ", "BodyX", "BodyZ", "EyeOpen", "ArmR", "ArmL")
+# Rich general-motion tracks (modules/video_retarget.py v2). Optional: legacy 8/9-track clips keep playing. Mouth
+# tracks (MouthOpen / MouthForm / MouthFunnel) are never played: the live lip-sync engines own the mouth.
+MOTION_OPTIONAL_TRACKS = ("EyeLOpen", "EyeROpen", "EyeLookX", "EyeLookY", "BrowLY", "BrowRY", "StageX", "StageY",
+                          "StageZoom", "ShoulderShrug", "ArmRGesture", "ArmLGesture")
+# clip track -> AAA rig-fx param (driven through _rig_fx_step's springs, written only where the rig has it)
+MOTION_FX_TRACKS = (("StageX", "Stage X"), ("StageY", "Stage Y"), ("StageZoom", "Stage Zoom"),
+                    ("ShoulderShrug", "Shoulder Shrug"))
 
 
 def validate_motion_clip(data: Any) -> dict[str, Any]:
@@ -259,8 +266,10 @@ def validate_motion_clip(data: Any) -> dict[str, Any]:
     tracks = data.get("tracks")
     if not isinstance(tracks, dict):
         raise ValueError("Motion clip has no tracks")
-    for name in MOTION_TRACKS:
+    for name in MOTION_TRACKS + MOTION_OPTIONAL_TRACKS:
         tr = tracks.get(name)
+        if tr is None and name in MOTION_OPTIONAL_TRACKS:
+            continue
         if not isinstance(tr, list) or len(tr) < frames:
             raise ValueError(f"Motion clip track {name} is missing or too short")
         if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in tr[:frames]):
@@ -838,6 +847,29 @@ class RigController:
             self._motion_playing = False
             self._motion_clip = None
 
+    def _motion_sample(self, clip: dict[str, Any], start: float, loop: bool, t_now: float) -> dict[str, float]:
+        """Linearly interpolated sample of every playable track at t_now (mouth tracks are never sampled)."""
+        tracks = clip["tracks"]
+        n_f = int(clip["frames"])
+        el = (t_now - start) * float(clip.get("fps", 60.0))
+        if el >= n_f:
+            if loop:
+                el = el % n_f
+            else:
+                with self.lock:
+                    self._motion_playing = False
+                el = n_f - 1
+        el = max(0.0, min(n_f - 1.0, el))
+        i0 = int(el)
+        i1 = (i0 + 1) % n_f if loop else min(n_f - 1, i0 + 1)
+        f = el - i0
+        out: dict[str, float] = {}
+        for name in MOTION_TRACKS + MOTION_OPTIONAL_TRACKS:
+            tr = tracks.get(name)
+            if tr is not None:
+                out[name] = float(tr[i0]) * (1.0 - f) + float(tr[i1]) * f
+        return out
+
     def motion_status(self) -> dict[str, Any]:
         with self.lock:
             if not self._motion_clip:
@@ -1329,27 +1361,24 @@ class RigController:
         ang_l = self.sp_brow_angle_l.step(ang_base + 0.25 * w_t * (0.4 + 0.6 * tl), dt, 6.0, 0.9)
         ang_r = self.sp_brow_angle_r.step(ang_base + 0.25 * w_t * (0.4 + 0.6 * tr), dt, 6.0, 0.9)
 
+        # 7.0 Motion Lab clip: one interpolated sample of every playable track (feeds 7, 8 and the rig-fx layer)
+        clip_s = self._motion_sample(m_clip, m_start, m_loop, t_now) if m_clip is not None else None
+        clip_rich = clip_s is not None and "ArmRGesture" in clip_s
+
         # 7. Raised wave arms (manual / emote / temp action) + speech gestures
         auto_gest = bool(rig_cfg.get("autoGestureOnSpeech", True))
         ag_gain = _clamp(_ff(lip_cfg.get("speechToArmGesture", 0.75), 0.75), 0.0, 2.0)
         t_arm_r = _ff(temp["armR"], 0.0) if temp and "armR" in temp else _ff(rig_cfg.get("armRPose", 0.0), 0.0)
         t_arm_l = _ff(temp["armL"], 0.0) if temp and "armL" in temp else _ff(rig_cfg.get("armLPose", 0.0), 0.0)
 
-        # 7.1 Excited / greeting peaks: raise the clean wave arm for one phrase, rarely (8-14 s cooldown). Normal chatter
-        #     keeps the original resting arms down; they sway through Arm L/R Swing physics with posture & beats.
-        rest_free = (t_arm_r < 0.5 and t_arm_l < 0.5) and not em_id and m_clip is None
-        excited_peak = speaking and stress > 0.72 and (ma > 0.35 or expr_name == "excited")
-        if auto_gest and ag_gain > 0.0 and rest_free and excited_peak and t_now >= self._raise_next and t_now >= self._raise_until:
-            self._raise_side = "L" if self._raise_side == "R" else "R"
-            self._raise_until = t_now + rnd.uniform(1.4, 2.6)
-            self._raise_next = self._raise_until + rnd.uniform(8.0, 14.0)
-        if t_now < self._raise_until:
-            if not auto_gest or not rest_free or (not speaking and t_now - self._speech_off_since > 0.4):
-                self._raise_until = t_now                            # phrase over / something else owns the arms
-            elif self._raise_side == "R":
-                t_arm_r = max(t_arm_r, 1.0)
-            else:
-                t_arm_l = max(t_arm_l, 1.0)
+        # 7.1 Raised wave arms come ONLY from an explicit command: a decided / manual emote, a temp action
+        #     (armR / armL), the armR/LPose sliders or a Motion Lab clip. Speech never pops an arm up on its own
+        #     (the Decision Model owns IF and WHEN she waves); while talking the resting arms stay down and sway
+        #     through Arm L/R Swing physics with posture & beats.
+        if clip_rich:                                  # tracked raises own the wave arms (eased, never a pop)
+            t_arm_r = max(t_arm_r, m_mix * _smooth((clip_s["ArmR"] - 0.3) / 0.3))
+            t_arm_l = max(t_arm_l, m_mix * _smooth((clip_s["ArmL"] - 0.3) / 0.3))
+        self._raise_until = 0.0                        # legacy speech-peak raise: permanently retired
 
         arm_r_pose = _clamp(self.sp_arm_r_pose.step(t_arm_r, dt, 22.0, 0.92), 0.0, 1.0)
         arm_l_pose = _clamp(self.sp_arm_l_pose.step(t_arm_l, dt, 22.0, 0.92), 0.0, 1.0)
@@ -1374,6 +1403,9 @@ class RigController:
             else:
                 g_l_tgt += 0.14 * math.sin(t_now * 1.7 + 0.8)
 
+        if clip_rich:                                  # tracked wrist wave sway while raised
+            g_r_tgt += 0.6 * m_mix * clip_s["ArmRGesture"] * arm_r_pose
+            g_l_tgt += 0.6 * m_mix * clip_s["ArmLGesture"] * arm_l_pose
         arm_r_gest = _clamp(self.sp_arm_r_gest.step(g_r_tgt, dt, 14.0, 0.85), -0.48, 0.92)
         arm_l_gest = _clamp(self.sp_arm_l_gest.step(g_l_tgt, dt, 14.0, 0.85), -0.48, 0.92)
         arm_r_lift = _clamp(self.sp_arm_r_lift.step(l_r_tgt, dt, 11.0, 0.88), -0.75, 0.85)
@@ -1382,32 +1414,32 @@ class RigController:
         lag_r = self.sp_arm_r_wlag.step(arm_r_gest, dt, 6.0, 0.7)
         lag_l = self.sp_arm_l_wlag.step(arm_l_gest, dt, 6.0, 0.7)
 
-        # 8. Motion Lab clip blend (head, body, blinks & arms only — never the live mouth)
-        if m_clip is not None:
-            tracks = m_clip["tracks"]
-            n_f = int(m_clip["frames"])
-            fps = float(m_clip.get("fps", 60.0))
-            el = (t_now - m_start) * fps
-            if el >= n_f:
-                if m_loop:
-                    el = el % n_f
-                else:
-                    with self.lock:
-                        self._motion_playing = False
-                    el = n_f - 1
-            fi = max(0, min(n_f - 1, int(el)))
+        # 8. Motion Lab clip blend: head, body, independent eyes / gaze / brows, arms (+ stage / shrug via the rig-fx
+        #    layer below). NEVER the mouth: VB Mouth / Mouth Funnel / Jaw Open stay owned by the live lip-sync engines.
+        clip_fx: dict[str, float] = {}
+        if clip_s is not None:
             w = m_mix
-            head_x = head_x * (1.0 - w) + tracks["AngleX"][fi] * w
-            head_y = head_y * (1.0 - w) + tracks["AngleY"][fi] * w
-            head_z = head_z * (1.0 - w) + tracks["AngleZ"][fi] * w
-            body_x = body_x * (1.0 - w) + tracks["BodyX"][fi] * w
-            body_z = body_z * (1.0 - w) + tracks["BodyZ"][fi] * w
-            eye_open_l = eye_open_l * (1.0 - w) + tracks["EyeOpen"][fi] * w
-            eye_open_r = eye_open_r * (1.0 - w) + tracks["EyeOpen"][fi] * w
-            if tracks["ArmR"][fi] > 0.35 and arm_r_pose > 0.5:
-                arm_r_gest = _clamp(arm_r_gest + (tracks["ArmR"][fi] - 0.35) * 0.9 * w, -0.48, 0.92)
-            if tracks["ArmL"][fi] > 0.35 and arm_l_pose > 0.5:
-                arm_l_gest = _clamp(arm_l_gest + (tracks["ArmL"][fi] - 0.35) * 0.9 * w, -0.48, 0.92)
+            head_x = head_x * (1.0 - w) + clip_s["AngleX"] * w
+            head_y = head_y * (1.0 - w) + clip_s["AngleY"] * w
+            head_z = head_z * (1.0 - w) + clip_s["AngleZ"] * w
+            body_x = body_x * (1.0 - w) + clip_s["BodyX"] * w
+            body_z = body_z * (1.0 - w) + clip_s["BodyZ"] * w
+            eye_open_l = eye_open_l * (1.0 - w) + clip_s.get("EyeLOpen", clip_s["EyeOpen"]) * w
+            eye_open_r = eye_open_r * (1.0 - w) + clip_s.get("EyeROpen", clip_s["EyeOpen"]) * w
+            if "EyeLookX" in clip_s:
+                eye_x = _clamp(eye_x * (1.0 - w) + clip_s["EyeLookX"] * w, -1.0, 1.0)
+            if "EyeLookY" in clip_s:
+                eye_y = _clamp(eye_y * (1.0 - w) + clip_s["EyeLookY"] * w, -1.0, 1.0)
+            brow_l_extra += clip_s.get("BrowLY", 0.0) * w
+            brow_r_extra += clip_s.get("BrowRY", 0.0) * w
+            for trk, pname in MOTION_FX_TRACKS:
+                if trk in clip_s:
+                    clip_fx[pname] = clip_s[trk] * w
+            if not clip_rich:                          # legacy clips: ArmR / ArmL were motion energy -> gesture boost
+                if clip_s["ArmR"] > 0.35 and arm_r_pose > 0.5:
+                    arm_r_gest = _clamp(arm_r_gest + (clip_s["ArmR"] - 0.35) * 0.9 * w, -0.48, 0.92)
+                if clip_s["ArmL"] > 0.35 and arm_l_pose > 0.5:
+                    arm_l_gest = _clamp(arm_l_gest + (clip_s["ArmL"] - 0.35) * 0.9 * w, -0.48, 0.92)
 
         # 9. Mouth (VTube Studio / VBridger mapping of every lip-sync channel)
         pmap_cfg = lip_cfg.get("paramMap") if isinstance(lip_cfg.get("paramMap"), dict) else {}
@@ -1917,6 +1949,10 @@ class RigController:
         #      eased by critically damped springs, then animated (twinkle / bob / throb) while active.
         self._vfx_step(dt, t_now, p, auto_vfx, vfx_ovr, vfx_emo, temp, em_vfx, em_smug, w_t, mv,
                        max(vb_open, _ff(lip.get("open", 0.0), 0.0)), quiet)
+        if clip_fx:                                    # Motion Lab stage hops / sways / lean-ins + shoulder shrug
+            em_fx = dict(em_fx)
+            for k, v in clip_fx.items():
+                em_fx[k] = em_fx.get(k, 0.0) + v
         self._rig_fx_step(dt, p, vfx_emo, temp, expr_name, em_fx, w_t, max(vb_open, _ff(lip.get("open", 0.0), 0.0)))
 
         chibi_val = _clamp(self.sp_chibi.step(chibi_tgt, dt, 12.0, 0.55), 0.0, 1.0)

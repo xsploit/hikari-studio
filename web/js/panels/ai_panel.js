@@ -1,6 +1,7 @@
 /** VOICE & BRAIN — brain/voice mode (Fish duplex · Vercel AI Gateway + Fish Speech), Fish TTS transport,
- *  gateway provider pinning, live call, speech & ASR, custom LLM, decision engine, body language, personality. */
-import { btn, choiceRows, el, group, more, row, selectEl, selectRow, slider, textIn, toggle, withCurrent } from '../ui.js';
+ *  live gateway model + provider pickers, live Fish voice picker + voice designer, live call, speech & ASR, custom LLM, decision engine, body language, personality. */
+import { btn, choiceRows, el, group, more, row, selectEl, segmented, selectRow, slider, textIn, toggle, withCurrent } from '../ui.js';
+import { jsonFetch, renderVoiceDesigner, softRerender, tagged } from './voice_design.js';
 
 const BRAIN_MODES = [
   ['fish_duplex', 'Fish Real-Time Duplex', 'Fish LLM + live full-duplex voice — lowest latency'],
@@ -99,6 +100,91 @@ function refreshDecidersSoon(store) {
   setTimeout(() => loadDeciders(store, true), 400);
 }
 
+/* ───────── Live Vercel AI Gateway models: GET /api/vercel/models (cached 60 s, no timers) ───────── */
+const gw = { data: null, fetchedAt: 0, loading: false, error: '', queued: false, filter: '' };
+async function loadVercelModels(store, force = false) {
+  if (gw.loading) { if (force) gw.queued = true; return; }
+  if (!force && Date.now() - gw.fetchedAt < 60000) return;
+  gw.loading = true;
+  try {
+    const d = await jsonFetch(`/api/vercel/models?force=${force ? 1 : 0}`);
+    gw.data = {
+      configured: typeof d.configured === 'boolean' ? d.configured : null,
+      activeModel: String(d.activeModel || ''),
+      activeProvider: String(d.activeProvider || ''),
+      models: (Array.isArray(d.models) ? d.models : []).filter((m) => m && m.id),
+      providers: (Array.isArray(d.providers) ? d.providers : []).filter(Boolean).map(String),
+    };
+    gw.error = '';
+  } catch (err) {
+    gw.error = err.message || 'unavailable';
+  } finally {
+    gw.loading = false;
+    gw.fetchedAt = Date.now();
+    if (gw.queued) { gw.queued = false; loadVercelModels(store, true); return; }
+    softRerender(store);
+  }
+}
+
+/* ───────── Live Fish voices: GET /api/fish/voices (cached 30 s per scope/query, no timers) ───────── */
+const fv = { scope: 'self', q: '', cache: new Map(), loading: '', queued: false, activeVoiceId: '' };
+const fvKey = () => (fv.scope === 'self' ? 'self' : `community|${fv.q.trim().toLowerCase()}`);
+async function loadFishVoices(store, force = false) {
+  const key = fvKey();
+  const hit = fv.cache.get(key);
+  if (!force && hit && Date.now() - hit.at < 30000) return;
+  if (fv.loading) { if (force || fv.loading !== key) fv.queued = true; return; }
+  fv.loading = key;
+  const scope = fv.scope;
+  const qs = new URLSearchParams({ scope, q: scope === 'self' ? '' : fv.q.trim(), page: '1', limit: '30', force: force ? '1' : '0' });
+  try {
+    const d = await jsonFetch(`/api/fish/voices?${qs}`);
+    fv.cache.set(key, {
+      at: Date.now(), error: '',
+      configured: typeof d.configured === 'boolean' ? d.configured : null,
+      voices: (Array.isArray(d.voices) ? d.voices : []).filter((v) => v && v.id),
+    });
+    if (d.activeVoiceId) fv.activeVoiceId = String(d.activeVoiceId);
+  } catch (err) {
+    fv.cache.set(key, { at: Date.now(), error: err.message || 'unavailable', configured: null, voices: hit?.voices || [] });
+  } finally {
+    fv.loading = '';
+    // A scope/search switch (or forced refresh) arrived mid-flight: fetch whatever is current now.
+    if (fv.queued) { fv.queued = false; loadFishVoices(store, fvKey() === key); return; }
+    softRerender(store);
+  }
+}
+/** Find a voice by id in any cached list (labels a preserved/custom id when possible). */
+function knownVoice(id) {
+  for (const e of fv.cache.values()) { const v = e.voices.find((x) => x.id === id); if (v) return v; }
+  return null;
+}
+const voiceLabel = (v) => {
+  const t = String(v.title || v.id);
+  const vis = String(v.visibility || '').toLowerCase();
+  return (v.mine || fv.scope === 'self') && vis && vis !== 'public' ? `${t} (${vis})` : t;
+};
+
+// Inline sample player for the selected voice (one at a time).
+const preview = { audio: null, id: '' };
+function togglePreview(store, voice) {
+  const url = voice?.samples?.[0];
+  if (!url) return;
+  if (preview.audio && preview.id === voice.id && !preview.audio.paused) {
+    preview.audio.pause();
+  } else {
+    preview.audio?.pause();
+    preview.audio = new Audio(url);
+    preview.id = voice.id;
+    preview.audio.addEventListener('ended', () => softRerender(store));
+    preview.audio.addEventListener('pause', () => softRerender(store));
+    preview.audio.play().catch(() => softRerender(store));
+  }
+  softRerender(store);
+}
+
+const orderList = (v) => (Array.isArray(v) ? v : String(v || '').split(',')).map((x) => String(x).trim()).filter(Boolean);
+
 const TTS = [
   ['fish', 'Fish Drama 3'],
   ['openai', 'OpenAI-compatible'],
@@ -117,6 +203,11 @@ export function renderAiPanel(store) {
 
   /* Saved credential overrides: the server masks them ("********") and ignores "" / the echoed mask,
      so inputs never show the value; typing replaces it; Clear sends null (explicit clear). */
+  // A new/cleared key changes what the live lists can see: re-fetch once the patch has reached the server.
+  const keyChanged = (field) => {
+    if (field === 'vercelApiKey') setTimeout(() => loadVercelModels(store, true), 400);
+    if (field === 'fishApiKey') { fv.cache.clear(); setTimeout(() => loadFishVoices(store, true), 400); }
+  };
   const secretControl = (field, label, { type = 'password', blankHint = 'Leave blank to use .env.local' } = {}) => {
     const isSet = Boolean(ai[field]);
     const input = textIn({
@@ -128,12 +219,14 @@ export function renderAiPanel(store) {
         set({ [field]: v });
         e.target.value = '';
         if (GATEWAY_KEY_FIELDS.has(field)) refreshDecidersSoon(store);
+        keyChanged(field);
         store.rerenderPanel();
       },
     });
     const clear = () => {
       set({ [field]: null });
       if (GATEWAY_KEY_FIELDS.has(field)) refreshDecidersSoon(store);
+      keyChanged(field);
       store.rerenderPanel();
     };
     return isSet ? [input, btn('Clear', clear)] : input;
@@ -154,6 +247,79 @@ export function renderAiPanel(store) {
     ]),
   ]);
 
+  /* Fish voice dropdown — My Voices / Community, inline ▶ sample preview, current id always preserved */
+  const fishVoiceRow = () => {
+    loadFishVoices(store);
+    const entry = fv.cache.get(fvKey());
+    const loading = fv.loading === fvKey();
+    const voices = entry?.voices || [];
+    const cur = String(ai.fishReferenceId || '');
+    const curVoice = voices.find((v) => v.id === cur) || knownVoice(cur);
+    const opts = [];
+    if (cur && !voices.some((v) => v.id === cur)) {
+      opts.push(el('option', { value: cur, selected: true, text: `Current · ${curVoice ? voiceLabel(curVoice) : cur}` }));
+    } else if (!cur) {
+      opts.push(el('option', { value: '', selected: true, text: 'Hikari default voice' }));
+    }
+    voices.forEach((v) => opts.push(el('option', { value: v.id, text: voiceLabel(v), selected: v.id === cur, title: v.description || v.id })));
+    if (!voices.length) opts.push(el('option', { value: '__none', disabled: true, text: loading ? 'Loading voices…' : 'No voices found' }));
+    const select = el('select', {
+      class: 'pill-select wide', 'aria-label': 'Fish voice',
+      onchange: (e) => { if (e.target.value !== '__none') { set({ fishReferenceId: e.target.value }); softRerender(store); } },
+    }, opts);
+    const sampleUrl = curVoice?.samples?.[0];
+    const playing = Boolean(preview.audio && preview.id === curVoice?.id && !preview.audio.paused);
+    const status = loading ? (fv.scope === 'self' ? 'Loading your Fish voices…' : 'Searching community voices…')
+      : entry?.configured === false ? 'Fish API key not configured — add one below'
+        : entry?.error ? `Voice list unavailable (${entry.error}) — paste a voice ID below`
+          : entry ? `${voices.length} ${fv.scope === 'self' ? 'voices on your account · design a new one in Voice Designer' : 'community voices'}`
+            : 'Checking Fish…';
+    const pickScope = (id) => {
+      if (id === fv.scope) return;
+      fv.scope = id;
+      loadFishVoices(store);
+      softRerender(store);
+    };
+    const runSearch = () => { loadFishVoices(store); softRerender(store); };
+    const control = el('div', { class: 'fv-picker' }, [
+      el('div', { class: 'fv-bar' }, [
+        segmented([['self', 'My Voices'], ['community', 'Community']], { active: fv.scope, onPick: pickScope, label: 'Voice source' }),
+        btn(loading ? 'Loading…' : 'Refresh', () => loadFishVoices(store, true), '', { disabled: Boolean(loading), title: 'Reload voices from Fish' }),
+      ]),
+      fv.scope === 'community' ? el('div', { class: 'fv-bar' }, [
+        textIn({
+          type: 'search', placeholder: 'Search community voices…', value: fv.q, 'aria-label': 'Search community voices',
+          'data-focus-key': 'fish.voiceSearch',
+          oninput: (e) => { fv.q = e.target.value; },
+          onkeydown: (e) => { if (e.key === 'Enter') runSearch(); },
+        }),
+        btn('Search', runSearch),
+      ]) : null,
+      el('div', { class: 'fv-bar' }, [
+        select,
+        sampleUrl ? btn(playing ? '■' : '▶', () => togglePreview(store, curVoice), 'icon-btn',
+          { title: playing ? 'Stop sample' : 'Play voice sample', 'aria-label': playing ? 'Stop sample' : 'Play voice sample' }) : null,
+      ]),
+      el('div', { class: `fv-status${entry?.error || entry?.configured === false ? ' warn' : ''}`, text: status }),
+    ]);
+    return tagged(row({ title: 'Fish voice', desc: 'Pick one of your voices or browse the community library', stack: true, control }),
+      'fish voices voice picker my voices community reference voice');
+  };
+
+  /* A designed voice was saved: adopt the server's ai config, select it, refresh the voice list. */
+  const onVoiceSaved = (res) => {
+    const v = res?.voice || {};
+    if (res?.ai && typeof res.ai === 'object') Object.assign(store.config.ai, res.ai);
+    if (v.id) {
+      if (res.applied) store.config.ai.fishReferenceId = res.ai?.fishReferenceId || v.id;
+      else store.patch('ai', { fishReferenceId: v.id });
+      const self = fv.cache.get('self');
+      if (self && !self.voices.some((x) => x.id === v.id)) self.voices.unshift({ ...v, mine: true });
+    }
+    fv.scope = 'self';
+    loadFishVoices(store, true);
+  };
+
   const fishRows = ai.ttsProvider === 'fish' ? [
     row({
       title: 'Fish API key',
@@ -161,7 +327,12 @@ export function renderAiPanel(store) {
       control: el('span', { class: `badge ${fs.keyReady ? 'ok' : 'warn'}`, text: fs.keyReady ? 'Ready' : 'Missing' }),
     }),
     selectRow({ label: 'Fish model', desc: 'Voice model for chat replies', items: FISH_MODELS, value: ai.fishModel, onChange: (v) => set({ fishModel: v }) }),
-    row({ title: 'Reference voice ID', desc: 'Fish voice to clone', control: textIn({ placeholder: 'Voice ID', value: ai.fishReferenceId, onchange: (e) => set({ fishReferenceId: e.target.value }) }), cls: 'wide-ctrl' }),
+    fishVoiceRow(),
+    tagged(row({ title: 'Custom voice ID', desc: 'Paste any Fish voice / reference ID — the dropdown above follows it', cls: 'wide-ctrl',
+      control: textIn({ placeholder: 'Paste a Fish voice ID', value: ai.fishReferenceId || '', 'aria-label': 'Custom voice ID',
+        'data-focus-key': 'fish.customVoice', spellcheck: 'false',
+        onchange: (e) => { set({ fishReferenceId: e.target.value.trim() }); softRerender(store); } }) }),
+    'reference voice id fish voices'),
     slider({ label: 'Speech speed', min: 0.6, max: 1.6, step: 0.05, value: ai.fishSpeed ?? 1.0, def: 1.0, suffix: '×', onInput: (v) => set({ fishSpeed: v }) }),
     row({ title: 'API key override', desc: 'Optional — overrides the server key', control: secretControl('fishApiKey', 'Fish API key override'), cls: 'wide-ctrl' }),
   ] : [];
@@ -202,23 +373,107 @@ export function renderAiPanel(store) {
     }),
   });
 
+  /* Vercel AI Gateway — live model dropdown (grouped by owner) + provider pin limited to that model's providers */
+  loadVercelModels(store);
+  const gwModels = gw.data?.models || [];
+  const chatModels = gwModels.filter((m) => !m.type || m.type === 'language');
+  const embedModels = gwModels.filter((m) => m.type === 'embedding');
+  const curModel = String(ai.vercelModel || '');
+  const curInfo = gwModels.find((m) => m.id === curModel);
+  const order = orderList(ai.vercelProviderOrder);
+
+  const fillModelOptions = (select) => {
+    const f = gw.filter.trim().toLowerCase();
+    const match = (m) => !f || `${m.id} ${m.name || ''} ${m.owner || ''}`.toLowerCase().includes(f);
+    const byOwner = new Map();
+    chatModels.filter(match).forEach((m) => {
+      const owner = String(m.owner || m.id.split('/')[0] || 'other');
+      if (!byOwner.has(owner)) byOwner.set(owner, []);
+      byOwner.get(owner).push(m);
+    });
+    const known = chatModels.some((m) => m.id === curModel);
+    const nodes = [
+      el('option', { value: '', text: `Server default${gw.data?.activeModel && !curModel ? ` (${gw.data.activeModel})` : ' (AI_GATEWAY_MODEL)'}`, selected: !curModel }),
+      curModel && !known ? el('option', { value: curModel, text: `Custom · ${curModel}`, selected: true }) : null,
+      ...[...byOwner.keys()].sort().map((owner) => el('optgroup', { label: owner },
+        byOwner.get(owner).sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)))
+          .map((m) => el('option', { value: m.id, text: m.name && m.name !== m.id ? `${m.name} · ${m.id}` : m.id, selected: m.id === curModel })))),
+      f && !byOwner.size ? el('option', { value: '__none', disabled: true, text: `No models match “${gw.filter.trim()}”` }) : null,
+    ].filter(Boolean);
+    select.replaceChildren(...nodes);
+  };
+
+  const vercelModelRow = () => {
+    const select = el('select', {
+      class: 'pill-select wide', 'aria-label': 'Vercel model',
+      onchange: (e) => { if (e.target.value === '__none') return; set({ vercelModel: e.target.value }); softRerender(store); },
+    });
+    fillModelOptions(select);
+    const owners = new Set(chatModels.map((m) => m.owner || m.id.split('/')[0])).size;
+    const desc = gw.loading && !gw.data ? 'Loading live models from the gateway…'
+      : gw.error ? `Live list unavailable (${gw.error}) — paste a model ID below`
+        : gw.data?.configured === false ? 'Add an AI Gateway key (below) to load live models — or paste a model ID'
+          : gw.data ? `${chatModels.length} live models from ${owners} owners · grouped by owner`
+            : 'Checking the gateway…';
+    const control = el('div', { class: 'gw-picker' }, [
+      el('div', { class: 'fv-bar' }, [
+        textIn({
+          type: 'search', placeholder: 'Filter models…', value: gw.filter, 'aria-label': 'Filter models', 'data-focus-key': 'gw.filter',
+          oninput: (e) => { gw.filter = e.target.value; fillModelOptions(select); },
+        }),
+        btn(gw.loading ? 'Loading…' : 'Refresh', () => loadVercelModels(store, true), '', { disabled: gw.loading, title: 'Reload live gateway models' }),
+      ]),
+      select,
+      textIn({
+        placeholder: 'Or paste any model ID, e.g. google/gemini-2.5-flash', value: curModel && !chatModels.some((m) => m.id === curModel) ? curModel : '',
+        'aria-label': 'Custom model ID', 'data-focus-key': 'gw.customModel', spellcheck: 'false',
+        onchange: (e) => { set({ vercelModel: e.target.value.trim() }); softRerender(store); },
+      }),
+    ]);
+    return tagged(row({ title: 'Vercel model', desc, stack: true, control }), 'vercel models gateway model llm chat model');
+  };
+
+  const providerRow = () => {
+    const fromModel = Array.isArray(curInfo?.providers) && curInfo.providers.length > 0;
+    const provs = (fromModel ? curInfo.providers : (gw.data?.providers || [])).map(String);
+    const pin = order[0] || '';
+    const unlisted = Boolean(pin && provs.length && !provs.includes(pin));
+    const items = [['', 'Auto (Gateway default)'], ...provs.map((p) => [p, p])];
+    if (pin && !provs.includes(pin)) items.push([pin, `${pin} · not listed for this model`]);
+    const desc = unlisted
+      ? `“${pin}” isn't listed for ${curModel || 'this model'} — pick Auto or a listed provider`
+      : fromModel ? `${provs.length} upstream provider${provs.length === 1 ? '' : 's'} serve ${curModel}`
+        : (curModel ? 'Model not in the live list — showing every gateway provider' : 'Showing every gateway provider');
+    return tagged(row({
+      title: 'Provider pinning', desc, cls: unlisted ? 'warn-row' : '',
+      control: selectEl(items, pin, (p) => {
+        set({ vercelProviderOrder: p ? [p, ...order.filter((x) => x !== p)].join(',') : '' });
+        softRerender(store);
+      }, { 'aria-label': 'Provider pinning', class: 'pill-select wide' }),
+    }), 'provider pinning pin provider gateway upstream');
+  };
+
   /* Brain & voice mode */
   // A retired mode left in an old settings.json falls back to Fish duplex in the picker.
   const brainMode = BRAIN_MODES.some(([id]) => id === ai.brainMode) ? ai.brainMode : 'fish_duplex';
   const vercelRows = [
-    row({ title: 'Vercel model', desc: 'Gateway model ID, e.g. google/gemini-2.5-flash', cls: 'wide-ctrl',
-      control: textIn({ placeholder: 'google/gemini-2.5-flash', value: ai.vercelModel || '', 'aria-label': 'Vercel model',
-        onchange: (e) => set({ vercelModel: e.target.value.trim() }) }) }),
-    row({ title: 'Provider pinning order', desc: 'Comma-separated, tried in order', cls: 'wide-ctrl',
-      control: textIn({ placeholder: 'vertex,groq,fireworks', value: ai.vercelProviderOrder || '', 'aria-label': 'Provider pinning order',
-        onchange: (e) => set({ vercelProviderOrder: e.target.value.split(',').map((x) => x.trim()).filter(Boolean).join(',') }) }) }),
+    vercelModelRow(),
+    providerRow(),
+    tagged(row({ title: 'Provider fallback order', desc: 'Comma-separated, tried in order — the pin above goes first', cls: 'wide-ctrl',
+      control: textIn({ placeholder: 'vertex,groq,fireworks', value: order.join(','), 'aria-label': 'Provider fallback order',
+        'data-focus-key': 'gw.order', spellcheck: 'false',
+        onchange: (e) => { set({ vercelProviderOrder: orderList(e.target.value).join(',') }); softRerender(store); } }) }),
+    'provider pinning order fallback gateway'),
     toggle({ label: 'Strict provider pin (only)', desc: 'Never fall back to providers outside the list',
       // Backend may store a provider list ([] = off) or a boolean; an empty list must never read as "on".
       checked: Array.isArray(ai.vercelProviderOnly) ? ai.vercelProviderOnly.length > 0 : Boolean(ai.vercelProviderOnly),
       onChange: (v) => set({ vercelProviderOnly: v === true }) }),
     row({ title: 'Vercel embedding model', desc: 'Indexes saved memories when Memory & Context uses the Vercel embedder', cls: 'wide-ctrl',
-      control: textIn({ placeholder: 'openai/text-embedding-3-small', value: ai.vercelEmbeddingModel || '', 'aria-label': 'Vercel embedding model',
-        onchange: (e) => set({ vercelEmbeddingModel: e.target.value.trim() }) }) }),
+      control: [
+        textIn({ placeholder: 'openai/text-embedding-3-small', value: ai.vercelEmbeddingModel || '', 'aria-label': 'Vercel embedding model',
+          list: embedModels.length ? 'gw-embed-models' : undefined, onchange: (e) => set({ vercelEmbeddingModel: e.target.value.trim() }) }),
+        embedModels.length ? el('datalist', { id: 'gw-embed-models' }, embedModels.map((m) => el('option', { value: m.id, label: m.name || m.id }))) : null,
+      ] }),
     row({ title: 'AI Gateway key', desc: 'AI_GATEWAY_API_KEY — auto-loaded server-side from .env.local if left blank', cls: 'wide-ctrl',
       control: secretControl('vercelApiKey', 'AI Gateway key') }),
   ];
@@ -258,6 +513,9 @@ export function renderAiPanel(store) {
       ...fishRows,
       row({ title: 'Sample voice take', desc: 'Play a test line through the lip-sync pipeline', control: btn('Play', () => store.playSample()) }),
     ]),
+
+    group('Voice Designer (Fish Audio)', [renderVoiceDesigner(store, { onSaved: onVoiceSaved })],
+      { desc: 'Design a brand-new voice from a description and save it to your Fish account' }),
 
     group('Custom LLM Brain', [
       selectRow({

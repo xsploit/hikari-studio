@@ -18,6 +18,7 @@ import weakref
 import time
 import re
 from typing import Any, AsyncIterator
+from urllib.parse import quote as urllib_quote
 
 import httpx
 
@@ -475,3 +476,193 @@ async def evaluation_catalog(cfg: dict[str, Any] | None = None, *, force: bool =
         _catalog.update({"failedAt": time.monotonic(), "error": msg[:120]})
         return {"models": list(cached) if cached else list(CURATED_EVALUATION_MODELS),
                 "source": "stale" if cached else "curated", "error": msg[:120]}
+
+
+# --------------------------------------------------------------------------- chat-model + upstream provider catalog
+# Port of Waifu Studio provider.rs `chat_model_ids` (Vercel: keep `type == "language"` rows with routed
+# 'creator/model' ids) + model_catalog.rs bounds, extended with the exact per-model upstream providers from
+# GET /v1/models/{id}/endpoints (`endpoints[].provider_name`: the slugs providerOptions.gateway.order / only take).
+# The listing is cached 5 min; each model's provider list 30 min (a refresh only re-asks for stale ones).
+CHAT_CATALOG_TTL_SEC = 300.0
+CHAT_CATALOG_RETRY_SEC = 30.0
+ENDPOINTS_TTL_SEC = 1800.0
+ENDPOINTS_CONCURRENCY = 12
+ENDPOINTS_BUDGET_SEC = 25.0
+FALLBACK_CHAT_MODELS: tuple[tuple[str, str], ...] = (
+    ("openai/gpt-5-nano", "GPT-5 nano"), ("openai/gpt-5-mini", "GPT-5 mini"), ("openai/gpt-5", "GPT-5"),
+    ("openai/gpt-4.1-mini", "GPT-4.1 mini"), ("anthropic/claude-sonnet-4.5", "Claude Sonnet 4.5"),
+    ("anthropic/claude-haiku-4.5", "Claude Haiku 4.5"), ("google/gemini-2.5-flash", "Gemini 2.5 Flash"),
+    ("google/gemini-2.5-pro", "Gemini 2.5 Pro"), ("deepseek/deepseek-v3.2", "DeepSeek V3.2"),
+    ("xai/grok-4-fast-reasoning", "Grok 4 Fast Reasoning"), ("meta/llama-4-maverick", "Llama 4 Maverick"),
+    ("mistral/mistral-medium", "Mistral Medium"), ("alibaba/qwen-3-235b", "Qwen3 235B"),
+    ("moonshotai/kimi-k2", "Kimi K2"),
+)
+_chat_catalog: dict[str, Any] = {"models": None, "at": 0.0, "failedAt": -1e9, "error": ""}
+_endpoint_cache: dict[str, tuple[float, list[str] | None]] = {}     # model id -> (at, providers | None = 404)
+_chat_inflight: "weakref.WeakKeyDictionary[Any, asyncio.Future]" = weakref.WeakKeyDictionary()
+
+
+def _safe_id(mid: Any) -> bool:
+    return (isinstance(mid, str) and 0 < len(mid) <= 256 and "/" in mid
+            and not any(ord(c) < 32 or ord(c) == 127 for c in mid))
+
+
+def chat_model_rows(value: Any) -> list[dict[str, Any]]:
+    """`/v1/models` JSON -> sorted, de-duplicated language-model rows (no providers yet)."""
+    rows = value.get("data") if isinstance(value, dict) else None
+    if not isinstance(rows, list):
+        raise RuntimeError("Expected a data array from /models")
+    if len(rows) > CATALOG_MAX_ROWS:
+        raise RuntimeError("Model catalog exceeds 10,000 entries")
+    out: dict[str, dict[str, Any]] = {}
+    for m in rows:
+        if not isinstance(m, dict) or m.get("type") != "language" or not _safe_id(m.get("id")):
+            continue
+        mid = m["id"]
+        pricing = m.get("pricing") if isinstance(m.get("pricing"), dict) else None
+        out[mid] = {
+            "id": mid,
+            "name": str(m.get("name") or model_label(mid))[:120],
+            "owner": str(m.get("owned_by") or mid.split("/", 1)[0])[:64],
+            "type": "language",
+            "contextWindow": m.get("context_window") if isinstance(m.get("context_window"), int) else None,
+            "maxTokens": m.get("max_tokens") if isinstance(m.get("max_tokens"), int) else None,
+            "pricing": {k: str(v) for k, v in pricing.items() if isinstance(v, (str, int, float))} if pricing else None,
+            "tags": [str(t)[:32] for t in (m.get("tags") or []) if isinstance(t, str)][:12],
+            "providers": [],
+        }
+    return [out[k] for k in sorted(out)]
+
+
+def endpoint_providers(value: Any) -> list[str]:
+    """`/v1/models/{id}/endpoints` JSON -> the exact upstream provider slugs (order kept, de-duplicated)."""
+    data = value.get("data") if isinstance(value, dict) else None
+    eps = data.get("endpoints") if isinstance(data, dict) else None
+    if not isinstance(eps, list):
+        raise RuntimeError("Expected an endpoints array")
+    out: list[str] = []
+    for e in eps:
+        p = str(e.get("provider_name") or "").strip().lower() if isinstance(e, dict) else ""
+        if _ID_RE.match(p) and p not in out:
+            out.append(p)
+    return out
+
+
+def _catalog_client() -> httpx.AsyncClient:
+    """A short-lived client just for the catalog fan-out, so ~300 endpoint lookups never queue behind (or
+    starve) live chat on the shared pool. Tests replace this factory with an httpx.MockTransport client."""
+    return httpx.AsyncClient(limits=httpx.Limits(max_connections=ENDPOINTS_CONCURRENCY,
+                                                 max_keepalive_connections=ENDPOINTS_CONCURRENCY),
+                             follow_redirects=False, headers={"User-Agent": "HikariStudio/1.0"})
+
+
+async def _get_json(client: httpx.AsyncClient, url: str, headers: dict[str, str], timeout: float,
+                    limit: int = CATALOG_MAX_BYTES) -> tuple[int, Any]:
+    buf = bytearray()
+    async with client.stream("GET", url, headers=headers,
+                                         timeout=httpx.Timeout(timeout, connect=min(timeout, 5.0))) as r:
+        if r.status_code >= 400:
+            await r.aread()
+            return r.status_code, None
+        async for chunk in r.aiter_bytes():
+            buf += chunk
+            if len(buf) > limit:
+                raise RuntimeError("Model catalog exceeds size limit")
+    try:
+        return r.status_code, json.loads(bytes(buf))
+    except json.JSONDecodeError:
+        raise RuntimeError("Model catalog returned invalid JSON") from None
+
+
+async def _fetch_chat_catalog(api_key: str, base_url: str) -> list[dict[str, Any]]:
+    headers = {"Accept": "application/json"}
+    if api_key and server_keys.is_official_url(base_url, "vercel"):
+        headers["Authorization"] = f"Bearer {api_key}"
+    async with _catalog_client() as client:
+        return await _fetch_chat_catalog_with(client, headers, base_url)
+
+
+async def _fetch_chat_catalog_with(client: httpx.AsyncClient, headers: dict[str, str],
+                                   base_url: str) -> list[dict[str, Any]]:
+    status, value = await _get_json(client, f"{base_url}/models", headers, 10.0)
+    if value is None:
+        raise RuntimeError(f"Model catalog returned HTTP {status}")
+    rows = chat_model_rows(value)
+    if not rows:
+        raise RuntimeError("Model catalog listed no language models")
+    sem = asyncio.Semaphore(ENDPOINTS_CONCURRENCY)
+    deadline = time.monotonic() + ENDPOINTS_BUDGET_SEC
+
+    async def providers_for(mid: str) -> None:
+        hit = _endpoint_cache.get(mid)
+        if hit and time.monotonic() - hit[0] < ENDPOINTS_TTL_SEC:
+            return
+        async with sem:
+            left = deadline - time.monotonic()
+            if left <= 0.5:
+                return
+            path = "/".join(urllib_quote(part, safe="") for part in mid.split("/"))
+            try:
+                st, val = await _get_json(client, f"{base_url}/models/{path}/endpoints", headers, min(10.0, left), 1_000_000)
+            except Exception:
+                return                                   # transient: keep any older answer, retry next refresh
+            if st == 404:
+                _endpoint_cache[mid] = (time.monotonic(), None)     # listed but not routable (e.g. *-batch)
+            elif val is not None:
+                try:
+                    _endpoint_cache[mid] = (time.monotonic(), endpoint_providers(val))
+                except RuntimeError:
+                    pass
+
+    await asyncio.gather(*(providers_for(r["id"]) for r in rows))
+    out = []
+    for r in rows:
+        hit = _endpoint_cache.get(r["id"])
+        if hit is not None and hit[1] is None:
+            continue                                     # the gateway says this id cannot be routed
+        r["providers"] = list(hit[1]) if hit else []
+        r["providersKnown"] = hit is not None
+        out.append(r)
+    return out
+
+
+def _fallback_models() -> list[dict[str, Any]]:
+    return [{"id": mid, "name": name, "owner": mid.split("/", 1)[0], "type": "language", "contextWindow": None,
+             "maxTokens": None, "pricing": None, "tags": [], "providers": [], "providersKnown": False}
+            for mid, name in FALLBACK_CHAT_MODELS]
+
+
+def _with_providers(models: list[dict[str, Any]], source: str, error: str) -> dict[str, Any]:
+    providers = sorted({p for m in models for p in m.get("providers") or ()})
+    return {"models": [dict(m, providers=list(m.get("providers") or [])) for m in models],
+            "providers": providers, "source": source, "error": error}
+
+
+async def list_chat_models_and_providers(api_key: str = "", force: bool = False, *,
+                                         base_url: str = VERCEL_AI_GATEWAY_BASE_URL) -> dict[str, Any]:
+    """{"models": [{id, name, owner, type, contextWindow, pricing, providers[]}], "providers": [sorted slugs],
+    "source": "live" | "cache" | "stale" | "fallback", "error": str}. Never raises."""
+    now = time.monotonic()
+    cached = _chat_catalog.get("models")
+    if not force and cached and now - _chat_catalog["at"] < CHAT_CATALOG_TTL_SEC:
+        return _with_providers(cached, "cache", "")
+    if not force and now - _chat_catalog["failedAt"] < CHAT_CATALOG_RETRY_SEC:
+        return _with_providers(cached or _fallback_models(), "stale" if cached else "fallback", _chat_catalog["error"])
+    loop = asyncio.get_running_loop()
+    fut = _chat_inflight.get(loop)
+    if fut is None or fut.done():                       # single flight: concurrent callers share one fan-out
+        fut = asyncio.ensure_future(_fetch_chat_catalog((api_key or "").strip(), base_url.rstrip("/")))
+        _chat_inflight[loop] = fut
+    try:
+        models = await asyncio.shield(fut)
+        _chat_catalog.update({"models": models, "at": time.monotonic(), "error": ""})
+        return _with_providers(models, "live", "")
+    except Exception as exc:
+        msg = str(exc) if isinstance(exc, RuntimeError) else "Could not reach model catalog"
+        _chat_catalog.update({"failedAt": time.monotonic(), "error": msg[:120]})
+        return _with_providers(cached or _fallback_models(), "stale" if cached else "fallback", msg[:120])
+
+
+def clear_chat_catalog_cache() -> None:
+    _chat_catalog.update({"models": None, "at": 0.0, "failedAt": -1e9, "error": ""})
+    _endpoint_cache.clear()

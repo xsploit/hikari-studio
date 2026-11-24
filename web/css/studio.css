@@ -815,3 +815,40 @@ kbd {
 .pop-abil .ability-status { font-size: 12px; }
 .pop-abil .ability-stop { margin-left: auto; }
 @media (prefers-reduced-motion: reduce) { .ability-pill.playing::after { animation: none; width: 100%; } }
+
+/* ───────── Voice & Brain: live gateway model / provider pickers, Fish voice picker, Voice Designer ───────── */
+.gw-picker, .fv-picker { display: flex; flex-direction: column; gap: 8px; }
+.fv-bar { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.fv-bar > .text-in { flex: 1 1 auto; min-width: 0; }
+.fv-bar > .seg { margin-right: auto; }
+.gw-picker .pill-select.wide, .fv-picker .pill-select.wide { flex: 1 1 auto; width: 100%; max-width: none; }
+.gw-picker > .text-in { width: 100%; }
+.fv-status { font-size: 12px; color: var(--muted); }
+.fv-status.warn { color: var(--warn); }
+.btn.icon-btn { min-width: 34px; padding-left: 0; padding-right: 0; justify-content: center; flex-shrink: 0; }
+
+.vd-prompt { width: 100%; resize: vertical; min-height: 64px; }
+.vd-cands { display: grid; gap: 10px; }
+.vd-cand {
+  display: flex; flex-direction: column; gap: 10px; padding: 12px; border-radius: 12px;
+  background: var(--field); border: 1px solid var(--line); transition: border-color 120ms, background-color 120ms;
+}
+.vd-cand.selected { border-color: var(--accent); background: var(--accent-soft); }
+.vd-cand-head { display: flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 500; }
+.vd-cand-head input[type="radio"] { accent-color: var(--accent); margin: 0; }
+.vd-chip {
+  margin-left: auto; padding: 2px 8px; border-radius: 999px; font-size: 11.5px;
+  color: var(--muted); background: var(--card); border: 1px solid var(--line);
+}
+.vd-audio-slot { display: block; }
+.vd-audio { width: 100%; height: 36px; display: block; }
+.vd-save { display: flex; flex-direction: column; gap: 6px; padding-top: 10px; border-top: 1px solid var(--line); }
+.vd-save-label { font-size: 12px; color: var(--text-2); font-weight: 500; }
+.vd-save-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.vd-save-row > .text-in { flex: 1 1 160px; min-width: 0; }
+.vd-save-row > .pill-select { min-width: 110px; }
+.s-row.vd-msg.ok { background: rgba(79, 209, 139, 0.08); box-shadow: inset 2px 0 0 var(--ok); }
+.s-row.vd-msg.ok .s-desc { color: var(--ok); font-weight: 500; }
+.s-row.vd-msg.err { background: rgba(255, 92, 114, 0.07); box-shadow: inset 2px 0 0 var(--danger); }
+.s-row.vd-msg.err .s-desc { color: var(--danger); }
+@media (max-width: 560px) { .fv-bar { flex-wrap: wrap; } .fv-bar > .seg { margin-right: 0; } }
