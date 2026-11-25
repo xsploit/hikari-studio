@@ -663,9 +663,17 @@ async def _fetch_chat_catalog_with(client: httpx.AsyncClient, headers: dict[str,
     return out
 
 
+_FALLBACK_VISION_IDS = frozenset({
+    "openai/gpt-5-nano", "openai/gpt-5-mini", "openai/gpt-5", "openai/gpt-4.1-mini",
+    "anthropic/claude-sonnet-4.5", "anthropic/claude-haiku-4.5",
+    "google/gemini-2.5-flash", "google/gemini-2.5-pro", "meta/llama-4-maverick",
+})
+
+
 def _fallback_models() -> list[dict[str, Any]]:
     return [{"id": mid, "name": name, "owner": mid.split("/", 1)[0], "type": "language", "contextWindow": None,
-             "maxTokens": None, "pricing": None, "tags": [], "providers": [], "providersKnown": False}
+             "maxTokens": None, "pricing": None, "tags": ["vision"] if mid in _FALLBACK_VISION_IDS else [],
+             "providers": [], "providersKnown": False}
             for mid, name in FALLBACK_CHAT_MODELS]
 
 

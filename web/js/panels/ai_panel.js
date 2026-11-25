@@ -328,7 +328,7 @@ export function renderAiPanel(store) {
     if (fc?.connected) {
       text = fs.voiceStatus?.sessionVoiceId === cur
         ? 'Chat TTS and the current Live Call use this voice'
-        : 'Chat TTS uses this voice now. The next Live Call will request it.';
+        : (fs.voiceStatus?.voiceNote ? `Chat TTS uses this voice now. Live Call: ${fs.voiceStatus.voiceNote}` : 'Chat TTS uses this voice now. The next Live Call will request it.');
     }
     return el('div', { class: 's-row note voice-sync-hint', 'data-voice-sync': '' }, [
       el('div', { class: 's-desc' }, [el('span', { class: 'sync-dot', 'aria-hidden': 'true' }), text]),

@@ -52,7 +52,7 @@ Most AI VTuber stacks glue together heavy Electron apps, paid proprietary Live2D
   - **Vercel AI Gateway + Fish Speech SSE/WS/HTTP** with live model and provider pinning dropdowns, fallback models, and server-side key isolation.
   - **Fish Audio Voice Designer** creates and previews voices from a description, with a live dropdown for account and community voices.
   - **Unified Vercel AI Gateway System-1 Deciders (`modules/decision_engine.py`):** Ported straight from Waifu Studio's `evaluation.rs` — pick any live `type: evaluation` model via one single `AI_GATEWAY_API_KEY` (`perplexity/pplx-decider-flash-v1.3`, `openai/gpt-6-luna-decisions`, `typesafe-ai/jev`, `google/gemini-decision-1`, `microsoft/decision-1.1`, `liquid/d1.2`) with automatic Jev fallback and optional direct Cloudflare Clef / Perplexity / OpenAI overrides.
-- **Procedural Life & 15 Spring-Tweened Emotes:** Neuro-style autonomous idle choreographer (`curious_tilt`, `vibe_sway`, `happy_bounce`, `chat_read`, `daydream_sigh`, `cheeky_lean`), **Midori-style single-mesh continuous-skin deform arms**, and 15 one-click or AI-triggered emotes. The Decision Model decides whether to wave and when to play it (now, on reply, or after a beat).
+- **Procedural Life & 21 Spring-Tweened Emotes:** Neuro-style autonomous idle choreographer (`curious_tilt`, `vibe_sway`, `happy_bounce`, `chat_read`, `daydream_sigh`, `cheeky_lean`), **Midori-style single-mesh continuous-skin deform arms**, and 21 one-click or AI-triggered emotes. The Decision Model decides whether to wave and when to play it (now, on reply, or after a beat).
 - **Universal Puppet Library:** Load Inochi2D `.inp` puppets, import Live2D models through MINT, and feed auto-discovered rig abilities to the Decision Model.
 - **Motion Lab:** A pure-motion video tracker captures 20 channels while leaving lip-sync under the voice pipeline’s control.
 - **Idle loop:** Any Motion Lab clip can be set as her looping idle (“Use as idle”). Only head, body and drift are borrowed, as seamless offsets on top of her own idle; her eyes, blinks, arms and mouth stay hers, and the loop fades out for emotes. The choice is remembered across restarts.
@@ -81,7 +81,7 @@ flowchart LR
     end
 
     subgraph Server["Python Async Studio Server (server.py)"]
-        RIG["60 FPS Rig Controller\n(Idle, Springs, 15 Emotes)"]
+        RIG["60 FPS Rig Controller\n(Idle, Springs, 21 Emotes)"]
         LIP["4-Engine Lip-Sync\n(MFCC + IPA · 0.28ms)"]
         BRAIN["Voice & Brain Router\n(Fish Live 3 / Vercel / Local)"]
         DEC["System-1 Deciders\n(Clef · pplx · Jev · Luna)"]
@@ -126,7 +126,7 @@ Measured live on Windows 11 at full 60 FPS streaming (`1280×720` / `326 KB` fra
 - **Windows 10/11** with **Python 3.11+** (tested on Python 3.13)
 - Install Python dependencies:
   ```bash
-  pip install fastapi uvicorn websockets pillow numpy opencv-python sounddevice httpx
+  pip install aiohttp msgpack pillow numpy opencv-python sounddevice httpx
   ```
 - **API Keys (only 2 keys needed for the full stack — set as env vars or in `.env`, never committed):**
   - `AI_GATEWAY_API_KEY` — **Vercel AI Gateway** (single unified key for all LLMs — OpenAI, Anthropic, Perplexity, Google, etc. — plus cheap embeddings `openai/text-embedding-3-small` and evaluation/decision models like `typesafe-ai/jev`)
@@ -185,7 +185,7 @@ curl -X POST http://127.0.0.1:8800/api/hook/trigger \
   -d '{"action":"wave","duration":3.5}'
 ```
 
-Supported actions: `wave`, `cheer`, `expression`, `shader_preset`, `say` (plus `POST /api/emote` for all 15 emotes listed by `GET /api/emotes`).
+Supported actions: `wave`, `cheer`, `expression`, `shader_preset`, `say` (plus `POST /api/emote` for all 21 emotes listed by `GET /api/emotes`).
 
 ---
 
@@ -193,7 +193,7 @@ Supported actions: `wave`, `cheer`, `expression`, `shader_preset`, `say` (plus `
 
 | Path | Description |
 | :--- | :--- |
-| [`server.py`](server.py) | FastAPI + WebSocket studio server, security guards, 60 FPS broadcast loop |
+| [`server.py`](server.py) | `aiohttp` + WebSocket studio server, security guards, 60 FPS broadcast loop |
 | [`engine/`](engine/) | Native DLang OpenGL 3.2 + GLSL 330 Inochi2D renderer (`source/app.d`, `hikari-live-engine.exe`) |
 | [`core/`](core/) | Rig controller, VRM eye/outfit customizer, 2× anime upscaler, wardrobe, hook & plugin system |
 | [`modules/`](modules/) | 4-engine lip-sync, Fish duplex & SSE/WS TTS, Vercel AI Gateway, System-1 deciders, SQLite conversation continuity and fact memory |

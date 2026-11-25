@@ -26,6 +26,9 @@ def _key_files() -> list[Path]:
     for var in ("HIKARI_KEY_FILE", "FISH_KEY_FILE"):
         if os.environ.get(var):
             out.append(Path(os.environ[var]))
+    repo_root = Path(__file__).resolve().parent.parent
+    out.append(repo_root / ".env")
+    out.append(repo_root / ".env.local")
     if os.environ.get("USERPROFILE"):
         out.append(Path(os.environ["USERPROFILE"]) / "Documents" / "treblo" / ".env.local")
     return out

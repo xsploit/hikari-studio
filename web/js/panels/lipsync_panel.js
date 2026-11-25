@@ -22,7 +22,7 @@ const MOUTH_PARAMS = [
   ['mouthOpen',   'Mouth open',   'Lip opening',            false],
   ['mouthForm',   'Mouth form',   'Frown ↔ smile',          true],
   ['mouthFunnel', 'Mouth funnel', 'O / U pucker',           false],
-  ['lipsPress',   'Lips press',   'M / B / P seal',         false],
+  ['lipsPress',   'Lips press',   'M / B / P seal',         true],
   ['mouthShrug',  'Mouth shrug',  'F / V lip tuck',         false],
   ['mouthX',      'Mouth X',      'Sideways shift',         true],
   ['tongueOut',   'Tongue out',   'L / TH tongue',          false],

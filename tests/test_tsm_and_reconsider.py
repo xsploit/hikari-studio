@@ -235,7 +235,20 @@ async def test_reconsider_heuristic() -> None:
     check("reconsider. viewer explicitly brings the topic up: passes even in a light tone", ids(kept) == ["cookies"],
           str(eng.reconsider_result))
     kept = await eng.reconsider_memories("what should I eat for dinner?", [GRIEF])
-    check("reconsider. neutral, non-banter message: sensitive memory not suppressed", ids(kept) == ["grief"])
+    check("reconsider. neutral, non-banter message: sensitive memory softened to ask_first (not dropped)",
+          ids(kept) == ["grief"] and kept[0].get("reconsiderMode") == "ask_first"
+          and kept[0].get("reconsiderCheck") == "boundary_permission", str(kept))
+    low_val = mem("low", "The viewer likes rainy jazz playlists.", score=0.30)
+    kept = await eng.reconsider_memories("help me debug this python script", [low_val])
+    check("reconsider. Check 3 (marginal value): weak unrelated memory softened to implicit",
+          ids(kept) == ["low"] and kept[0].get("reconsiderMode") == "implicit"
+          and kept[0].get("reconsiderCheck") == "marginal_value", str(kept))
+    old_bg = mem("oldbg", "The viewer likes building mechanical keyboards.", score=0.55,
+                 createdAt=NOW - 20 * DAY, updatedAt=NOW - 20 * DAY)
+    kept = await eng.reconsider_memories("what movie should we watch?", [old_bg])
+    check("reconsider. Check 4 (present justification): older unreferenced context -> implicit",
+          ids(kept) == ["oldbg"] and kept[0].get("reconsiderMode") == "implicit"
+          and kept[0].get("reconsiderCheck") == "present_justification", str(kept))
     kept = await eng.reconsider_memories("I need to reschedule my dentist appointment", [STALE])
     check("reconsider. stale logistics kept when directly referenced", ids(kept) == ["stale"], str(eng.reconsider_result))
 
@@ -277,15 +290,22 @@ async def test_reconsider_gateway() -> None:
         kept = await eng.reconsider_memories(banter, POOL)
         q = calls[-1]
         check("gateway. one typed call on the gateway evaluation route", len(calls) == 1 and q["provider"] == "gateway")
-        check("gateway. reconsider questions offer exactly bring_up / hold_back",
-              q["questions"] and all(o == ["bring_up", "hold_back"] for o in q["options"])
+        check("gateway. reconsider questions offer all 4 graded modes",
+              q["questions"] and all(o == ["ask_first", "explicit", "hold_back", "implicit"] for o in q["options"])
               and q["questions"][0].startswith("reconsider"), str(q))
         offered = list(q["state"]["candidates"].values())
         check("gateway. pinned / identity / stale never sent to the model",
               not any(("Max" in c["memory"]) or ("Sam" in c["memory"]) or ("dentist" in c["memory"]) for c in offered),
               str(offered))
-        check("gateway. bring_up overrides the heuristic hold-back", "grief" in ids(kept) and "breakup" in ids(kept)
+        check("gateway. legacy bring_up alias overrides hold-back as explicit", "grief" in ids(kept) and "breakup" in ids(kept)
+              and all(m.get("reconsiderMode") == "explicit" for m in kept if m["id"] in ("grief", "breakup"))
               and eng.reconsider_result["backend"] == "gateway", str(eng.reconsider_result))
+
+        de_mod.run_typed_decision = fake({"reconsider_0": "implicit", "reconsider_1": "ask_first"})
+        kept = await eng.reconsider_memories(banter, [GRIEF, BREAKUP])
+        check("gateway. graded implicit & ask_first modes preserved and counted",
+              [m.get("reconsiderMode") for m in kept] == ["implicit", "ask_first"]
+              and eng.stats["implicit"] >= 1 and eng.stats["askFirst"] >= 1, str(eng.reconsider_result))
 
         de_mod.run_typed_decision = fake("hold_back")
         kept = await eng.reconsider_memories("I'm so sad, I miss my grandma", POOL)
@@ -353,6 +373,16 @@ async def test_prompt_integration(tmp: Path) -> None:
           plain.dynamic)
     check("integration. build_prompt_context(reconsider=...) holds the heavy one back",
           gated.dynamic.count("- category=") == 1 and "passed away" not in gated.dynamic, gated.dynamic)
+
+    # Graded prompt formatting: ask_first and implicit modes carry explicit handling cues in the prompt
+    ask_ctx = await store.build_prompt_context("grandma", reconsider=lambda t, ms, *, now: eng.reconsider_memories("dinner?", ms, now=now))
+    check("integration. ask_first mode renders [ASK FIRST ...] cue in prompt",
+          "[ASK FIRST" in ask_ctx.dynamic and "passed away" in ask_ctx.dynamic, ask_ctx.dynamic)
+    imp_lines = MemoryStore.format_for_prompt([
+        {**mem("imp", "The viewer gets stressed before finals."), "reconsiderMode": "implicit"}
+    ])
+    check("integration. implicit mode renders [IMPLICIT ONLY ...] cue in prompt",
+          len(imp_lines) == 1 and "[IMPLICIT ONLY" in imp_lines[0], str(imp_lines))
 
     async def broken(text, ms):
         raise RuntimeError("boom")

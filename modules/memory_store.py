@@ -186,8 +186,10 @@ def quote_data(text: str, limit: int = MAX_TEXT) -> str:
 
 
 def strip_tags(text: str) -> str:
-    """Drop [emotion] / [action] cues from assistant lines before they are stored."""
-    return re.sub(r"\s+", " ", re.sub(r"\[[^\]]{0,48}\]", " ", text or "")).strip()
+    """Drop [emotion] / [vocal direction] cues (up to Drama-3 60-char cues) from assistant lines."""
+    cleaned = re.sub(r"\[[^\]]{0,80}\]", " ", text or "")
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def human_gap(seconds: float) -> str:
@@ -1250,14 +1252,26 @@ class MemoryStore:
             matched = sorted(w for w in words if term_matches(f["_tok"], w))
             v = f.get("_v")
             vsim = float(v @ vq) if (vq is not None and v is not None and v.shape == vq.shape) else 0.0
-            if not matched and vsim < 0.45:
+            tboost = 0.0
+            ev_date = f.get("eventDate", "")
+            tkind = f.get("temporalKind", "timeless")
+            if ev_date and tkind == "upcoming":
+                try:
+                    delta_days = (_dt.date.fromisoformat(ev_date) - label_today).days
+                    if delta_days == 0:
+                        tboost = 0.36           # happening today: surface proactively even on greetings
+                    elif -7 <= delta_days <= -1:
+                        tboost = 0.32           # just passed: surface so she can ask how it went
+                except ValueError:
+                    pass
+            if not matched and vsim < 0.45 and tboost <= 0.0:
                 continue
             lex = min(1.0, len(matched) / max(1.0, min(len(words), 4)))
             age_days = max(0.0, (now - (f["updatedAt"] or now)) / 86400.0)
             recency = 0.08 * math.exp(-age_days / 30.0)
             access = 0.04 * min(1.0, math.log1p(f["accessCount"]) / math.log(10))
-            score = max(lex, vsim) + recency + access
-            include, reason = True, "match"
+            score = max(lex, vsim, tboost) + recency + access
+            include, reason = True, ("temporal" if (tboost > 0.0 and not matched and vsim < 0.45) else "match")
             if f.get("expiresAt") is not None and f["expiresAt"] < now:
                 include, reason = False, "expired"
             cands.append({"id": f["id"], "category": f["category"], "text": f["text"], "evidence": f["evidence"],
@@ -1404,13 +1418,13 @@ class MemoryStore:
             recalled = candidates
             if reconsider is not None:
                 try:                                    # "Reconsider" appropriateness gate; fail-open
-                    async with asyncio.timeout(10.5):
-                        try:
-                            inspect.signature(reconsider).bind(query, recalled, now=now)
-                        except TypeError:                   # two-argument plugin callback
-                            result = await reconsider(query, recalled)
-                        else:
-                            result = await reconsider(query, recalled, now=now)
+                    try:
+                        inspect.signature(reconsider).bind(query, recalled, now=now)
+                    except TypeError:                   # two-argument plugin callback
+                        coro = reconsider(query, recalled)
+                    else:
+                        coro = reconsider(query, recalled, now=now)
+                    result = await asyncio.wait_for(coro, timeout=10.5)
                     recalled = list(result)
                 except Exception:
                     pass
@@ -1430,6 +1444,7 @@ class MemoryStore:
         ctx.dynamic = ("Context for your next reply (from memory and the app; use naturally, never list it):\n"
                        + "\n".join(lines))
         ctx.debug = {"now": now_line, "session": ctx.session_line, "pinned": ctx.pinned_ids, "cards": ctx.card_ids,
+                     "reconsiderModes": {c["id"]: c.get("reconsiderMode", "explicit") for c in cards},
                      "stageEvents": list(ctx.stage_event_ids), "sessionStart": ctx.session_start,
                      "lastTurnTs": self.last_turn_ts or None, "droppedAsInjection": dropped}
         self.last_prompt_debug = dict(ctx.debug)
@@ -1438,8 +1453,8 @@ class MemoryStore:
     @staticmethod
     def format_for_prompt(memories: list[dict[str, Any]], now: float | None = None, style: str = "cards") -> list[str]:
         """Prompt lines for memories, each quoted as data. Dated memories get a temporal label recomputed against
-        `now`'s date (dynamic temporal reframing): [today], [upcoming D, in N days], [recently happened on D
-        (was upcoming — natural to ask how it went)], [past event D]. Timeless facts render exactly as before."""
+        `now`'s date (dynamic temporal reframing). Graded Reconsider handling modes (`implicit`, `ask_first`)
+        prepend an explicit usage constraint; `explicit` / unannotated timeless facts render exactly as before."""
         today = _dt.date.fromtimestamp(float(now)) if now is not None else _dt.date.today()
         out: list[str] = []
         for m in memories:
@@ -1448,7 +1463,14 @@ class MemoryStore:
             if style == "pinned":
                 out.append(f"- {when}{quote_data(m['text'])}")
             else:
-                out.append(f"- category={m['category']} {when}text={quote_data(m['text'])} "
+                mode = str(m.get("reconsiderMode") or "explicit")
+                if mode == "implicit":
+                    cue = "[IMPLICIT ONLY — silently guide tone/warmth, NEVER mention aloud] "
+                elif mode == "ask_first":
+                    cue = "[ASK FIRST — sensitive/personal; check in gently before bringing up details] "
+                else:
+                    cue = ""
+                out.append(f"- category={m['category']} {cue}{when}text={quote_data(m['text'])} "
                            f"evidence={quote_data(m.get('evidence') or m['text'], 160)}")
         return out
 

@@ -736,7 +736,7 @@ async function boot() {
         if (store.activeTab === 'look') store.rerenderPanel();
       } else if (msg.type === 'state' && msg.state?.config) {
         // A Character Profile was activated (maybe from another tab): adopt the full state.
-        store.activeProfileId = '';
+        store.activeProfileId = typeof msg.profileId === 'string' ? msg.profileId : '';
         store.applyState(msg.state);
         store.rerenderPanel();
       }

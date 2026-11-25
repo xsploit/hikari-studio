@@ -743,6 +743,10 @@ class RigController:
                 elif s == "listening":
                     self._listen_side = -1.0 if self._rnd.random() < 0.5 else 1.0
 
+    def get_interaction_state(self) -> str:
+        with self.lock:
+            return self._istate
+
     def trigger_temp_action(self, action: dict[str, Any], duration: float = 4.5) -> None:
         with self.lock:
             self._temp_action = dict(action)

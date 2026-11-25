@@ -844,7 +844,8 @@ class StudioRuntime:
         self.sync_rig_flags()
         self.apply_memory_config()
         await self.config.save_async()
-        await self.broadcast_json({"type": "state", "state": await self.full_state_async()})
+        await self.broadcast_json({"type": "state", "profileId": str(prof.get("id") or ""),
+                                   "state": await self.full_state_async()})
         return prof
 
     def sync_rig_flags(self) -> None:
@@ -1148,6 +1149,10 @@ class StudioRuntime:
                          decision: Decision | None = None, tag: str | None = None,
                          wav_path: Path | None = None, synth: bool = True) -> dict[str, Any]:
         clean, parsed_tag, parsed_act = parse_emotion_and_clean(text)
+        explicit = bool(explicit_cue_tag(text))
+        if action is None and not explicit and parsed_tag == "wave" and (decision is None or not decision.wave):
+            parsed_tag = "happy"                 # no authored [wave] and no decided wave: arms stay down
+            parsed_act = TAG_TO_STATE["happy"]
         tag = tag or parsed_tag
         act = action or parsed_act
         self._subtitle = clean
@@ -1207,11 +1212,15 @@ class StudioRuntime:
             await asyncio.wait({decision_task}, timeout=self.DECISION_GRACE_SEC)
         decision = await self._await_decision(decision_task, "reply", parsed_tag) if decision_task.done() else None
         tag, act = parsed_tag, parsed_act
-        if decision is not None and not explicit:
-            tag = decision.tag
-            if tag == "wave" and not decision.wave:
-                tag = "happy"                    # no authored [wave] and no decided wave: arms stay down
-            act = TAG_TO_STATE.get(tag, TAG_TO_STATE["happy"])
+        if not explicit:
+            if decision is not None:
+                tag = decision.tag
+                if tag == "wave" and not decision.wave:
+                    tag = "happy"                # no authored [wave] and no decided wave: arms stay down
+                act = TAG_TO_STATE.get(tag, TAG_TO_STATE["happy"])
+            elif tag == "wave":
+                tag = "happy"                    # decider still running: keep arms down until _late_decision lands
+                act = TAG_TO_STATE["happy"]
         await self.hooks.emit_async("on_ai_reply", self, {"reply": clean, "tag": tag, "action": act})
         if player is not None:
             player.action, player.tag = act, tag
@@ -1444,13 +1453,14 @@ def _sanitize_ai_patch(values: dict[str, Any]) -> dict[str, Any]:
 
 
 def reconsider_status(decisions: Any) -> dict[str, Any]:
-    """Reconsider gate (memory appropriateness) stats + last outcome for the UI."""
+    """Reconsider gate (5 checks -> 4 modes) stats + last outcome for the UI."""
     try:
         stats = getattr(decisions, "stats", {}) or {}
         return {"last": decisions.reconsider_result, "llmReady": bool(decisions.reconsider_llm_ready()),
-                "reconsidered": int(stats.get("reconsidered", 0)), "heldBack": int(stats.get("heldBack", 0))}
+                "reconsidered": int(stats.get("reconsidered", 0)), "heldBack": int(stats.get("heldBack", 0)),
+                "implicit": int(stats.get("implicit", 0)), "askFirst": int(stats.get("askFirst", 0))}
     except Exception:
-        return {"last": {}, "llmReady": False, "reconsidered": 0, "heldBack": 0}
+        return {"last": {}, "llmReady": False, "reconsidered": 0, "heldBack": 0, "implicit": 0, "askFirst": 0}
 
 
 def build_app(runtime: StudioRuntime) -> web.Application:
@@ -1830,12 +1840,15 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         except Exception:
             return None
 
-    def _plan_vision(data_url: str, msg: str) -> tuple[str | None, dict[str, Any], dict[str, Any], Any]:
+    def _plan_vision(data_url: str, msg: str, *, force_direct: bool = False) -> tuple[str | None, dict[str, Any], dict[str, Any], Any]:
         """Route pixels only to the selected vision model. A failed description leaves chat text-only."""
         vcfg = runtime.config.data.get("vision") or {}
         model = pick_vision_model(vcfg.get("model"))
         order = vcfg.get("providerOrder") or ""
-        if vcfg.get("mode") == "direct":
+        if force_direct or vcfg.get("mode") == "direct":
+            if not runtime.ai.gateway.configured and runtime.ai.brain_mode != "vercel_fish":
+                # No gateway key on a non-Vercel provider: never leak pixels to a text model or 502-crash.
+                return None, {}, {"screen_observation": ""}, None
             return (data_url, {"visionModel": model, "visionMode": "direct"},
                     {"model_override": model, "provider_order_override": order}, None)
         eye = asyncio.create_task(describe_screen(data_url, msg, gateway=runtime.ai.gateway,
@@ -1873,11 +1886,15 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         ctx = None
         try:
             async with chat_lock:                  # history: user turn + reply stay paired and in order
-                if include_screen and (runtime.ai.brain_mode == "vercel_fish" or
-                                       runtime.config.data["ai"].get("provider", "offline") != "offline"):
+                has_live_chat = (runtime.ai.brain_mode == "vercel_fish"
+                                 or runtime.config.data["ai"].get("provider", "offline") != "offline")
+                if include_screen and (has_live_chat or runtime.ai.gateway.configured):
                     cap, status = await capture_screen()
                     if status == 200 and cap.get("dataUrl"):
-                        image_data_url, vision, gen_kw, eye = _plan_vision(cap["dataUrl"], msg)
+                        # If chat itself is offline (e.g. default fish_duplex + provider=offline) but gateway is ready,
+                        # let the selected vision model answer this screen-look turn directly instead of silent no-op.
+                        image_data_url, vision, gen_kw, eye = _plan_vision(
+                            cap["dataUrl"], msg, force_direct=(not has_live_chat and runtime.ai.gateway.configured))
                 try:
                     ctx = await runtime.prompt_context(msg, greeting=greeting)   # (the Vision Eye runs meanwhile)
                 except BaseException:
@@ -1953,6 +1970,7 @@ def build_app(runtime: StudioRuntime) -> web.Application:
                       "arousal": mood.get("arousal", 0.0), "offBaseline": bool(mood.get("offBaseline"))}
         st["interactionState"] = runtime._interaction_state
         st["restoredMessages"] = runtime.ai.restored_turns
+        st["reconsider"] = reconsider_status(runtime.decisions)
         return web.json_response({"ok": True, **st})
 
     def _with_temporal(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2300,7 +2318,13 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         if _truthy(body.get("pause"), False):
             runtime.rig.note_user_pause()
             triggered = True
-        return web.json_response({"ok": True, "triggered": triggered, "backchannel": runtime.rig.backchannel_status()})
+        bc = runtime.rig.backchannel_status()
+        # Keep interaction in "listening" whenever live user mic activity / micro-pause arrives while Hikari is not
+        # speaking (fixes Turn 2+ Fish Live Call backchanneling after role="agent" reset istate to "idle").
+        if (bc.get("speaking") or triggered) and not runtime.lipsync.is_speaking():
+            if runtime.rig.get_interaction_state() not in ("speaking", "thinking"):
+                runtime.set_interaction("listening")
+        return web.json_response({"ok": True, "triggered": triggered, "backchannel": bc})
 
     async def api_vision_capture(req):
         """POST /api/vision/capture: one on-demand screenshot (downscaled JPEG data URL; nothing stored)."""

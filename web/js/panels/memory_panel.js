@@ -3,7 +3,7 @@
  *  Network: fetches only when this tab renders (cached 8 s). No timers — nothing runs while Settings is closed. */
 import { btn, el, group, more, noteRow, row, selectRow, slider, switchEl, textIn, toggle, withCurrent } from '../ui.js';
 
-const EMBEDDERS = [['vercel', 'Vercel AI Gateway'], ['local_hash', 'Local lightweight (offline)']];
+const EMBEDDERS = [['vercel', 'Vercel AI Gateway'], ['local', 'Local lightweight (offline)']];
 const CATEGORY_LABELS = {
   fact: 'Fact', preference: 'Preference', project: 'Project', inside_joke: 'Inside joke', viewer: 'Viewer', note: 'Note',
 };
@@ -38,6 +38,7 @@ const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 function normStatus(d) {
   const s = d || {};
   const moodRaw = s.mood && typeof s.mood === 'object' ? s.mood : null;
+  const recRaw = s.reconsider && typeof s.reconsider === 'object' ? s.reconsider : null;
   return {
     enabled: s.enabled !== false,
     facts: numOrNull(s.factCount),
@@ -49,6 +50,14 @@ function normStatus(d) {
       valence: numOrNull(moodRaw.valence),
       arousal: numOrNull(moodRaw.arousal),
     } : null,
+    reconsider: recRaw ? {
+      llmReady: Boolean(recRaw.llmReady),
+      reconsidered: numOrNull(recRaw.reconsidered) ?? 0,
+      heldBack: numOrNull(recRaw.heldBack) ?? 0,
+      implicit: numOrNull(recRaw.implicit) ?? 0,
+      askFirst: numOrNull(recRaw.askFirst) ?? 0,
+      last: recRaw.last && typeof recRaw.last === 'object' ? recRaw.last : {},
+    } : null,
   };
 }
 
@@ -58,6 +67,9 @@ function normFact(f, i = 0) {
     text: String(pick(f, 'text') ?? '').trim(),
     category: String(pick(f, 'category') || 'note'),
     evidence: String(pick(f, 'evidence') || '').trim(),
+    eventDate: String(pick(f, 'eventDate') || '').trim(),
+    temporalKind: String(pick(f, 'temporalKind') || 'timeless'),
+    temporalLabel: String(pick(f, 'temporalLabel') || '').trim(),
     pinned: Boolean(f?.pinned),
     updatedAt: numOrNull(pick(f, 'updatedAt', 'createdAt')) ?? 0,
   };
@@ -183,7 +195,32 @@ export function renderMemoryPanel(store) {
           mood ? stat(mood, 'Mood', moodTip) : null,
         ]),
       }),
-    ];
+      st.reconsider ? (() => {
+        const rec = st.reconsider;
+        const last = rec.last || {};
+        const held = Array.isArray(last.heldBack) ? last.heldBack : [];
+        const soft = Array.isArray(last.softened) ? last.softened : [];
+        const notes = [
+          ...held.map((h) => `held back (${h.reason || h.check || 'filtered'})`),
+          ...soft.map((s) => `${s.mode === 'ask_first' ? 'ask first' : 'implicit'} (${s.reason || s.check || 'softened'})`),
+        ].slice(0, 2);
+        const modeTxt = rec.llmReady ? '5 checks · 4 modes (gateway + offline)' : '5 checks · 4 modes (offline heuristic)';
+        const detail = notes.length
+          ? `Last turn (${last.tone || 'neutral'}): ${notes.join(' · ')}`
+          : (rec.reconsidered > 0 ? `${modeTxt} · last turn: ${last.tone || 'neutral'}` : `${modeTxt} · ready for next turn`);
+        return row({
+          title: 'Reconsider gate',
+          desc: detail,
+          stack: true,
+          control: el('div', { class: 'stat-grid' }, [
+            stat(rec.reconsidered, 'Checked'),
+            stat(rec.implicit, 'Implicit only', 'Shaped tone silently without stating aloud'),
+            stat(rec.askFirst, 'Ask first', 'Sensitive — checks in before bringing up'),
+            stat(rec.heldBack, 'Held back', 'Omitted for tone, boundary, or staleness'),
+          ]),
+        });
+      })() : null,
+    ].filter(Boolean);
   } else {
     statusRows = [noteRow(state.loading || !state.fetchedAt ? 'Loading memory status…' : `Memory status: ${state.statusErr || 'unavailable'}`)];
   }

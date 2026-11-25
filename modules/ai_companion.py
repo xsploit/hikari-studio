@@ -395,7 +395,7 @@ def offline_hikari_reply(user_msg: str) -> str:
     return random.choice([
         "[sparkle] Ooh, I love that! Every syllable is driving my six-layer VBridger mouth and rigid arms live at sixty FPS!",
         "[happy] Gotcha! Try flipping between Bust, Waist-Up, and Full Body framing—or drop a video clip into Motion Lab!",
-        "[wave] Sounds awesome! Open the Shaders or Mouth & Visemes tab anytime to dial in the exact look you want!",
+        "[happy] Sounds awesome! Open the Shaders or Mouth & Visemes tab anytime to dial in the exact look you want!",
     ])
 
 
