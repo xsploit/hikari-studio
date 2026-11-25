@@ -689,7 +689,7 @@ class Follower:
 # =================================================================================================================
 # 4. VFX / micro-expression spec + rig pass
 # =================================================================================================================
-VFX_VERSION = "vfx-v1"
+VFX_VERSION = "vfx-v2-kuroama"
 NODE_BASE = 54000
 PARAM_IDS = {"VFX Sparkles": 54100, "VFX Hearts": 54101, "VFX Sweat": 54102, "VFX Anger": 54103, "VFX Shock": 54104,
              "VFX Music": 54105, "Eye Star": 54106, "Eye Heart": 54107, "Cat Mouth": 54109}
@@ -969,7 +969,8 @@ def apply_vfx_rig(header: bytes, tid_of: dict[str, int], sizes: dict[str, tuple[
 #    (topwear / resting arms / shoulder lineart, lash / eye white, lips / cavity) move identically at the seam.
 # =================================================================================================================
 PRO_PARAM_IDS = {"Stage X": 54200, "Stage Y": 54201, "Stage Zoom": 54202, "Pupil Shrink": 54203, "Shoulder Shrug": 54204,
-                 "Stage Roll": 54205}
+                 "Stage Roll": 54205, "Angle X Cheek Squish": 54206, "Cheek L PY1": 54207, "Cheek R PY1": 54208,
+                 "Arm R Fit": 54209, "Arm L Fit": 54210}
 PUPPET_ROOT = 1
 STAGE_X = 80.0                    # +-units of whole-body sway at Stage X = +-1
 STAGE_Y = (45.0, -55.0)           # t.y at Stage Y = -1 (crouch, down) / +1 (hop, UP: Inochi2D y points down)
@@ -1183,3 +1184,172 @@ def apply_pro_transforms(puppet: dict[str, Any], iris_pngs: dict[str, bytes]) ->
             if n is not None and n.get("mesh", {}).get("verts"):
                 p = _world_rest(n, parent)
                 emit(nid, p, np.ones(len(p)))
+
+    # ---- 5. Kuroama v30 Head & Soft-Volume Pass (3D eyeballs, nose tip projection, cheek squish + jiggle, arm-up fit)
+    apply_kuroama_v30(puppet, by_id, parent, params)
+
+
+# =================================================================================================================
+# 6. Kuroama v30 Pass: 3D eyeball perspective + nose projection on Angle (11x5), cheek squish on Mouth Shrug +
+#    Angle X Cheek Squish, soft L/R cheek physics blend shapes (Cheek L/R PY1), and side-independent Arm R/L Fit.
+# =================================================================================================================
+KUROAMA_EYE_WRAP = {
+    "R": {"sclera": (1014,), "lashes": (1016, 1018, 1019, 1020), "iris": (1023,), "hi": (1025, 50019)},
+    "L": {"sclera": (1015,), "lashes": (1017, 1021, 1022), "iris": (1024,), "hi": (1026, 50020)},
+}
+NOSE_NODE = 1012
+
+
+def _cheek_squish_weights(face_rest: np.ndarray, side: str | None = None, outer_bias: bool = False) -> np.ndarray:
+    """Smooth, broad lower-cheek weight field on ArtMeshFace (1011). Zero on eyes/chin, wide ramp -> zero silhouette pinch."""
+    x, y = face_rest[:, 0], face_rest[:, 1]
+    lock = (1.0 - _ss(-378.0, -365.0, y)) * _ss(-442.0, -412.0, y)
+    sides = (side,) if side in ("R", "L") else ("R", "L")
+    total = np.zeros(len(face_rest), np.float64)
+    for s in sides:
+        cx, cy = CHEEK_CENTER[s]
+        dx, dy = x - cx, y - (cy - 1.0)
+        w = np.exp(-((dx / 30.0) ** 2 + (dy / 22.0) ** 2)) * lock
+        sgn = 1.0 if s == "L" else -1.0
+        w *= _ss(4.0, 22.0, (x - MOUTH_CENTER[0]) * sgn)
+        if outer_bias:
+            w *= _ss(28.0, 58.0, np.abs(x))
+        total = np.maximum(total, w)
+    return total
+
+
+def apply_kuroama_v30(puppet: dict[str, Any], by_id: dict[int, dict[str, Any]],
+                      parent: dict[int, dict[str, Any]], params: list[dict[str, Any]]) -> None:
+    by_name = {p["name"]: p for p in params}
+
+    # ---- 6a. Cheek Squish on Mouth Shrug + 3/4-Angle Extra Outer-Cheek Squish + Cheek L/R PY1 spring shapes
+    face = by_id.get(FACE)
+    if face is not None and face.get("mesh", {}).get("verts"):
+        fw = _world_rest(face, parent)
+        sgn_x = np.where(fw[:, 0] >= MOUTH_CENTER[0], 1.0, -1.0)
+
+        # Mouth Shrug -> soft upward + outward lower-cheek squish (keeps existing VB Mouth bindings intact!)
+        ms = by_name.get("Mouth Shrug")
+        if ms is not None and len(ms["axis_points"][0]) == 2:
+            w = _cheek_squish_weights(fw, outer_bias=False)
+            squish = np.stack([sgn_x * 2.6 * w, -2.5 * w], 1)
+            _bind_deform(ms, FACE, [np.zeros_like(squish), squish])
+
+        # Angle X Cheek Squish -> extra plush outer-cheek curve when smiling/shrugging at 3/4 angles
+        ax_cs = _ensure_param(params, "Angle X Cheek Squish", 0)
+        w_out = _cheek_squish_weights(fw, outer_bias=True)
+        out_squish = np.stack([sgn_x * 3.4 * w_out, -1.6 * w_out], 1)
+        _bind_deform(ax_cs, FACE, [np.zeros_like(out_squish), out_squish])
+
+        # Cheek L PY1 / Cheek R PY1 -> soft secondary cheek bounce spring blend shapes (-1 drop .. +1 lift)
+        for side, pname in (("L", "Cheek L PY1"), ("R", "Cheek R PY1")):
+            cp_y = _ensure_param(params, pname, -1)
+            w_s = _cheek_squish_weights(fw, side=side, outer_bias=False)
+            sg = 1.0 if side == "L" else -1.0
+            drop = np.stack([-sg * 1.2 * w_s, 2.2 * w_s], 1)
+            lift = np.stack([sg * 1.8 * w_s, -2.6 * w_s], 1)
+            _bind_deform(cp_y, FACE, [drop, np.zeros_like(drop), lift])
+
+    # ---- 6b. 3D Eyeball Perspective + Curved Lash Wrap + 3D Nose Tip Projection across Angle (11x5) yaw stops
+    ang = by_name.get("Angle")
+    if ang is not None and len(ang.get("axis_points", [])) == 2:
+        ax_x = ang["axis_points"][0]
+        nx = len(ax_x)
+        ang_by_node = {b["node"]: b for b in ang.get("bindings", []) if b.get("param_name") == "deform"}
+
+        for side, spec in KUROAMA_EYE_WRAP.items():
+            scl = by_id.get(spec["sclera"][0])
+            iris = by_id.get(spec["iris"][0])
+            if scl is None or iris is None:
+                continue
+            sw = _world_rest(scl, parent)
+            iw = _world_rest(iris, parent)
+            eye_cx = float(0.5 * (sw[:, 0].min() + sw[:, 0].max()))
+            eye_hw = max(8.0, float(0.5 * (sw[:, 0].max() - sw[:, 0].min())))
+            iris_cx = float(iw[:, 0].mean())
+            out_sgn = 1.0 if side == "L" else -1.0  # +1 screen-right for L, -1 screen-left for R
+
+            # Sclera + Lashes: far-eye outer-corner spherical wrap; near-eye subtle convex open perspective
+            for nid in spec["sclera"] + spec["lashes"]:
+                b = ang_by_node.get(nid)
+                nd = by_id.get(nid)
+                if b is None or nd is None or not nd.get("mesh", {}).get("verts"):
+                    continue
+                w = _world_rest(nd, parent)
+                V = np.asarray(b["values"], np.float64)
+                if V.shape[0] != nx or V.shape[2] != len(w):
+                    continue
+                dx_c = w[:, 0] - eye_cx
+                outer_u = np.clip((dx_c * out_sgn / eye_hw + 0.65) / 1.65, 0.0, 1.0) ** 1.4
+                for i, axv in enumerate(ax_x):
+                    yn = (float(axv) - 0.5) * 2.0  # [-1..+1]
+                    mag = abs(yn) ** 1.35
+                    if mag < 1e-4:
+                        continue
+                    is_far = (side == "R" and yn < 0.0) or (side == "L" and yn > 0.0)
+                    if is_far:
+                        ddx = -out_sgn * (3.2 * mag) * outer_u - 0.06 * mag * dx_c
+                        ddy = (1.3 * mag) * outer_u
+                    else:
+                        ddx = 0.035 * mag * dx_c
+                        ddy = np.zeros_like(dx_c)
+                    V[i, :, :, 0] += ddx[None, :]
+                    V[i, :, :, 1] += ddy[None, :]
+                b["values"] = np.round(V, 4).tolist()
+
+            # Iris + Catchlights: 3D spherical foreshortening + convex cornea-dome highlight parallax
+            for is_hi, nids in ((False, spec["iris"]), (True, spec["hi"])):
+                for nid in nids:
+                    b = ang_by_node.get(nid)
+                    nd = by_id.get(nid)
+                    if b is None or nd is None or not nd.get("mesh", {}).get("verts"):
+                        continue
+                    w = _world_rest(nd, parent)
+                    V = np.asarray(b["values"], np.float64)
+                    if V.shape[0] != nx or V.shape[2] != len(w):
+                        continue
+                    dx_i = w[:, 0] - iris_cx
+                    for i, axv in enumerate(ax_x):
+                        yn = (float(axv) - 0.5) * 2.0
+                        mag = abs(yn) ** 1.35
+                        if mag < 1e-4:
+                            continue
+                        is_far = (side == "R" and yn < 0.0) or (side == "L" and yn > 0.0)
+                        if is_far:
+                            ddx = -0.18 * mag * dx_i + (-out_sgn * (1.2 if not is_hi else 2.5) * mag)
+                        else:
+                            ddx = 0.04 * mag * dx_i + (out_sgn * (0.0 if not is_hi else 1.4) * mag)
+                        V[i, :, :, 0] += ddx[None, :]
+                    b["values"] = np.round(V, 4).tolist()
+
+        # Nose (1012): 3D silhouette tip projection (tip protrudes in yaw direction relative to bridge)
+        nb = ang_by_node.get(NOSE_NODE)
+        nnd = by_id.get(NOSE_NODE)
+        if nb is not None and nnd is not None and nnd.get("mesh", {}).get("verts"):
+            nw = _world_rest(nnd, parent)
+            V = np.asarray(nb["values"], np.float64)
+            if V.shape[0] == nx and V.shape[2] == len(nw):
+                y0, y1 = float(nw[:, 1].min()), float(nw[:, 1].max())
+                tip_t = np.clip((nw[:, 1] - y0) / max(1e-3, y1 - y0), 0.0, 1.0) ** 1.2
+                for i, axv in enumerate(ax_x):
+                    yn = (float(axv) - 0.5) * 2.0
+                    mag = abs(yn) ** 1.3
+                    if mag < 1e-4:
+                        continue
+                    sgn = 1.0 if yn > 0.0 else -1.0
+                    V[i, :, :, 0] += (sgn * 3.0 * mag * tip_t)[None, :]
+                    V[i, :, :, 1] += (-0.7 * mag * (1.0 - tip_t))[None, :]
+                nb["values"] = np.round(V, 4).tolist()
+
+    # ---- 6c. Arm R Fit / Arm L Fit (Kuroama Fit-Jacket coupling): single-side topwear & collar lift when raising an arm
+    for side, pname in (("R", "Arm R Fit"), ("L", "Arm L Fit")):
+        fp = _ensure_param(params, pname, 0)
+        sg = 1.0 if side == "L" else -1.0
+        for nid in SHRUG_TORSO:
+            nd = by_id.get(nid)
+            if nd is None or not nd.get("mesh", {}).get("verts"):
+                continue
+            w = _world_rest(nd, parent)
+            f = shrug_field(w, arm=False) * _ss(-10.0, 32.0, w[:, 0] * sg)
+            lift = np.stack([sg * 2.4 * f, -6.2 * f], 1)
+            _bind_deform(fp, nid, [np.zeros_like(lift), lift])

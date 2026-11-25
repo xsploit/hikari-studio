@@ -442,6 +442,13 @@ class RigController:
         self.sp_fb_chest_y = Spring2nd(0.0)
         self.sp_fb_chest_x = Spring2nd(0.0)
         self.sp_fb_arm_swing = Spring2nd(0.0)
+        # Kuroama v30: soft cheek bounce springs, layered Body Z2 counter-sway, conditional saccade/blink eye-bounce
+        self.sp_cheek_l = Spring2nd(0.0)
+        self.sp_cheek_r = Spring2nd(0.0)
+        self.sp_body_z2 = Spring2nd(0.0)
+        self._prev_eye_x = 0.0
+        self._prev_eye_y = 0.0
+        self._prev_blink_active = False
         self._prev_body_x = 0.0
         self._prev_body_y = 0.0
         self._prev_breath = 0.0
@@ -1718,6 +1725,22 @@ class RigController:
             idle_brow_boost += 0.24 * barge_env
             body_lean += 1.6 * barge_env
 
+        # 5.5 Kuroama v30 conditional eye-bounce (saccade darts + blink rebound) & corner Z-roll + Body Z2 follow-through
+        eye_jump = math.hypot(eye_x - self._prev_eye_x, eye_y - self._prev_eye_y)
+        if eye_jump > 0.14:
+            self.sp_eye_jelly.v += min(0.85, eye_jump * 1.45) * 4.5
+        if self._prev_blink_active and not self._blink_active:
+            self.sp_eye_jelly.v += 3.2
+        self._prev_eye_x = eye_x
+        self._prev_eye_y = eye_y
+        self._prev_blink_active = self._blink_active
+
+        # Subtle diagonal Angle Z in XY corners (Kuroama Nxd1BVrg49w) + layered Body Z2 counter-sway (X8J0rtkEuSs)
+        head_z += -_clamp((head_x / 30.0) * (head_y / 24.0), -1.0, 1.0) * 6.5
+        bz2 = self.sp_body_z2.step(-body_x * 0.24 + head_z * 0.14, dt, 5.4, 0.44)
+        body_z += _clamp(bz2, -3.5, 3.5)
+        body_lean += _clamp(bz2 * 0.35, -1.8, 1.8)
+
         # 6. Expression + mood + state
         expr_name = (temp.get("expression") if temp else None) or str(rig_cfg.get("expression", "happy"))
         expr_tgt = EXPRESSION_PRESETS.get(expr_name, EXPRESSION_PRESETS["neutral"])
@@ -1925,7 +1948,8 @@ class RigController:
         p["VB Mouth"] = (_clamp(vb_form, -1.0, 1.0), _clamp(vb_open, 0.0, 1.0))
         p["Mouth Funnel"] = (funnel_v, 0.0)
         p["Mouth X"] = (mouth_x_v, 0.0)
-        p["Mouth Shrug"] = (m_shrug if m_shrug is not None else self.defaults.get("Mouth Shrug", (0.0, 0.0))[0], 0.0)
+        shrug_base = m_shrug if m_shrug is not None else self.defaults.get("Mouth Shrug", (0.0, 0.0))[0]
+        p["Mouth Shrug"] = (_clamp(max(shrug_base, smile * 0.48), 0.0, 1.0), 0.0)
         if "Lips Press / Part" in p:
             p["Lips Press / Part"] = (m_press if m_press is not None else self.defaults["Lips Press / Part"][0], 0.0)
         p["Tongue Out"] = (_clamp(vb_tongue, 0.0, 1.0), 0.0)
@@ -2353,6 +2377,34 @@ class RigController:
             p["Body Angle Z"] = (_clamp(body_z, -10.0, 10.0), 0.0)
             p["Body Lean"] = (_clamp(body_lean, -10.0, 10.0), 0.0)
             p["Body Angle X"] = (_clamp(body_x, -10.0, 10.0), 0.0)
+
+        # 10.25 Kuroama v30 live couplings: 3/4-angle cheek squish, soft L/R cheek bounce springs, arm-raise clothing fit
+        hx_now = p["Angle"][0]
+        shrug_now = p["Mouth Shrug"][0] if "Mouth Shrug" in p else 0.0
+        jaw_now = p["Jaw Open"][0] if "Jaw Open" in p else 0.0
+        if "Angle X Cheek Squish" in p:
+            yaw_mag = _clamp(abs(hx_now) / 30.0, 0.0, 1.0) ** 1.15
+            squish_drv = _clamp(shrug_now * 0.78 + smile * 0.62 + jaw_now * 0.32, 0.0, 1.0)
+            p["Angle X Cheek Squish"] = (_clamp(yaw_mag * squish_drv, 0.0, 1.0), 0.0)
+        cheek_imp = _clamp(-dhy * 1.1 + onset * 3.8 + _clamp(v_open, -4.0, 4.0) * 0.45, -6.0, 6.0)
+        cheek_asym = _clamp(dhx * 0.55, -2.5, 2.5)
+        self.sp_cheek_l.v += (cheek_imp + cheek_asym) * dt * 14.0
+        self.sp_cheek_r.v += (cheek_imp - cheek_asym) * dt * 14.0
+        cl_val = _clamp(self.sp_cheek_l.step(smile * 0.22, dt, 14.0, 0.36), -1.0, 1.0)
+        cr_val = _clamp(self.sp_cheek_r.step(smile * 0.22, dt, 14.0, 0.36), -1.0, 1.0)
+        if "Cheek L PY1" in p:
+            p["Cheek L PY1"] = (cl_val, 0.0)
+        if "Cheek R PY1" in p:
+            p["Cheek R PY1"] = (cr_val, 0.0)
+        ar_fit = _smooth(_clamp(p["Arm R Pose"][0] + max(0.0, p["Arm R Lift"][0]) * 0.35, 0.0, 1.0)) if "Arm R Pose" in p else 0.0
+        al_fit = _smooth(_clamp(p["Arm L Pose"][0] + max(0.0, p["Arm L Lift"][0]) * 0.35, 0.0, 1.0)) if "Arm L Pose" in p else 0.0
+        if "Arm R Fit" in p:
+            p["Arm R Fit"] = (ar_fit, 0.0)
+        if "Arm L Fit" in p:
+            p["Arm L Fit"] = (al_fit, 0.0)
+        arm_fit_max = max(ar_fit, al_fit)
+        if arm_fit_max > 0.01:
+            em_fx["Shoulder Shrug"] = em_fx.get("Shoulder Shrug", 0.0) + 0.18 * arm_fit_max
 
         # 10.3 Expression VFX & blend shapes: auto emotion mapping < emote VFX < manual Studio overrides,
         #      eased by critically damped springs, then animated (twinkle / bob / throb) while active.

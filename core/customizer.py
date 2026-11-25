@@ -1249,43 +1249,50 @@ def _upgrade_spring_physics(header: bytes) -> bytes:
         os_x, os_y = n.get("output_scale", [1.0, 0.0])
         if "ahoge" in nm:
             n["model_type"] = "SpringPendulum"
-            n["angle_damping"] = 0.16
-            n["length_damping"] = 0.20
-            n["frequency"] = max(1.75, float(n.get("frequency", 1.55)))
-            n["output_scale"] = [round(float(os_x) * 1.45, 4), round(float(os_y) * 1.45, 4)]
+            n["angle_damping"] = 0.18
+            n["length_damping"] = 0.22
+            n["frequency"] = max(2.25, round(float(n.get("frequency", 1.55)) * 1.22, 3))
+            n["output_scale"] = [round(float(os_x) * 1.50, 4), round(float(os_y) * 1.50, 4)]
         elif "back hair" in nm:
             n["model_type"] = "SpringPendulum"
-            n["angle_damping"] = 0.22
-            n["length_damping"] = 0.26
-            n["output_scale"] = [round(float(os_x) * 1.38, 4), round(float(os_y) * 1.38, 4)]
+            n["angle_damping"] = 0.25
+            n["length_damping"] = 0.28
+            n["frequency"] = max(1.95, round(float(n.get("frequency", 1.50)) * 1.18, 3))
+            n["output_scale"] = [round(float(os_x) * 1.42, 4), round(float(os_y) * 1.42, 4)]
         elif "front hair" in nm:
+            n["model_type"] = "SpringPendulum"
+            n["angle_damping"] = 0.26
+            n["length_damping"] = 0.30
+            n["frequency"] = max(2.10, round(float(n.get("frequency", 1.65)) * 1.18, 3))
+            n["output_scale"] = [round(float(os_x) * 1.38, 4), round(float(os_y) * 1.38, 4)]
+        elif "skirt" in nm:
             n["model_type"] = "SpringPendulum"
             n["angle_damping"] = 0.24
             n["length_damping"] = 0.28
-            n["output_scale"] = [round(float(os_x) * 1.32, 4), round(float(os_y) * 1.32, 4)]
-        elif "skirt" in nm:
-            n["model_type"] = "SpringPendulum"
-            n["angle_damping"] = 0.20
-            n["length_damping"] = 0.26
-            n["output_scale"] = [round(float(os_x) * 1.40, 4), round(float(os_y) * 1.40, 4)]
+            n["frequency"] = max(2.05, round(float(n.get("frequency", 1.55)) * 1.18, 3))
+            n["output_scale"] = [round(float(os_x) * 1.42, 4), round(float(os_y) * 1.42, 4)]
         elif "top fabric" in nm:
             n["model_type"] = "SpringPendulum"
-            n["angle_damping"] = 0.28
+            n["angle_damping"] = 0.26
             n["length_damping"] = 0.28
-            n["output_scale"] = [round(float(os_x) * 1.35, 4), round(float(os_y) * 1.35, 4)]
+            n["frequency"] = max(2.15, round(float(n.get("frequency", 1.65)) * 1.16, 3))
+            n["output_scale"] = [round(float(os_x) * 1.40, 4), round(float(os_y) * 1.40, 4)]
         elif "eye jelly" in nm or "eyelbounce" in nm or "eyerbounce" in nm:
             n["model_type"] = "SpringPendulum"
-            n["angle_damping"] = 0.78
-            n["length_damping"] = 0.78
-            n["output_scale"] = [round(float(os_x) * 0.35, 4), round(float(os_y) * 0.35, 4)]
+            n["angle_damping"] = 0.56
+            n["length_damping"] = 0.56
+            n["frequency"] = max(2.60, round(float(n.get("frequency", 2.00)) * 1.15, 3))
+            n["output_scale"] = [round(float(os_x) * 0.52, 4), round(float(os_y) * 0.52, 4)]
         elif "arm swing" in nm:
-            n["angle_damping"] = 0.30
-            n["output_scale"] = [round(float(os_x) * 1.28, 4), round(float(os_y) * 1.28, 4)]
+            n["angle_damping"] = 0.28
+            n["frequency"] = max(1.85, round(float(n.get("frequency", 1.45)) * 1.15, 3))
+            n["output_scale"] = [round(float(os_x) * 1.32, 4), round(float(os_y) * 1.32, 4)]
         elif "brow" in nm or "mouth" in nm:
             n["model_type"] = "SpringPendulum"
-            n["angle_damping"] = 0.36
-            n["length_damping"] = 0.36
-            n["output_scale"] = [round(float(os_x) * 1.25, 4), round(float(os_y) * 1.25, 4)]
+            n["angle_damping"] = 0.32
+            n["length_damping"] = 0.34
+            n["frequency"] = max(2.50, round(float(n.get("frequency", 1.90)) * 1.16, 3))
+            n["output_scale"] = [round(float(os_x) * 1.30, 4), round(float(os_y) * 1.30, 4)]
 
     # 2) Wire anatomical 2-cup Gaussian squash-and-stretch deform bindings onto Chest Y (5094) & Chest X (5095)
     top_node = nodes.get(1005)
