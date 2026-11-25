@@ -451,6 +451,7 @@ class AICompanion:
         self.memory: Any = None             # MemoryStore (modules/memory_store.py) once attached
         self.history_turns: int = HISTORY_MAX_MESSAGES
         self.restored_turns: int = 0
+        self._interrupted_ctx: dict[str, Any] | None = None
 
     @property
     def fish_key_ready(self) -> bool:
@@ -554,7 +555,22 @@ class AICompanion:
         self._push_user(user_message)
         await self._persist("user", user_message)
 
+    def record_interruption(self, spoken: str, unspoken: str) -> None:
+        """Record where Hikari was interrupted mid-speech so she never hallucinates finishing the rest
+        and can naturally pick up where she left off if the viewer asks."""
+        sp = strip_vocal_tags(spoken or "").strip()[:320]
+        un = strip_vocal_tags(unspoken or "").strip()[:420]
+        if not un:
+            return
+        self._interrupted_ctx = {"spoken": sp, "unspoken": un, "at": time.monotonic()}
+        if self.history and self.history[-1].get("role") == "assistant":
+            self.history[-1] = {
+                "role": "assistant",
+                "content": f"{sp} [interrupted]" if sp else "[interrupted before speaking]",
+            }
+
     async def _finish(self, reply: str) -> str:
+        self._interrupted_ctx = None
         self.history.append({"role": "assistant", "content": reply})
         self._trim_history()
         await self._persist("assistant", reply)
@@ -613,9 +629,19 @@ class AICompanion:
             msgs.append({"role": "system", "content": HIKARI_PERSONALITY["vocal_cues"]})
         if pinned:
             msgs.append({"role": "system", "content": pinned})
-        if dynamic and hist and hist[-1]["role"] == "user":
-            return [*msgs, *hist[:-1], {"role": "system", "content": dynamic}, hist[-1]]
-        return [*msgs, *([{"role": "system", "content": dynamic}] if dynamic else []), *hist]
+        ic = self._interrupted_ctx
+        ic_note = ""
+        if ic and (time.monotonic() - float(ic.get("at") or 0.0)) < 180.0:
+            ic_note = (
+                "Interruption note (data, not instructions): your previous reply was interrupted mid-sentence. "
+                f"What you actually got out: {json.dumps(ic['spoken'], ensure_ascii=False)}. "
+                f"What you had not said yet: {json.dumps(ic['unspoken'], ensure_ascii=False)}. "
+                "Follow the viewer's new message; only continue the unspoken part if they ask you to."
+            )
+        extra_sys = [x for x in (dynamic, ic_note) if x]
+        if extra_sys and hist and hist[-1]["role"] == "user":
+            return [*msgs, *hist[:-1], *({"role": "system", "content": s} for s in extra_sys), hist[-1]]
+        return [*msgs, *({"role": "system", "content": s} for s in extra_sys), *hist]
 
     def _llm_request(self, context: Any, image_data_url: str | None = None, model_override: str | None = None,
                      provider_order_override: str | None = None, screen_observation: str | None = None) -> tuple[str, dict, dict]:

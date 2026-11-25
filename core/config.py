@@ -18,6 +18,7 @@ from modules.ai_companion import BRAIN_MODES, DEFAULT_AI_CFG, LEGACY_AI_KEYS, LE
 from modules.vercel_gateway import is_vision_model_id
 from modules.fish_tts_stream import FISH_TRANSPORTS
 from modules.memory_store import DEFAULT_MEMORY_CFG, LEGACY_MEMORY_KEYS
+from modules.ambient_presence import DEFAULT_AMBIENT_CFG
 from modules.lipsync import DEFAULT_LIPSYNC_CFG, DEFAULT_PARAM_MAP, DEFAULT_VISEMES, LIPSYNC_ENGINES, MFCC_SCORING
 
 PARAM_MAP_FIELDS = ("inMin", "inMax", "outMin", "outMax", "smooth", "curve")
@@ -312,6 +313,22 @@ def sanitize_vision_patch(values: Any) -> dict[str, Any]:
     return out
 
 
+def sanitize_ambient_patch(values: Any) -> dict[str, Any]:
+    """`ambient` section (off by default): bool toggles + clamped minIntervalSec."""
+    if not isinstance(values, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for k in ("enabled", "windowReactions", "proactiveCheckIn"):
+        if isinstance(values.get(k), bool):
+            out[k] = values[k]
+    if "minIntervalSec" in values:
+        try:
+            out["minIntervalSec"] = max(60, min(3600, int(values["minIntervalSec"])))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
 def sanitize_memory_patch(values: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if "enabled" in values:
@@ -582,6 +599,7 @@ def default_config() -> dict[str, Any]:
         "visemes": copy.deepcopy(DEFAULT_VISEMES),
         "ai": {**copy.deepcopy(DEFAULT_AI_CFG), "fishVocalTags": DEFAULT_AI_CFG.get("fishVocalTags", True)},
         "vision": copy.deepcopy(DEFAULT_VISION_CFG),
+        "ambient": copy.deepcopy(DEFAULT_AMBIENT_CFG),
         "customizer": copy.deepcopy(DEFAULT_CUSTOMIZER_CFG),
         "memory": copy.deepcopy(DEFAULT_MEMORY_CFG),
         "plugins": {},
@@ -615,6 +633,8 @@ class ConfigStore:
                             saved[sec] = sanitize_section(sec, saved[sec], self.data.get(sec) if sec != "visemes" else None)
                     if "vision" in saved:              # bounded model / provider ids, mode enum
                         saved["vision"] = sanitize_vision_patch(saved["vision"])
+                    if "ambient" in saved:
+                        saved["ambient"] = sanitize_ambient_patch(saved["ambient"])
                     _deep_merge(self.data, saved)
             except Exception:
                 pass

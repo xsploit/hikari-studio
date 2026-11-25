@@ -216,8 +216,32 @@ export function renderMotionPanel(store) {
     }),
   ], { desc: 'Idle phrases, voice-driven body language and listening cues' });
 
+  const amb = store.config.ambient || {};
+  const ambOn = Boolean(amb.enabled);
+  const ambientGroup = group('Ambient Presence', [
+    toggle({
+      label: 'Enable ambient presence',
+      desc: 'Off by default · reacts silently to local window activity & returning from breaks (no webcam, no screenshots)',
+      checked: ambOn,
+      onChange: (v) => { store.patch('ambient', { enabled: v }); store.rerenderPanel(); },
+    }),
+    ambOn ? toggle({
+      label: 'Silent expression reactions',
+      desc: 'Subtle curious tilt when coding, playful spark when gaming, warm smile on return',
+      checked: amb.windowReactions ?? true,
+      onChange: (v) => store.patch('ambient', { windowReactions: v }),
+    }) : null,
+    ambOn ? toggle({
+      label: 'Gentle spoken check-ins',
+      desc: 'Off by default · occasional brief welcome-back or check-in line (min 5 min apart)',
+      checked: Boolean(amb.proactiveCheckIn),
+      onChange: (v) => store.patch('ambient', { proactiveCheckIn: v }),
+    }) : null,
+  ].filter(Boolean), { desc: 'Optional companion presence — strictly opt-in, 100% local' });
+
   return [
     livingMotion,
+    ambientGroup,
     group('Motion Lab', [
       extractRow,
       ...(clipRows.length ? clipRows : [noteRow('No extracted clips yet — upload a video or extract the demo.')]),

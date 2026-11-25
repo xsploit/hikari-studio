@@ -7,6 +7,8 @@ const EMBEDDERS = [['vercel', 'Vercel AI Gateway'], ['local', 'Local lightweight
 const CATEGORY_LABELS = {
   fact: 'Fact', preference: 'Preference', project: 'Project', inside_joke: 'Inside joke', viewer: 'Viewer', note: 'Note',
 };
+const SELF_KINDS = [['opinion', 'Opinion'], ['inside_joke', 'Inside joke'], ['trait', 'Trait'], ['promise', 'Promise']];
+const SELF_KIND_LABELS = Object.fromEntries(SELF_KINDS);
 const CACHE_MS = 8000;
 const MAX_FACTS_SHOWN = 60;
 const HISTORY_LIMIT = 12;
@@ -29,6 +31,10 @@ const state = {
   clearing: false,
   historyMsg: '',
   historyMsgKind: '',
+  selfNotes: null,     // Hikari's own opinions / inside jokes / promises
+  selfDraft: '',
+  selfKind: 'opinion',
+  selfSaving: false,
 };
 
 const pick = (o, ...keys) => { for (const k of keys) if (o && o[k] !== undefined && o[k] !== null) return o[k]; return undefined; };
@@ -57,6 +63,11 @@ function normStatus(d) {
       implicit: numOrNull(recRaw.implicit) ?? 0,
       askFirst: numOrNull(recRaw.askFirst) ?? 0,
       last: recRaw.last && typeof recRaw.last === 'object' ? recRaw.last : {},
+    } : null,
+    companion: s.companion && typeof s.companion === 'object' ? {
+      daysKnown: numOrNull(s.companion.daysKnown) ?? 0,
+      sessionCount: numOrNull(s.companion.sessionCount) ?? 0,
+      carryoverActive: Boolean(s.companion.carryoverActive),
     } : null,
   };
 }
@@ -144,16 +155,18 @@ const postJson = (url, body) => getJson(url, {
 async function refresh(store, force = false) {
   if (state.loading || (!force && Date.now() - state.fetchedAt < CACHE_MS)) return;
   state.loading = true;
-  const [st, fa, hi] = await Promise.allSettled([
+  const [st, fa, hi, sf] = await Promise.allSettled([
     getJson('/api/memory/status'),
     getJson('/api/memory/facts'),
     getJson(`/api/chat/history?limit=${HISTORY_LIMIT}`),
+    getJson('/api/memory/self'),
   ]);
   state.loading = false;
   state.fetchedAt = Date.now();
   if (st.status === 'fulfilled') { state.status = normStatus(st.value); state.statusErr = ''; } else { state.statusErr = st.reason?.message || 'Unavailable'; }
   if (fa.status === 'fulfilled') { state.facts = normFacts(fa.value); state.factsErr = ''; } else { state.factsErr = fa.reason?.message || 'Unavailable'; }
   if (hi.status === 'fulfilled') { state.history = normHistory(hi.value); state.historyErr = ''; } else { state.historyErr = hi.reason?.message || 'Unavailable'; }
+  if (sf.status === 'fulfilled') { state.selfNotes = Array.isArray(sf.value?.notes) ? sf.value.notes : []; }
   if (store.activeTab === 'memory') store.rerenderPanel();
 }
 
@@ -391,6 +404,66 @@ export function renderMemoryPanel(store) {
     ]));
   }
 
+  const selfNotes = state.selfNotes || [];
+  const saveSelfNote = async () => {
+    const text = state.selfDraft.trim();
+    if (!text || state.selfSaving) return;
+    state.selfSaving = true;
+    store.rerenderPanel();
+    try {
+      const d = await postJson('/api/memory/self', { text, kind: state.selfKind });
+      if (d?.note) state.selfNotes = [d.note, ...selfNotes.filter((n) => n.id !== d.note.id)];
+      state.selfDraft = '';
+    } catch { /* ignore */ } finally {
+      state.selfSaving = false;
+      store.rerenderPanel();
+    }
+  };
+  const selfInput = textIn({
+    class: 'text-in', value: state.selfDraft, placeholder: 'e.g. Still refuses to admit pineapple belongs on pizza',
+    'aria-label': 'Hikari continuity note', maxlength: 220,
+    oninput: (e) => { state.selfDraft = e.target.value; },
+    onkeydown: (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); saveSelfNote(); } },
+  });
+  const selfKindSel = el('select', {
+    class: 'sel', 'aria-label': 'Note kind',
+    onchange: (e) => { state.selfKind = e.target.value; },
+  }, SELF_KINDS.map(([v, lbl]) => el('option', { value: v, text: lbl, selected: v === state.selfKind })));
+  const compMeta = st?.companion;
+  const selfDesc = [
+    compMeta?.daysKnown ? `Day ${compMeta.daysKnown} together` : '',
+    compMeta?.carryoverActive ? 'Emotional carryover active (implicit)' : '',
+    `${selfNotes.length} ${selfNotes.length === 1 ? 'note' : 'notes'}`,
+  ].filter(Boolean).join(' · ');
+  const selfRows = [
+    el('div', { class: 's-row stack mem-add' }, [
+      el('div', { class: 's-row-text' }, [
+        el('div', { class: 's-title', text: 'Add her opinion, joke or promise' }),
+        el('div', { class: 's-desc', text: 'Hikari’s own persistent personality continuity across days' }),
+      ]),
+      el('div', { class: 's-ctrl mem-add-ctrl' }, [
+        selfInput, selfKindSel,
+        btn(state.selfSaving ? 'Saving…' : 'Add', saveSelfNote, 'primary', { disabled: state.selfSaving }),
+      ]),
+    ]),
+    ...(selfNotes.length ? selfNotes.map((n) => row({
+      title: n.text,
+      control: [
+        el('span', { class: 'badge cat', text: SELF_KIND_LABELS[n.kind] || n.kind || 'Opinion' }),
+        el('button', {
+          type: 'button', class: 'icon-x', title: 'Remove', 'aria-label': `Remove: ${n.text}`, text: '×',
+          onclick: async () => {
+            try {
+              await getJson(`/api/memory/self/${encodeURIComponent(n.id)}`, { method: 'DELETE' });
+              state.selfNotes = (state.selfNotes || []).filter((x) => x.id !== n.id);
+              store.rerenderPanel();
+            } catch { /* ignore */ }
+          },
+        }),
+      ],
+    })) : [noteRow('No character continuity notes yet — add an opinion, inside joke or promise above.')]),
+  ];
+
   return [
     group('Memory & Context', [
       toggle({ label: 'Memory enabled', desc: 'Remember you and your conversations across sessions',
@@ -418,6 +491,10 @@ export function renderMemoryPanel(store) {
         id: 'memory.facts', title: 'Saved memories', open: facts.length > 0,
         desc: state.facts ? `${facts.length} ${facts.length === 1 ? 'memory' : 'memories'}${pinnedFacts ? ` · ${pinnedFacts} pinned` : ''}` : 'Long-term notes & facts',
       }, factRows),
+      more({
+        id: 'memory.self', title: 'Hikari’s continuity (opinions & inside jokes)', open: selfNotes.length > 0,
+        desc: selfDesc || 'Her own evolving tastes, running gags & emotional carryover',
+      }, selfRows),
       more({
         id: 'memory.history', title: 'Recent saved turns',
         desc: state.history ? `Last ${plural(history.length, 'turn')} · chat & voice` : 'What gets reloaded after a restart',

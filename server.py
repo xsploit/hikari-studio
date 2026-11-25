@@ -30,8 +30,8 @@ from aiohttp.web_runner import GracefulExit
 
 from core.config import (
     FRAME_SECTIONS, ConfigStore, EXPRESSION_PRESETS, EYE_STYLE_PRESETS, ROOM_AMBIENT_MAP, SHADER_PRESETS, default_config,
-    mask_secrets, public_config, sanitize_ai_brain_patch, sanitize_lipsync_patch, sanitize_memory_patch,
-    sanitize_section, sanitize_vision_patch, secrets_set,
+    mask_secrets, public_config, sanitize_ai_brain_patch, sanitize_ambient_patch, sanitize_lipsync_patch,
+    sanitize_memory_patch, sanitize_section, sanitize_vision_patch, secrets_set,
 )
 from core.customizer import DEFAULT_CUSTOMIZER_CFG, CharacterCustomizer
 from core.engine_bridge import NativeEngineBridge
@@ -52,8 +52,9 @@ from modules.decision_engine import (
 )
 from modules.fish_duplex import FishDuplexController, clean_voice_id, compose_session_prompt
 from modules.fish_tts_stream import FISH_TRANSPORTS, clean_for_speech
+from modules.ambient_presence import AmbientPresenceMonitor
 from modules.lipsync import LiveLipSyncEngine
-from modules.memory_store import CATEGORIES, MemoryStore, PinLimitError, temporal_label
+from modules.memory_store import CATEGORIES, COMPANION_KINDS, MemoryStore, PinLimitError, temporal_label
 from modules.profiles import ProfileStore
 from modules.screen_vision import capture_screen_jpeg, describe_screen, wants_screen_vision
 from modules import fish_voices
@@ -76,7 +77,7 @@ LIBRARY_DIR = MODELS_DIR / "library"                 # extra Inochi2D puppets (.
 HIKARI_MODEL = MODELS_DIR / "Hikari-v28-Custom.inp"
 MINT_CLI = DEFAULT_MINT_CLI
 HIKARI_LABEL = "Hikari (Custom)"
-CONFIG_SECTIONS = ("stage", "camera", "shader", "rig", "lipsync", "visemes", "ai", "memory", "vision")
+CONFIG_SECTIONS = ("stage", "camera", "shader", "rig", "lipsync", "visemes", "ai", "memory", "vision", "ambient")
 TMP_DIR = HERE / "data" / "tmp"                      # private (never served)
 CUSTOM_ASSETS_DIR = HERE / "data" / "custom_assets"  # validated eye / hair images (never served)
 MAX_VIDEO_BYTES = 120 * 1024 * 1024
@@ -316,6 +317,20 @@ def _read_param_meta(inp_path: Path) -> tuple[dict[str, tuple[float, float]], li
     return defaults, meta
 
 
+def _split_spoken_text(text: str, frac: float) -> tuple[str, str]:
+    """Split `text` cleanly on word boundaries at playback fraction `frac` in [0, 1]."""
+    words = (text or "").strip().split()
+    if not words:
+        return "", ""
+    f = max(0.0, min(1.0, float(frac)))
+    if f >= 0.94:
+        return " ".join(words), ""
+    if f <= 0.04:
+        return "", " ".join(words)
+    cut = max(1, min(len(words) - 1, int(round(len(words) * f))))
+    return " ".join(words[:cut]), " ".join(words[cut:])
+
+
 class SegmentPlayer:
     """Plays one reply's sentences back to back as Fish TTS finishes each one, so her voice starts with
     sentence 1 instead of after the whole reply is synthesized. Each segment is a normal `speech` event
@@ -332,6 +347,11 @@ class SegmentPlayer:
         self.action: dict[str, Any] | None = None
         self.tag = "hikari"
         self._closed = False
+        self._all_texts: list[str] = []
+        self._done_texts: list[str] = []
+        self._cur_text: str = ""
+        self._cur_start: float = 0.0
+        self._cur_dur: float = 0.0
         self.task = runtime.spawn(self._run())
 
     async def push_pcm(self, pcm: bytes, rate: int, text: str, _idx: int) -> None:
@@ -340,11 +360,31 @@ class SegmentPlayer:
             return
         wav = await self.rt.ai.fish_tts.save_wav(pcm, rate)
         if wav is not None:
-            self.q.put_nowait((wav, clean_for_speech(text)))
+            clean = clean_for_speech(text)
+            self._all_texts.append(clean)
+            self.q.put_nowait((wav, clean))
 
     def push_wav(self, wav: Path | None, text: str) -> None:
         if not self._closed:
-            self.q.put_nowait((wav, clean_for_speech(text)))
+            clean = clean_for_speech(text)
+            self._all_texts.append(clean)
+            self.q.put_nowait((wav, clean))
+
+    def snapshot_progress(self) -> tuple[str, str]:
+        """Return (spoken_so_far, unspoken_remainder) at the moment of interruption."""
+        spoken = list(self._done_texts)
+        unspoken: list[str] = []
+        started_count = len(self._done_texts) + (1 if self._cur_text else 0)
+        if self._cur_text:
+            frac = (time.monotonic() - self._cur_start) / max(0.25, self._cur_dur)
+            sp, un = _split_spoken_text(self._cur_text, frac)
+            if sp:
+                spoken.append(sp)
+            if un:
+                unspoken.append(un)
+        if started_count < len(self._all_texts):
+            unspoken.extend(self._all_texts[started_count:])
+        return " ".join(spoken).strip(), " ".join(unspoken).strip()
 
     def close(self) -> None:
         if not self._closed:
@@ -363,16 +403,23 @@ class SegmentPlayer:
         while True:
             item = await self.q.get()
             if item is None:
+                if self._cur_text:
+                    self._done_texts.append(self._cur_text)
+                    self._cur_text = ""
                 return
             wav, text = item
             wait = self.end_at - time.monotonic()
             if wait > 0:
                 await asyncio.sleep(wait)
+            if self._cur_text:
+                self._done_texts.append(self._cur_text)
             dur, audio_url = max(1.2, len(text) / 14.0), ""
             if wav is not None and await asyncio.to_thread(wav.exists):
                 dur = await asyncio.to_thread(self.rt.lipsync.load_wav_and_play, wav, None, wav.name)
                 audio_url = f"/uploads/audio/{wav.name}"
-            self.end_at = time.monotonic() + dur + self.GAP_SEC
+            now = time.monotonic()
+            self._cur_text, self._cur_start, self._cur_dur = text, now, dur
+            self.end_at = now + dur + self.GAP_SEC
             self.rt._subtitle = text
             if self.action is not None:
                 self.rt.rig.trigger_temp_action(self.action, duration=max(2.6, dur + 0.6))
@@ -474,7 +521,10 @@ class StudioRuntime:
         self._slow_clients: set[Any] = set()
         self._fast_streak: dict[Any, int] = {}           # consecutive fast sends of a viewer marked slow
         self._segment_player: SegmentPlayer | None = None
+        self._active_speech: dict[str, Any] | None = None
         self._interaction_state = "idle"
+        self.ambient = AmbientPresenceMonitor(self.config.data.get("ambient"))
+        self._ambient_ticks = 0
         self._shutting_down = False
         self._shutdown_task: asyncio.Task | None = None
         self._fish_ended_on_shutdown = False
@@ -935,6 +985,17 @@ class StudioRuntime:
                 d = self.decisions.idle_tick(busy=busy)
                 if d is not None:
                     await self.apply_decision(d, temp_action=bool(d.emote), hold=3.4)
+                # Opt-in Ambient Presence (strictly OFF by default; local window category + AFK return only)
+                self._ambient_ticks += 1
+                if (self._ambient_ticks % 3 == 0 and self.ambient.cfg.get("enabled")
+                        and not busy and not self.fish_duplex.active_session_id):
+                    ev = await asyncio.to_thread(self.ambient.poll, busy=busy)
+                    if ev is not None:
+                        expr = str(ev.get("expression") or "happy")
+                        self.rig.set_vfx_emotion(expr, hold=5.0)
+                        self.rig.trigger_temp_action(TAG_TO_STATE.get(expr, TAG_TO_STATE["happy"]), duration=3.5)
+                        if ev.get("kind") == "checkin" and ev.get("text"):
+                            await self.speak_text(str(ev["text"]), tag=expr)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -967,6 +1028,16 @@ class StudioRuntime:
             if self._segment_player is not None:
                 self._segment_player.cancel()
             self.lipsync.stop_playback()
+        except Exception:
+            pass
+        try:
+            st_mood = self.decisions.get_mood_state() or {}
+            await asyncio.wait_for(self.memory.record_session_mood(
+                str(st_mood.get("label") or "neutral"),
+                float(st_mood.get("valence") or 0.0),
+                float(st_mood.get("arousal") or 0.0),
+                bump_session=True,
+            ), 0.5)
         except Exception:
             pass
         try:
@@ -1165,6 +1236,7 @@ class StudioRuntime:
             dur = await asyncio.to_thread(self.lipsync.load_wav_and_play, wav_path, None, wav_path.name)
             audio_url = f"/uploads/audio/{wav_path.name}"
             self.spawn(asyncio.to_thread(_prune_audio_cache, 20))
+        self._active_speech = {"text": clean, "start": time.monotonic(), "dur": dur}
         self.rig.trigger_temp_action(act, duration=max(2.6, dur + 0.6))
         if decision is not None:
             # The reply's autonomous emote starts together with her voice, not before TTS is ready.
@@ -1248,6 +1320,32 @@ class StudioRuntime:
         if decision is None:
             self.spawn(self._late_decision(decision_task, explicit, speech_end))
         return evt, decision
+
+    def handle_interrupt(self) -> dict[str, Any]:
+        """Graceful barge-in: stop speech cleanly, trigger physical yield reaction, and record exact
+        cutoff point so Hikari knows what she actually finished vs. left unsaid."""
+        spoken, unspoken = "", ""
+        if self._segment_player is not None:
+            if self._segment_player.remaining() > 0.05 or not self._segment_player.task.done():
+                spoken, unspoken = self._segment_player.snapshot_progress()
+            self._segment_player.cancel()
+            self._segment_player = None
+        elif self._active_speech is not None:
+            sp_info = self._active_speech
+            elapsed = time.monotonic() - float(sp_info.get("start") or 0.0)
+            dur = max(0.25, float(sp_info.get("dur") or 0.0))
+            if elapsed < dur * 0.94:
+                spoken, unspoken = _split_spoken_text(str(sp_info.get("text") or ""), elapsed / dur)
+        self._active_speech = None
+        self.lipsync.stop_playback()
+        fn = getattr(self.rig, "trigger_barge_in", None)
+        if callable(fn):
+            fn()
+        self._interaction_state = "listening"
+        interrupted = bool(unspoken)
+        if interrupted and hasattr(self.ai, "record_interruption"):
+            self.ai.record_interruption(spoken, unspoken)
+        return {"interrupted": interrupted, "spoken": spoken, "unspoken": unspoken}
 
     def new_segment_player(self) -> SegmentPlayer:
         """One reply at a time: a new reply cuts off the previous one's queued sentences."""
@@ -1518,6 +1616,8 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             vals = sanitize_memory_patch(raw)
         elif sec == "vision":
             vals = sanitize_vision_patch(raw)             # enabled / model / providerOrder / mode (enum)
+        elif sec == "ambient":
+            vals = sanitize_ambient_patch(raw)            # off by default: local window category & idle reactions
         elif sec in FRAME_SECTIONS:
             # rig / camera / shader / stage / visemes feed the 60 FPS loop: type-checked against the defaults,
             # NaN / Inf / non-numeric dropped, numbers clamped, rig.overrides finite [x, y] pairs only.
@@ -1539,6 +1639,10 @@ def build_app(runtime: StudioRuntime) -> web.Application:
             runtime.apply_ai_config(vals)
         elif sec == "memory":
             runtime.apply_memory_config()
+        elif sec == "ambient":
+            amb = getattr(runtime, "ambient", None)
+            if amb is not None:
+                amb.update_config(vals)
         elif sec == "rig":
             runtime.sync_rig_flags()
             if "idlePhraseSec" in vals and runtime.config.data["rig"].get("idleClip"):
@@ -1869,6 +1973,16 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         payload = {"message": msg}
         await runtime.hooks.emit_async("on_user_message", runtime, payload)
         msg = str(payload.get("message") or msg)[:MAX_CHAT_CHARS]
+        # If the viewer sends a new message while Hikari is still mid-speech, run a clean barge-in first.
+        sp_active = getattr(runtime, "_segment_player", None)
+        if (sp_active is not None and sp_active.remaining() > 0.05) or (
+            getattr(runtime, "_active_speech", None) is not None
+            and getattr(runtime.lipsync, "is_speaking", lambda: False)()
+        ):
+            fn = getattr(runtime, "handle_interrupt", None)
+            if callable(fn):
+                info = fn()
+                await runtime.broadcast_json({"type": "interrupt", "interrupted": info["interrupted"], "spoken": info["spoken"]})
         # She reacts to what you said right away (e.g. waves at "hey!") while she thinks of a reply.
         user_task = asyncio.create_task(runtime.decide_and_apply(msg, "user"))
         greeting = classify_text(msg, "user").emotion == "greeting"
@@ -1973,6 +2087,37 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         st["reconsider"] = reconsider_status(runtime.decisions)
         return web.json_response({"ok": True, **st})
 
+    async def api_ambient_status(_req):
+        amb = getattr(runtime, "ambient", None)
+        return web.json_response({"ok": True, "ambient": amb.status() if amb is not None else {"enabled": False}})
+
+    async def api_memory_self_list(_req):
+        notes = await runtime.memory.list_companion_notes()
+        return web.json_response({"ok": True, "notes": notes, "kinds": list(COMPANION_KINDS),
+                                  "companion": runtime.memory.relationship_summary()})
+
+    async def api_memory_self_add(req):
+        bad = _origin_guard(req)
+        if bad is not None:
+            return bad
+        body = await _json_body(req)
+        if not isinstance(body, dict):
+            return web.json_response({"ok": False, "error": "Expected a JSON object"}, status=400)
+        text = str(body.get("text") or "").strip()
+        kind = str(body.get("kind") or "opinion").strip().lower()
+        try:
+            note = await runtime.memory.add_companion_note(text, kind=kind)
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        return web.json_response({"ok": True, "note": note, "companion": runtime.memory.relationship_summary()})
+
+    async def api_memory_self_delete(req):
+        bad = _origin_guard(req)
+        if bad is not None:
+            return bad
+        ok = await runtime.memory.delete_companion_note(req.match_info["note_id"])
+        return web.json_response({"ok": ok}, status=200 if ok else 404)
+
     def _with_temporal(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Temporal Semantic Memory: dated facts carry a label reframed against today ("today", "upcoming"...)."""
         for f in facts:
@@ -2063,11 +2208,9 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         return web.json_response({"ok": True, "shuttingDown": True, "already": True})
 
     async def api_interrupt(_req):
-        if runtime._segment_player is not None:
-            runtime._segment_player.cancel()           # queued sentences of the current reply are dropped too
-        runtime.lipsync.stop_playback()
-        await runtime.broadcast_json({"type": "interrupt"})
-        return web.json_response({"ok": True})
+        info = runtime.handle_interrupt()
+        await runtime.broadcast_json({"type": "interrupt", "interrupted": info["interrupted"], "spoken": info["spoken"]})
+        return web.json_response({"ok": True, **info})
 
     async def api_clear_memory(req):
         """Legacy name for /api/chat/clear (clears the conversation, keeps long-term facts)."""
@@ -2875,6 +3018,10 @@ def build_app(runtime: StudioRuntime) -> web.Application:
     app.router.add_post("/api/interrupt", api_interrupt)
     app.router.add_post("/api/memory/clear", api_clear_memory)
     app.router.add_get("/api/memory/status", api_memory_status)
+    app.router.add_get("/api/ambient/status", api_ambient_status)
+    app.router.add_get("/api/memory/self", api_memory_self_list)
+    app.router.add_post("/api/memory/self", api_memory_self_add)
+    app.router.add_delete("/api/memory/self/{note_id}", api_memory_self_delete)
     app.router.add_get("/api/chat/history", api_chat_history)
     app.router.add_post("/api/chat/clear", api_chat_clear)
     app.router.add_get("/api/memory/facts", api_memory_facts)

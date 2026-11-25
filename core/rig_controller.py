@@ -557,6 +557,18 @@ class RigController:
         # Organic Neuro-style whole-body rocking pendulum (planted-foot Stage Roll + lagged waist/head + 2x weight dip)
         self._rock_phase: float = rnd.uniform(0.0, 6.283)
         self._rock_w: float = 0.0
+        # Conversational gaze choreography + blink-on-head-turn + barge-in yield reaction
+        self._was_speaking: bool = False
+        self._avert_until: float = 0.0
+        self._avert_side: float = 1.0
+        self._tri_idx: int = 0
+        self._prev_head_x: float = 0.0
+        self._prev_head_y: float = 0.0
+        self._turn_accum: float = 0.0
+        self._turn_accum_at: float = now
+        self._last_turn_blink: float = -1e9
+        self._turn_blinks: int = 0
+        self._barge_until: float = 0.0
 
         # Expression VFX / blend-shape layer (auto emotion mapping + manual Studio overrides)
         self.auto_vfx = True
@@ -746,6 +758,18 @@ class RigController:
     def get_interaction_state(self) -> str:
         with self.lock:
             return self._istate
+
+    def trigger_barge_in(self) -> None:
+        """Physical yield micro-reaction when the viewer interrupts Hikari mid-sentence:
+        attentive brow lift, subtle perk-up, eye-contact lock, and immediate switch to 'listening'."""
+        now = time.perf_counter()
+        with self.lock:
+            self._barge_until = now + 0.65
+            self._avert_until = 0.0
+            self.sp_nod.v += 14.0
+            self._istate = "listening"
+            self._istate_since = now
+            self._listen_side = -1.0 if self._rnd.random() < 0.5 else 1.0
 
     def trigger_temp_action(self, action: dict[str, Any], duration: float = 4.5) -> None:
         with self.lock:
@@ -1138,15 +1162,19 @@ class RigController:
         b = math.sin(ph * math.pi) ** 1.6
         return b * (0.5 if kind == "half" else 1.0)
 
-    def _start_blink(self, t_now: float) -> None:
-        r = self._rnd.random()
-        if r < 0.12:
-            self._blink_kind = "half"
-        elif r < 0.22:
-            self._blink_kind = "slow"
+    def _start_blink(self, t_now: float, kind: str | None = None) -> None:
+        if kind in ("normal", "half", "slow"):
+            self._blink_kind = kind
+            self._blink_queue_double = False
         else:
-            self._blink_kind = "normal"
-            self._blink_queue_double = r > 0.84      # ~16 % double blink
+            r = self._rnd.random()
+            if r < 0.12:
+                self._blink_kind = "half"
+            elif r < 0.22:
+                self._blink_kind = "slow"
+            else:
+                self._blink_kind = "normal"
+                self._blink_queue_double = r > 0.84      # ~16 % double blink
         self._blink_active = True
         self._blink_phase = 0.0
 
@@ -1487,18 +1515,39 @@ class RigController:
             head_y += 3.0 * w_t
             body_z += think_side * 1.2 * w_t
 
-        # 4. Autonomous gaze + mouse follow (eye leads head)
+        # 4. Autonomous conversational gaze + mouse follow (eye leads head)
         auto_gaze = bool(rig_cfg.get("autoGaze", True))
         liveliness = _clamp(_ff(rig_cfg.get("autoGazeLiveliness", 1.0), 1.0), 0.0, 3.0)
         mouse_on = bool(rig_cfg.get("mouseLookAt", True))
         mouse_recent = mouse_on and ((t_now - self._mouse_last_move) < 2.2)
         contact = max(w_l, w_s)                                      # attentive: more eye contact
+        barge_rem = max(0.0, self._barge_until - t_now)
+        barge_env = math.sin(min(1.0, barge_rem / 0.65) * math.pi) if barge_rem > 0.0 else 0.0
+
+        # Conversational turn-initiation gaze aversion (brief glance away as she starts speaking, then lock back)
+        if speaking and not self._was_speaking and auto_gaze and not idle_block and barge_env <= 0.0:
+            if rnd.random() < 0.72:
+                self._avert_side = -1.0 if rnd.random() < 0.5 else 1.0
+                self._avert_until = t_now + rnd.uniform(0.45, 0.90)
+        self._was_speaking = bool(speaking)
+        avert_w = _clamp((self._avert_until - t_now) / 0.25, 0.0, 1.0) if t_now < self._avert_until else 0.0
+        # Punchlines / questions / emphasis / barge-in pull gaze cleanly back to eye contact
+        if pq > 0.30 or pe > 0.45 or barge_env > 0.05:
+            avert_w *= 0.15
 
         if auto_gaze:
             if t_now >= self._next_micro_saccade:
                 self._next_micro_saccade = t_now + rnd.uniform(0.35, 0.95)
-                self._micro_x = rnd.uniform(-0.07, 0.07) * liveliness
-                self._micro_y = rnd.uniform(-0.05, 0.05) * liveliness
+                if contact > 0.30:
+                    # Subtle face-triangle micro-saccades (left eye -> right eye -> upper bridge)
+                    tri = ((-0.055, -0.025), (0.055, -0.025), (0.0, 0.032))
+                    self._tri_idx = (self._tri_idx + rnd.choice((1, 2))) % 3
+                    bx, by = tri[self._tri_idx]
+                    self._micro_x = (bx + rnd.uniform(-0.015, 0.015)) * liveliness
+                    self._micro_y = (by + rnd.uniform(-0.012, 0.012)) * liveliness
+                else:
+                    self._micro_x = rnd.uniform(-0.07, 0.07) * liveliness
+                    self._micro_y = rnd.uniform(-0.05, 0.05) * liveliness
             if t_now >= self._next_gaze_shift:
                 r_pick = rnd.random()
                 old_tx = self._gaze_tx
@@ -1537,9 +1586,13 @@ class RigController:
         m_tilt = self._mx_filt * 0.22 * ml
 
         if auto_gaze:
-            a_gx = _clamp(self._gaze_tx + self._micro_x, -0.95, 0.95) * (1.0 - 0.35 * contact)
-            a_gy = _clamp(self._gaze_ty + self._micro_y, -0.85, 0.85) * (1.0 - 0.35 * contact)
-            a_tilt = self._gaze_head_tilt
+            focus_lock = _clamp(0.35 * contact + 0.35 * max(pq, pe) + 0.65 * barge_env, 0.0, 0.88)
+            a_gx = _clamp(self._gaze_tx + self._micro_x, -0.95, 0.95) * (1.0 - focus_lock)
+            a_gy = _clamp(self._gaze_ty + self._micro_y, -0.85, 0.85) * (1.0 - focus_lock)
+            a_tilt = self._gaze_head_tilt * (1.0 - 0.5 * barge_env)
+            if avert_w > 0.01:
+                a_gx = a_gx * (1.0 - avert_w) + self._avert_side * 0.44 * avert_w + self._micro_x * avert_w
+                a_gy = a_gy * (1.0 - avert_w) + (-0.28) * avert_w + self._micro_y * avert_w
         else:
             a_gx, a_gy, a_tilt = 0.0, 0.0, 0.0
         if w_t > 0.01:                                               # thinking glance (up + to one side)
@@ -1612,12 +1665,28 @@ class RigController:
         head_y += 1.1 * bounce_y
         body_x += 1.8 * bounce_x
 
-        # 5. Blinks: normal / double / half / slow relaxed
+        # 5. Blinks: normal / double / half / slow relaxed + natural blink-on-head-turn (>12 deg shift)
         eye_open_l = 1.0
         eye_open_r = 1.0
+        dhx = head_x - self._prev_head_x
+        dhy = head_y - self._prev_head_y
+        self._prev_head_x = head_x
+        self._prev_head_y = head_y
+        if t_now - self._turn_accum_at > 0.35:
+            self._turn_accum = 0.0
+            self._turn_accum_at = t_now
+        self._turn_accum += math.hypot(dhx, dhy)
+        head_turn_speed = math.hypot(dhx, dhy) / max(0.004, dt)
         if rig_cfg.get("autoBlink", True):
             rate = _clamp(_ff(rig_cfg.get("blinkRate", 1.0), 1.0), 0.2, 6.0)
-            if not self._blink_active and t_now >= self._next_blink:
+            if not self._blink_active and (t_now - self._last_turn_blink) >= 0.85 and (
+                self._turn_accum >= 12.0 or head_turn_speed >= 65.0
+            ):
+                self._turn_accum = 0.0
+                self._last_turn_blink = t_now
+                self._turn_blinks += 1
+                self._start_blink(t_now, "normal")
+            elif not self._blink_active and t_now >= self._next_blink:
                 self._start_blink(t_now)
             if self._blink_active:
                 dur = {"normal": 0.165, "half": 0.15, "slow": 0.42}[self._blink_kind]
@@ -1635,7 +1704,10 @@ class RigController:
                     b = self._blink_shape()
                     eye_open_l = eye_open_r = max(0.0, 1.0 - b)
         if eye_open_l > 0.95:
-            eye_open_l = eye_open_r = eye_open_l + eye_widen
+            eye_open_l = eye_open_r = eye_open_l + eye_widen + 0.08 * barge_env
+        if barge_env > 1e-4:
+            idle_brow_boost += 0.24 * barge_env
+            body_lean += 1.6 * barge_env
 
         # 6. Expression + mood + state
         expr_name = (temp.get("expression") if temp else None) or str(rig_cfg.get("expression", "happy"))
@@ -2343,8 +2415,22 @@ class RigController:
         self._finalize_params(p)
 
         # 14. Universal puppet: canonical Hikari frame -> the loaded puppet's params (+ its own raw overrides)
+        #     Also bridge Stage X/Y/Zoom/Roll whole-body sway to non-Hikari rigs via camera + torso tilt parity.
         mapper = self._mapper
         if mapper is not None:
+            fx_roll = float(self.rig_fx_active.get("Stage Roll", 0.0))
+            fx_sx = float(self.rig_fx_active.get("Stage X", 0.0))
+            fx_sy = float(self.rig_fx_active.get("Stage Y", 0.0))
+            fx_sz = float(self.rig_fx_active.get("Stage Zoom", 0.0))
+            if (abs(fx_roll) + abs(fx_sx) + abs(fx_sy) + abs(fx_sz)) > 1e-4:
+                if "Body Angle Z" in p:
+                    bz0, bzy = p["Body Angle Z"]
+                    p["Body Angle Z"] = (_clamp(bz0 + fx_roll * 7.0, -30.0, 30.0), bzy)
+                base_sc = max(0.15, _ff(cam_cfg.get("scale", 1.0), 1.0))
+                inv_sc = 1.0 / base_sc
+                cam_cfg["x"] = _ff(cam_cfg.get("x", 0.0), 0.0) - (fx_sx * 48.0 + fx_roll * 26.0) * inv_sc
+                cam_cfg["y"] = _ff(cam_cfg.get("y", 0.0), 0.0) - (fx_sy * 36.0) * inv_sc
+                cam_cfg["scale"] = _clamp(base_sc * (1.0 + 0.055 * fx_sz), 0.05, 8.0)
             self.last_canonical = p
             p = mapper.step(p, dt, physics_on)          # mapping + arm follow-through + universal spring physics
             if isinstance(overrides, dict) and overrides:
