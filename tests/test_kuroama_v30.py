@@ -73,20 +73,25 @@ def test_kuroama_v30_rig_bindings_and_zero_rest() -> None:
     assert FACE in ms_nodes, "Mouth Shrug missing ArtMeshFace cheek-squish deform"
     assert 40006 in ms_nodes, "Mouth Shrug lost VB Mouth upper lip binding"
 
-    # 3. Angle (11x5) preserves exact 0.0 rest at center yaw (index 5) and adds 3D nose tip projection at +-45 deg
+    # 3. Angle (11x5) preserves exact 0.0 rest at center yaw (index 5) and aligns nose AHEAD of eyeMid at +-45 deg
     ang = by_name["Angle"]
+    by_id = {}
+    def _walk(n):
+        by_id[n["uuid"]] = n
+        for c in n.get("children", []):
+            _walk(c)
+    _walk(pup["nodes"])
     nose_b = next(b for b in ang["bindings"] if b["node"] == NOSE_NODE and b["param_name"] == "deform")
     V_nose = np.asarray(nose_b["values"], np.float64)
     assert np.allclose(V_nose[5, 2], 0.0, atol=1e-4), "Nose rest deform at yaw=0 must remain zero"
-    tip_span_neg = float(V_nose[0, 2, :, 0].max() - V_nose[0, 2, :, 0].min())
-    tip_span_pos = float(V_nose[10, 2, :, 0].max() - V_nose[10, 2, :, 0].min())
-    assert tip_span_neg >= 2.0 and tip_span_pos >= 2.0, f"Expected 3D nose tip projection, got {tip_span_neg}, {tip_span_pos}"
+    assert V_nose[0, 2, :, 0].mean() < -35.0, f"Nose at -45 deg should project ahead of eyeMid (-31), got {V_nose[0, 2, :, 0].mean()}"
+    assert V_nose[10, 2, :, 0].mean() > 35.0, f"Nose at +45 deg should project ahead of eyeMid (+34), got {V_nose[10, 2, :, 0].mean()}"
 
-    # 4. Far iris foreshortens cleanly at +-45 deg while rest yaw=0 stays zero
+    # 4. Far iris keeps clean un-pinched volume at +-45 deg while rest yaw=0 stays zero
     ir_r = next(b for b in ang["bindings"] if b["node"] == 1023 and b["param_name"] == "deform")
     V_ir = np.asarray(ir_r["values"], np.float64)
     assert np.allclose(V_ir[5, 2], 0.0, atol=1e-4), "Iris R rest deform at yaw=0 must remain zero"
-    assert float(V_ir[0, 2, :, 0].max() - V_ir[0, 2, :, 0].min()) > 12.0, "Far iris R should foreshorten at -45 deg"
+    assert 9.0 < float(V_ir[0, 2, :, 0].max() - V_ir[0, 2, :, 0].min()) < 15.0, "Far iris R should foreshorten cleanly without pinching"
 
     # 5. Snappy Kuroama spring physics frequencies applied cleanly
     up_h = _upgrade_spring_physics(header)

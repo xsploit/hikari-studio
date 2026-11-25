@@ -1198,6 +1198,7 @@ KUROAMA_EYE_WRAP = {
     "L": {"sclera": (1015,), "lashes": (1017, 1021, 1022), "iris": (1024,), "hi": (1026, 50020)},
 }
 NOSE_NODE = 1012
+EAR_NODES = {"R": 1009, "L": 1010}
 
 
 def _cheek_squish_weights(face_rest: np.ndarray, side: str | None = None, outer_bias: bool = False) -> np.ndarray:
@@ -1250,13 +1251,98 @@ def apply_kuroama_v30(puppet: dict[str, Any], by_id: dict[int, dict[str, Any]],
             lift = np.stack([sg * 1.8 * w_s, -2.6 * w_s], 1)
             _bind_deform(cp_y, FACE, [drop, np.zeros_like(drop), lift])
 
-    # ---- 6b. 3D Eyeball Perspective + Curved Lash Wrap + 3D Nose Tip Projection across Angle (11x5) yaw stops
+    # ---- 6b. True 3D Cylindrical Facial Centerline across Angle (11x5) yaw stops:
+    #      Fixes v28's sunken nose (+27 vs eyeMid +34.5 at +45 deg), flat un-foreshortened mouth, lagging chin,
+    #      and protruding far ear — while adding subtle, un-pinched 3D eyeball highlight parallax.
     ang = by_name.get("Angle")
     if ang is not None and len(ang.get("axis_points", [])) == 2:
         ax_x = ang["axis_points"][0]
         nx = len(ax_x)
         ang_by_node = {b["node"]: b for b in ang.get("bindings", []) if b.get("param_name") == "deform"}
 
+        # Helper: smooth spherical sin(theta) yaw curve across [-45..+45 deg], strictly 0.0 at yaw=0
+        def _yaw_sin(axv: float) -> tuple[float, float]:
+            yn = (float(axv) - 0.5) * 2.0               # [-1..+1]
+            s = math.sin(yn * (math.pi * 0.25)) / math.sin(math.pi * 0.25)   # [-1..+1] spherical
+            return s, abs(s)
+
+        # 1) Nose (1012): bring out from behind the eyes to project cleanly IN FRONT of the eye midpoint
+        #    Base v28 shifts nose only +-26.6 at +-45 deg while eyeMid shifts +-32.6 -> add +12.5*s (+2.2 tip taper)
+        nb = ang_by_node.get(NOSE_NODE)
+        nnd = by_id.get(NOSE_NODE)
+        if nb is not None and nnd is not None and nnd.get("mesh", {}).get("verts"):
+            nw = _world_rest(nnd, parent)
+            V = np.asarray(nb["values"], np.float64)
+            if V.shape[0] == nx and V.shape[2] == len(nw):
+                y0, y1 = float(nw[:, 1].min()), float(nw[:, 1].max())
+                tip_t = np.clip((nw[:, 1] - y0) / max(1e-3, y1 - y0), 0.0, 1.0) ** 1.1
+                for i, axv in enumerate(ax_x):
+                    s, mag = _yaw_sin(axv)
+                    if mag < 1e-4:
+                        continue
+                    V[i, :, :, 0] += (s * (11.5 + 2.4 * tip_t))[None, :]
+                    V[i, :, :, 1] += (-0.6 * mag * (1.0 - tip_t))[None, :]
+                nb["values"] = np.round(V, 4).tolist()
+
+        # 2) All Mouth parts (1037..1045, 40001..40006): align under the 3D nose/philtrum (+4.2*s) and
+        #    foreshorten horizontally (-16% at +-45 deg) so the mouth wraps around the 3/4 muzzle cleanly!
+        for mid in MOUTH_PARTS:
+            mb = ang_by_node.get(mid)
+            mnd = by_id.get(mid)
+            if mb is None or mnd is None or not mnd.get("mesh", {}).get("verts"):
+                continue
+            mw = _world_rest(mnd, parent)
+            V = np.asarray(mb["values"], np.float64)
+            if V.shape[0] != nx or V.shape[2] != len(mw):
+                continue
+            dx_m = mw[:, 0] - MOUTH_CENTER[0]
+            for i, axv in enumerate(ax_x):
+                s, mag = _yaw_sin(axv)
+                if mag < 1e-4:
+                    continue
+                # Shift forward onto curved muzzle + foreshorten width in 3/4 perspective
+                ddx = s * 4.4 - 0.16 * (mag ** 1.15) * dx_m
+                V[i, :, :, 0] += ddx[None, :]
+            mb["values"] = np.round(V, 4).tolist()
+
+        # 3) ArtMeshFace (1011): align lower chin/muzzle (+4.4*s smoothly below y=-410) so nose -> mouth -> chin
+        #    share one true 3D vertical centerline (Cat Mouth 54022 follows FACE so it inherits this automatically!)
+        fb = ang_by_node.get(FACE)
+        if fb is not None and face is not None and face.get("mesh", {}).get("verts"):
+            fw = _world_rest(face, parent)
+            V = np.asarray(fb["values"], np.float64)
+            if V.shape[0] == nx and V.shape[2] == len(fw):
+                # Smoothly affects lower center muzzle & chin (y > -415, |x| < 55); upper temples stay locked
+                chin_w = _ss(-420.0, -372.0, fw[:, 1]) * (1.0 - _ss(36.0, 72.0, np.abs(fw[:, 0])))
+                for i, axv in enumerate(ax_x):
+                    s, mag = _yaw_sin(axv)
+                    if mag < 1e-4:
+                        continue
+                    V[i, :, :, 0] += (s * 4.4 * chin_w)[None, :]
+                fb["values"] = np.round(V, 4).tolist()
+
+        # 4) Far Ear tuck (1009 R, 1010 L): tuck the far-side ear smoothly behind the head silhouette as yaw increases
+        for side, eid in EAR_NODES.items():
+            eb = ang_by_node.get(eid)
+            end = by_id.get(eid)
+            if eb is None or end is None or not end.get("mesh", {}).get("verts"):
+                continue
+            V = np.asarray(eb["values"], np.float64)
+            if V.shape[0] != nx:
+                continue
+            out_sgn = 1.0 if side == "L" else -1.0
+            for i, axv in enumerate(ax_x):
+                s, mag = _yaw_sin(axv)
+                if mag < 1e-4:
+                    continue
+                is_far = (side == "R" and s < 0.0) or (side == "L" and s > 0.0)
+                if is_far:
+                    V[i, :, :, 0] += -out_sgn * (9.5 * (mag ** 1.25))
+            eb["values"] = np.round(V, 4).tolist()
+
+        # 5) Subtle, un-pinched 3D Eyeball Perspective:
+        #    Base v28 ALREADY squashes far sclera/iris strongly (-18.8 units); do NOT crush sclera width further!
+        #    Only add gentle outer-lash curve + light iris spherical foreshortening (-5%) + glossy cornea highlight parallax.
         for side, spec in KUROAMA_EYE_WRAP.items():
             scl = by_id.get(spec["sclera"][0])
             iris = by_id.get(spec["iris"][0])
@@ -1267,10 +1353,10 @@ def apply_kuroama_v30(puppet: dict[str, Any], by_id: dict[int, dict[str, Any]],
             eye_cx = float(0.5 * (sw[:, 0].min() + sw[:, 0].max()))
             eye_hw = max(8.0, float(0.5 * (sw[:, 0].max() - sw[:, 0].min())))
             iris_cx = float(iw[:, 0].mean())
-            out_sgn = 1.0 if side == "L" else -1.0  # +1 screen-right for L, -1 screen-left for R
+            out_sgn = 1.0 if side == "L" else -1.0
 
-            # Sclera + Lashes: far-eye outer-corner spherical wrap; near-eye subtle convex open perspective
-            for nid in spec["sclera"] + spec["lashes"]:
+            # Gentle outer-lash temple wrap only (sclera width preserved so far eye stays bright & open!)
+            for nid in spec["lashes"]:
                 b = ang_by_node.get(nid)
                 nd = by_id.get(nid)
                 if b is None or nd is None or not nd.get("mesh", {}).get("verts"):
@@ -1279,25 +1365,18 @@ def apply_kuroama_v30(puppet: dict[str, Any], by_id: dict[int, dict[str, Any]],
                 V = np.asarray(b["values"], np.float64)
                 if V.shape[0] != nx or V.shape[2] != len(w):
                     continue
-                dx_c = w[:, 0] - eye_cx
-                outer_u = np.clip((dx_c * out_sgn / eye_hw + 0.65) / 1.65, 0.0, 1.0) ** 1.4
+                outer_u = np.clip(((w[:, 0] - eye_cx) * out_sgn / eye_hw + 0.45) / 1.45, 0.0, 1.0) ** 1.6
                 for i, axv in enumerate(ax_x):
-                    yn = (float(axv) - 0.5) * 2.0  # [-1..+1]
-                    mag = abs(yn) ** 1.35
+                    s, mag = _yaw_sin(axv)
                     if mag < 1e-4:
                         continue
-                    is_far = (side == "R" and yn < 0.0) or (side == "L" and yn > 0.0)
+                    is_far = (side == "R" and s < 0.0) or (side == "L" and s > 0.0)
                     if is_far:
-                        ddx = -out_sgn * (3.2 * mag) * outer_u - 0.06 * mag * dx_c
-                        ddy = (1.3 * mag) * outer_u
-                    else:
-                        ddx = 0.035 * mag * dx_c
-                        ddy = np.zeros_like(dx_c)
-                    V[i, :, :, 0] += ddx[None, :]
-                    V[i, :, :, 1] += ddy[None, :]
+                        V[i, :, :, 0] += (-out_sgn * 1.1 * (mag ** 1.3) * outer_u)[None, :]
+                        V[i, :, :, 1] += (0.8 * (mag ** 1.3) * outer_u)[None, :]
                 b["values"] = np.round(V, 4).tolist()
 
-            # Iris + Catchlights: 3D spherical foreshortening + convex cornea-dome highlight parallax
+            # Light iris foreshortening (-5%) + crisp convex cornea highlight parallax (+1.8 units)
             for is_hi, nids in ((False, spec["iris"]), (True, spec["hi"])):
                 for nid in nids:
                     b = ang_by_node.get(nid)
@@ -1310,36 +1389,16 @@ def apply_kuroama_v30(puppet: dict[str, Any], by_id: dict[int, dict[str, Any]],
                         continue
                     dx_i = w[:, 0] - iris_cx
                     for i, axv in enumerate(ax_x):
-                        yn = (float(axv) - 0.5) * 2.0
-                        mag = abs(yn) ** 1.35
+                        s, mag = _yaw_sin(axv)
                         if mag < 1e-4:
                             continue
-                        is_far = (side == "R" and yn < 0.0) or (side == "L" and yn > 0.0)
+                        is_far = (side == "R" and s < 0.0) or (side == "L" and s > 0.0)
                         if is_far:
-                            ddx = -0.18 * mag * dx_i + (-out_sgn * (1.2 if not is_hi else 2.5) * mag)
+                            ddx = -0.05 * mag * dx_i + (-out_sgn * (0.4 if not is_hi else 1.8) * mag)
                         else:
-                            ddx = 0.04 * mag * dx_i + (out_sgn * (0.0 if not is_hi else 1.4) * mag)
+                            ddx = 0.03 * mag * dx_i + (out_sgn * (0.0 if not is_hi else 1.3) * mag)
                         V[i, :, :, 0] += ddx[None, :]
                     b["values"] = np.round(V, 4).tolist()
-
-        # Nose (1012): 3D silhouette tip projection (tip protrudes in yaw direction relative to bridge)
-        nb = ang_by_node.get(NOSE_NODE)
-        nnd = by_id.get(NOSE_NODE)
-        if nb is not None and nnd is not None and nnd.get("mesh", {}).get("verts"):
-            nw = _world_rest(nnd, parent)
-            V = np.asarray(nb["values"], np.float64)
-            if V.shape[0] == nx and V.shape[2] == len(nw):
-                y0, y1 = float(nw[:, 1].min()), float(nw[:, 1].max())
-                tip_t = np.clip((nw[:, 1] - y0) / max(1e-3, y1 - y0), 0.0, 1.0) ** 1.2
-                for i, axv in enumerate(ax_x):
-                    yn = (float(axv) - 0.5) * 2.0
-                    mag = abs(yn) ** 1.3
-                    if mag < 1e-4:
-                        continue
-                    sgn = 1.0 if yn > 0.0 else -1.0
-                    V[i, :, :, 0] += (sgn * 3.0 * mag * tip_t)[None, :]
-                    V[i, :, :, 1] += (-0.7 * mag * (1.0 - tip_t))[None, :]
-                nb["values"] = np.round(V, 4).tolist()
 
     # ---- 6c. Arm R Fit / Arm L Fit (Kuroama Fit-Jacket coupling): single-side topwear & collar lift when raising an arm
     for side, pname in (("R", "Arm R Fit"), ("L", "Arm L Fit")):
