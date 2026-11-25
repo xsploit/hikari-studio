@@ -3,8 +3,9 @@ from functools import cached_property
 import json
 from pathlib import Path
 
+from core.paths import studio_root
 
-ASSETS = Path(__file__).resolve().parents[1] / "assets" / "wardrobe"
+ASSETS = studio_root() / "assets" / "wardrobe"
 TOP_TEXTURE = 5
 SHOE_TEXTURES = (6, 7)
 WARDROBE_STYLES = {

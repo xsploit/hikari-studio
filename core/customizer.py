@@ -32,10 +32,11 @@ from core.vfx_rig import (
     build_vfx_textures,
     midori_bake_key,
 )
+from core.paths import studio_root
 from core.wardrobe import SHOE_TEXTURES, TOP_TEXTURE, Wardrobe
 
 DEFAULT_VRM_PATH = Path(r"D:\Waifu Studio\assets\characters\models\a4f45d37bdbb-hikari-refined.vrm")
-ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
+ASSETS_DIR = studio_root() / "assets"
 DEFAULT_FRONT_HAIR_HD = ASSETS_DIR / "front_hair_lighter_bangs.png"
 DEFAULT_BACK_HAIR_HD = ASSETS_DIR / "back_hair_matching.png"
 HD_PARTS_DIR = ASSETS_DIR / "hd_parts"

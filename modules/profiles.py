@@ -20,6 +20,7 @@ import uuid
 from typing import Any
 
 from core.customizer import DEFAULT_CUSTOMIZER_CFG
+from core.paths import studio_root
 from core.puppet_adapter import valid_model_id
 
 MAX_PROFILES = 200
@@ -31,7 +32,7 @@ DEFAULT_PROFILE_NAME = "Hikari (Default)"
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _VOICE_RE = re.compile(r"^[A-Za-z0-9_-]{0,64}$")
 _LOOK_FIELDS = {*DEFAULT_CUSTOMIZER_CFG, "outfit"}
-_ASSET_DIR = Path(__file__).resolve().parents[1] / "data" / "custom_assets"
+_ASSET_DIR = studio_root() / "data" / "custom_assets"
 _CLIP_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}")
 
 

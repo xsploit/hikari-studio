@@ -23,13 +23,16 @@ import io
 import json
 import math
 from pathlib import Path
+import sys
 from typing import Any, Callable
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw
 
-ROOT = Path(__file__).resolve().parents[1]
+from core.paths import studio_root
+
+ROOT = studio_root()
 MIDORI_TOOL = ROOT / "tools" / "build_midori_deform_arms.py"
 MIDORI_CACHE_DIR = ROOT / "assets" / "hd_parts" / "wave" / "_midori_cache"
 MIDORI_VERSION = "midori-v1"
@@ -733,7 +736,21 @@ CHEEK_PUFF_PEAK = 11.5                 # model units of outward lower-cheek bulg
 
 _ART_CACHE: dict[tuple[Any, ...], tuple[bytes, float, float]] = {}
 # the disk cache key includes this module's source so any art tweak invalidates stale PNGs automatically
-_ART_SRC_HASH = hashlib.sha1(Path(__file__).read_bytes()).hexdigest()[:12]
+def _art_src_hash() -> str:
+    try:
+        p = Path(__file__)
+        if p.is_file():
+            return hashlib.sha1(p.read_bytes()).hexdigest()[:12]
+    except OSError:
+        pass
+    try:
+        st = Path(sys.executable).stat()
+        return hashlib.sha1(f"frozen:{VFX_VERSION}:{st.st_size}:{st.st_mtime_ns}".encode()).hexdigest()[:12]
+    except OSError:
+        return hashlib.sha1(f"frozen:{VFX_VERSION}".encode()).hexdigest()[:12]
+
+
+_ART_SRC_HASH = _art_src_hash()
 
 
 def _art(kind: str, kw: dict[str, Any]) -> tuple[bytes, float, float]:

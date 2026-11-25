@@ -53,8 +53,8 @@ const MAX_RESTARTS: u32 = 3;
 const BACKEND_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8800));
 /// Bound on each step (connect, write, read) of the shutdown request.
 const SHUTDOWN_IO_TIMEOUT: Duration = Duration::from_millis(400);
-/// How long server.py gets to exit on its own after /api/shutdown.
-const SHUTDOWN_GRACE: Duration = Duration::from_millis(2500);
+/// How long the backend gets to exit on its own after /api/shutdown.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(5000);
 
 /// Lets the frameless OBS window be dragged by holding the left mouse button.
 const OBS_DRAG_JS: &str = r#"
@@ -501,11 +501,16 @@ async fn supervise(app: AppHandle) {
         return;
     }
     let Some(dir) = studio_dir() else {
-        status(&app, "Could not find server.py. Set HIKARI_STUDIO_DIR to the hikari-studio folder.", true);
+        status(&app, "Could not find Hikari Studio backend (hikari-server.exe or server.py). Set HIKARI_STUDIO_DIR.", true);
         return;
     };
-    let python = python_exe().await;
-    let log = dir.join("desktop-tauri").join("logs").join("backend.log");
+    let bundled_server = bundled_backend_exe(&dir);
+    let python = if bundled_server.is_some() { PathBuf::new() } else { python_exe().await };
+    let log = if dir.join("desktop-tauri").is_dir() {
+        dir.join("desktop-tauri").join("logs").join("backend.log")
+    } else {
+        dir.join("logs").join("backend.log")
+    };
     let mut restarts = 0u32;
     let shell = app.state::<Shell>();
 
@@ -513,10 +518,11 @@ async fn supervise(app: AppHandle) {
         if shell.shutting_down.load(Ordering::SeqCst) {
             return;
         }
-        let mut child = match spawn_backend(&app, &python, &dir, &log).await {
+        let mut child = match spawn_backend(&app, bundled_server.as_deref(), &python, &dir, &log).await {
             Ok(c) => c,
             Err(e) => {
-                status(&app, &format!("Could not start {}: {e}", python.display()), true);
+                let target = bundled_server.as_deref().unwrap_or(&python);
+                status(&app, &format!("Could not start {}: {e}", target.display()), true);
                 return;
             }
         };
@@ -599,16 +605,23 @@ async fn supervise(app: AppHandle) {
     }
 }
 
-async fn spawn_backend(app: &AppHandle, python: &Path, dir: &Path, log: &Path) -> std::io::Result<Child> {
+async fn spawn_backend(app: &AppHandle, bundled: Option<&Path>, python: &Path, dir: &Path, log: &Path) -> std::io::Result<Child> {
     if let Some(parent) = log.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let out = tokio::fs::File::create(log).await?.into_std().await;
     let err = out.try_clone()?;
 
-    let mut cmd = Command::new(python);
-    cmd.arg("server.py")
-        .current_dir(dir)
+    let mut cmd = if let Some(exe) = bundled {
+        let mut c = Command::new(exe);
+        c.env("HIKARI_STUDIO_DIR", dir);
+        c
+    } else {
+        let mut c = Command::new(python);
+        c.arg("server.py");
+        c
+    };
+    cmd.current_dir(dir)
         .env("PYTHONUNBUFFERED", "1")
         .env("PYTHONIOENCODING", "utf-8")
         .stdin(Stdio::null())
@@ -640,20 +653,30 @@ async fn spawn_backend(app: &AppHandle, python: &Path, dir: &Path, log: &Path) -
 
 /// HIKARI_STUDIO_DIR, else the first folder above the exe holding server.py,
 /// else the folder this crate was built from.
+fn bundled_backend_exe(dir: &Path) -> Option<PathBuf> {
+    for rel in ["hikari-server/hikari-server.exe", "hikari-server.exe"] {
+        let p = dir.join(rel);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 fn studio_dir() -> Option<PathBuf> {
-    let has_server = |p: &Path| p.join("server.py").is_file();
+    let has_backend = |p: &Path| bundled_backend_exe(p).is_some() || p.join("server.py").is_file();
     if let Some(d) = std::env::var_os("HIKARI_STUDIO_DIR").map(PathBuf::from) {
-        if has_server(&d) {
+        if has_backend(&d) {
             return Some(d);
         }
     }
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(d) = exe.ancestors().skip(1).find(|p| has_server(p)) {
+        if let Some(d) = exe.ancestors().skip(1).find(|p| has_backend(p)) {
             return Some(d.to_path_buf());
         }
     }
     let built = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
-    has_server(&built).then_some(built)
+    has_backend(&built).then_some(built)
 }
 
 /// PYTHON env var, else the newest python.org install in

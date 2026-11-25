@@ -5,10 +5,14 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+build/
+dist/
+*.spec
 
 # Environment & local secrets / runtime settings
 .env
 .env.*
+!.env.example
 settings.json
 
 # Runtime memory DBs, private uploads & backups

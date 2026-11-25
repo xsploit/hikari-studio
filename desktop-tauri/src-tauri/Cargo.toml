@@ -1,6 +1,6 @@
 [package]
 name = "hikari-desktop"
-version = "0.1.0"
+version = "1.0.0"
 description = "Hikari Studio native desktop shell"
 edition = "2021"
 rust-version = "1.77"

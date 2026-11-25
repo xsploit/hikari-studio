@@ -10,6 +10,8 @@ from pathlib import Path
 import threading
 from urllib.parse import urlsplit
 
+from core.paths import studio_root
+
 KNOWN_KEYS = (
     "AI_GATEWAY_API_KEY", "AI_GATEWAY_MODEL", "VERCEL_OIDC_TOKEN",
     "FISH_SPEECH_API_KEY", "FISHSPEECH_API_KEY", "FISH_AUDIO_API_KEY", "FISH_API_KEY",
@@ -26,7 +28,7 @@ def _key_files() -> list[Path]:
     for var in ("HIKARI_KEY_FILE", "FISH_KEY_FILE"):
         if os.environ.get(var):
             out.append(Path(os.environ[var]))
-    repo_root = Path(__file__).resolve().parent.parent
+    repo_root = studio_root()
     out.append(repo_root / ".env")
     out.append(repo_root / ".env.local")
     if os.environ.get("USERPROFILE"):

@@ -65,7 +65,9 @@ from modules.vercel_gateway import (
 )
 from modules.video_retarget import extract_motion_from_video
 
-HERE = Path(__file__).resolve().parent
+from core.paths import studio_root
+
+HERE = studio_root()
 ROOT = HERE.parent
 WEB_DIR = HERE / "web"
 MODELS_DIR = HERE / "models"
