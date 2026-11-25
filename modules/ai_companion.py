@@ -452,6 +452,8 @@ class AICompanion:
         self.history_turns: int = HISTORY_MAX_MESSAGES
         self.restored_turns: int = 0
         self._interrupted_ctx: dict[str, Any] | None = None
+        self._turn_gen: int = 0
+        self._interrupted_turn_gen: int = -1
 
     @property
     def fish_key_ready(self) -> bool:
@@ -552,17 +554,23 @@ class AICompanion:
         await self._persist(role, text, channel)
 
     async def _begin_turn(self, user_message: str) -> None:
+        self._turn_gen += 1
         self._push_user(user_message)
         await self._persist("user", user_message)
 
-    def record_interruption(self, spoken: str, unspoken: str) -> None:
+    def record_interruption(self, spoken: str, unspoken: str, *, turn_gen: int | None = None) -> None:
         """Record where Hikari was interrupted mid-speech so she never hallucinates finishing the rest
-        and can naturally pick up where she left off if the viewer asks."""
+        and can naturally pick up where she left off if the viewer asks — even if interrupted while
+        the streaming reply is still finishing."""
         sp = strip_vocal_tags(spoken or "").strip()[:320]
         un = strip_vocal_tags(unspoken or "").strip()[:420]
         if not un:
             return
         self._interrupted_ctx = {"spoken": sp, "unspoken": un, "at": time.monotonic()}
+        if turn_gen is not None:
+            self._interrupted_turn_gen = turn_gen
+        elif self.history and self.history[-1].get("role") == "user":
+            self._interrupted_turn_gen = self._turn_gen
         if self.history and self.history[-1].get("role") == "assistant":
             self.history[-1] = {
                 "role": "assistant",
@@ -570,7 +578,20 @@ class AICompanion:
             }
 
     async def _finish(self, reply: str) -> str:
+        if self._interrupted_turn_gen == self._turn_gen and self._interrupted_ctx is not None:
+            # Interrupted mid-stream BEFORE _finish ran: keep _interrupted_ctx and save only the spoken prefix!
+            sp = self._interrupted_ctx.get("spoken", "")
+            full_clean = strip_vocal_tags(reply).strip()
+            if not self._interrupted_ctx.get("unspoken") and full_clean and full_clean != sp:
+                self._interrupted_ctx["unspoken"] = full_clean[len(sp):].strip()[:420]
+            saved = f"{sp} [interrupted]" if sp else "[interrupted before speaking]"
+            self._interrupted_turn_gen = -1
+            self.history.append({"role": "assistant", "content": saved})
+            self._trim_history()
+            await self._persist("assistant", saved)
+            return reply
         self._interrupted_ctx = None
+        self._interrupted_turn_gen = -1
         self.history.append({"role": "assistant", "content": reply})
         self._trim_history()
         await self._persist("assistant", reply)
@@ -711,7 +732,8 @@ class AICompanion:
         reply, wav, err = "", None, ""
         if self.voices_inline and self.cfg.get("ttsEnabled", True) and self.fish_tts.configured:
             try:
-                reply, pcm, rate = await self.fish_tts.speak_stream(gen, on_segment=seg_cb if on_segment else None)
+                reply, pcm, rate = await self.fish_tts.speak_stream(
+                    gen, on_segment=seg_cb if on_segment else None, return_pcm=(on_segment is None))
                 if on_segment is None:
                     wav = await self.fish_tts.save_wav(pcm, rate)
             except Exception as exc:

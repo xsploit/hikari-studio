@@ -51,16 +51,22 @@ export class FishCallManager {
 
   async _setupPcmPipeline(room) {
     const context = new AudioContext({ sampleRate: SAMPLE_RATE });
-    await context.resume();
-    await context.audioWorklet.addModule('/static/js/pcm-worklet.js');
-    const node = new AudioWorkletNode(context, 'remote-pcm', {
-      channelCount: 1,
-      channelCountMode: 'explicit',
-      numberOfInputs: 1,
-      numberOfOutputs: 1,
-      outputChannelCount: [1],
-    });
-    node.connect(context.destination);
+    let node;
+    try {
+      await context.resume();
+      await context.audioWorklet.addModule('/static/js/pcm-worklet.js');
+      node = new AudioWorkletNode(context, 'remote-pcm', {
+        channelCount: 1,
+        channelCountMode: 'explicit',
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+      });
+      node.connect(context.destination);
+    } catch (err) {
+      await context.close().catch(() => {});
+      throw err;
+    }
 
     const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const socket = new WebSocket(`${wsProto}//${location.host}/ws/fish-pcm`);

@@ -558,7 +558,7 @@ class RigController:
         self._rock_phase: float = rnd.uniform(0.0, 6.283)
         self._rock_w: float = 0.0
         # Conversational gaze choreography + blink-on-head-turn + barge-in yield reaction
-        self._was_speaking: bool = False
+        self._gaze_was_speaking: bool = False
         self._avert_until: float = 0.0
         self._avert_side: float = 1.0
         self._tri_idx: int = 0
@@ -569,6 +569,7 @@ class RigController:
         self._last_turn_blink: float = -1e9
         self._turn_blinks: int = 0
         self._barge_until: float = 0.0
+        self._barge_listen_until: float = 0.0
 
         # Expression VFX / blend-shape layer (auto emotion mapping + manual Studio overrides)
         self.auto_vfx = True
@@ -765,6 +766,7 @@ class RigController:
         now = time.perf_counter()
         with self.lock:
             self._barge_until = now + 0.65
+            self._barge_listen_until = now + 8.0
             self._avert_until = 0.0
             self.sp_nod.v += 14.0
             self._istate = "listening"
@@ -1524,12 +1526,19 @@ class RigController:
         barge_rem = max(0.0, self._barge_until - t_now)
         barge_env = math.sin(min(1.0, barge_rem / 0.65) * math.pi) if barge_rem > 0.0 else 0.0
 
+        # Auto-release barge-in "listening" back to "idle" after 8 s of silence so she never stays stuck leaning in.
+        if self._barge_listen_until > 0.0 and t_now >= self._barge_listen_until:
+            self._barge_listen_until = 0.0
+            if self._istate == "listening" and not self._user_vad.speaking:
+                self._istate = "idle"
+                istate = "idle"
+
         # Conversational turn-initiation gaze aversion (brief glance away as she starts speaking, then lock back)
-        if speaking and not self._was_speaking and auto_gaze and not idle_block and barge_env <= 0.0:
+        if speaking and not self._gaze_was_speaking and auto_gaze and not idle_block and barge_env <= 0.0:
             if rnd.random() < 0.72:
                 self._avert_side = -1.0 if rnd.random() < 0.5 else 1.0
                 self._avert_until = t_now + rnd.uniform(0.45, 0.90)
-        self._was_speaking = bool(speaking)
+        self._gaze_was_speaking = bool(speaking)
         avert_w = _clamp((self._avert_until - t_now) / 0.25, 0.0, 1.0) if t_now < self._avert_until else 0.0
         # Punchlines / questions / emphasis / barge-in pull gaze cleanly back to eye contact
         if pq > 0.30 or pe > 0.45 or barge_env > 0.05:

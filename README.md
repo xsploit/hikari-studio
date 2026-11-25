@@ -126,7 +126,7 @@ Measured live on Windows 11 at full 60 FPS streaming (`1280×720` / `326 KB` fra
 - **Windows 10/11** with **Python 3.11+** (tested on Python 3.13)
 - Install Python dependencies:
   ```bash
-  pip install aiohttp msgpack pillow numpy opencv-python sounddevice httpx
+  pip install -r requirements.txt
   ```
 - **API Keys (only 2 keys needed for the full stack — set as env vars or in `.env`, never committed):**
   - `AI_GATEWAY_API_KEY` — **Vercel AI Gateway** (single unified key for all LLMs — OpenAI, Anthropic, Perplexity, Google, etc. — plus cheap embeddings `openai/text-embedding-3-small` and evaluation/decision models like `typesafe-ai/jev`)

@@ -372,6 +372,7 @@ class FishTtsStreamer:
                            on_text: Callable[[str], Awaitable[None] | None] | None = None,
                            on_segment: Callable[[bytes, int, str, int], Awaitable[None]] | None = None,
                            preserve_vocal_tags: bool | None = None,
+                           return_pcm: bool = True,
                            ) -> tuple[str, bytes, int]:
         """Consume LLM deltas, synthesize while streaming, return (full_text, pcm, rate).
         `on_segment(pcm, rate, text, index)` (optional) receives each phrase's audio IN ORDER as soon as it is
@@ -480,11 +481,17 @@ class FishTtsStreamer:
                 await _cancel_all(tasks + ([emitter] if emitter is not None else []))   # never leave work running
                 raise
             rate = max((r for _, r in results), default=DEFAULT_PCM_RATE)
-            gap = b"\x00\x00" * int(rate * 0.06)     # 60 ms breath between phrases
-            pcm = gap.join(_resample_pcm(p, r, rate) for p, r in results if p)
+            if not return_pcm:
+                # Caller already consumed every segment via on_segment; skip redundant full-reply join!
+                pcm = b""
+                audio_bytes = sum(len(p) for p, _ in results if p)
+            else:
+                gap = b"\x00\x00" * int(rate * 0.06)     # 60 ms breath between phrases
+                pcm = gap.join(_resample_pcm(p, r, rate) for p, r in results if p)
+                audio_bytes = len(pcm)
         self.last_stats = {"transport": transport, "ms": round((time.perf_counter() - t0) * 1000.0, 1),
                            "firstAudioMs": round(first_audio_at[0] * 1000.0, 1) if first_audio_at else None,
-                           "audioBytes": len(pcm)}
+                           "audioBytes": audio_bytes if transport != "ws" else len(pcm)}
         return "".join(full), pcm, rate
 
     async def save_wav(self, pcm: bytes, rate: int, prefix: str = "tts") -> Path | None:

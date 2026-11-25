@@ -408,45 +408,69 @@ def public_config(data: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def sanitize_lipsync_patch(values: dict[str, Any]) -> dict[str, Any]:
-    """Validate the multi-engine lip-sync fields of a `lipsync` config patch (others pass through)."""
-    out = dict(values)
-    if "engine" in out:
-        e = str(out["engine"] or "").lower()
-        out["engine"] = e if e in LIPSYNC_ENGINES else "hybrid"
-    if "mfccScoring" in out:
-        s = str(out["mfccScoring"] or "").lower()
-        out["mfccScoring"] = s if s in MFCC_SCORING else "cosine"
-    if "coarticulation" in out:
-        try:
-            out["coarticulation"] = max(0.08, min(0.60, float(out["coarticulation"])))
-        except (TypeError, ValueError):
-            out["coarticulation"] = 0.22
-    if "paramMap" in out:
-        pm_in = out["paramMap"] if isinstance(out["paramMap"], dict) else {}
-        pm: dict[str, dict[str, Any]] = {}
-        for ch, vals in pm_in.items():
-            if (ch not in DEFAULT_PARAM_MAP and ch != "mouthSpring") or not isinstance(vals, dict):
+_LIPSYNC_SCALAR_BOUNDS: dict[str, tuple[float, float]] = {
+    "gain": (0.1, 6.0), "noiseGate": (0.0, 0.25), "attackOmega": (5.0, 80.0), "dampingZeta": (0.2, 2.5),
+    "smileBias": (-1.0, 1.0), "roundness": (0.0, 2.5), "jawBounce": (0.0, 2.5),
+    "lipSealSharpness": (0.0, 2.5), "microFlutter": (0.0, 1.5), "coarticulation": (0.08, 0.60),
+    "speechToHeadNod": (0.0, 3.0), "speechToBrows": (0.0, 3.0), "speechToArmGesture": (0.0, 3.0),
+}
+
+
+def sanitize_lipsync_patch(values: dict[str, Any], *, keep_calibration: bool = False) -> dict[str, Any]:
+    """Validate every lip-sync scalar, engine, scoring, and paramMap field so NaN/bad types never freeze frames."""
+    if not isinstance(values, dict):
+        return {}
+    import math
+    out: dict[str, Any] = {}
+    for k, v in values.items():
+        if k == "engine":
+            e = str(v or "").lower()
+            out[k] = e if e in LIPSYNC_ENGINES else "hybrid"
+        elif k == "mfccScoring":
+            s = str(v or "").lower()
+            out[k] = s if s in MFCC_SCORING else "cosine"
+        elif k in _LIPSYNC_SCALAR_BOUNDS:
+            lo, hi = _LIPSYNC_SCALAR_BOUNDS[k]
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
                 continue
-            clean: dict[str, Any] = {}
-            if "enabled" in vals:
-                clean["enabled"] = bool(vals["enabled"])
-            for f in PARAM_MAP_FIELDS:
-                if f in vals:
-                    try:
-                        v = float(vals[f])
-                    except (TypeError, ValueError):
-                        continue
-                    if f == "smooth":
-                        v = max(0.0, min(0.98, v))
-                    elif f == "curve":
-                        v = max(0.2, min(5.0, v))
-                    else:
-                        v = max(-2.0, min(2.0, v))
-                    clean[f] = v
-            pm[ch] = clean
-        out["paramMap"] = pm
-    out.pop("mfccCalibration", None)     # only changed through /api/lipsync/calibrate
+            if not math.isfinite(fv) or isinstance(v, bool):
+                continue
+            out[k] = max(lo, min(hi, fv))
+        elif k == "micEnabled":
+            out[k] = bool(v)
+        elif k == "holdViseme":
+            hv = str(v or "").strip().upper()
+            out[k] = hv if hv in ("", "X", "A", "B", "C", "D", "E", "F", "G", "H") else ""
+        elif k == "mfccCalibration" and keep_calibration and isinstance(v, dict):
+            out[k] = v
+        elif k == "paramMap":
+            pm_in = v if isinstance(v, dict) else {}
+            pm: dict[str, dict[str, Any]] = {}
+            for ch, vals in pm_in.items():
+                if (ch not in DEFAULT_PARAM_MAP and ch != "mouthSpring") or not isinstance(vals, dict):
+                    continue
+                clean: dict[str, Any] = {}
+                if "enabled" in vals:
+                    clean["enabled"] = bool(vals["enabled"])
+                for f in PARAM_MAP_FIELDS:
+                    if f in vals:
+                        try:
+                            fv = float(vals[f])
+                        except (TypeError, ValueError):
+                            continue
+                        if not math.isfinite(fv) or isinstance(vals[f], bool):
+                            continue
+                        if f == "smooth":
+                            fv = max(0.0, min(0.98, fv))
+                        elif f == "curve":
+                            fv = max(0.2, min(5.0, fv))
+                        else:
+                            fv = max(-2.0, min(2.0, fv))
+                        clean[f] = fv
+                pm[ch] = clean
+            out[k] = pm
     return out
 
 
@@ -631,6 +655,8 @@ class ConfigStore:
                     for sec in FRAME_SECTIONS:                # a bad value already on disk can't break frames
                         if isinstance(saved.get(sec), dict):
                             saved[sec] = sanitize_section(sec, saved[sec], self.data.get(sec) if sec != "visemes" else None)
+                    if "lipsync" in saved:
+                        saved["lipsync"] = sanitize_lipsync_patch(saved["lipsync"], keep_calibration=True)
                     if "vision" in saved:              # bounded model / provider ids, mode enum
                         saved["vision"] = sanitize_vision_patch(saved["vision"])
                     if "ambient" in saved:

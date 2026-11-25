@@ -852,7 +852,12 @@ class LiveLipSyncEngine:
                 self.cfg["micEnabled"] = False
         return bool(self.cfg.get("micEnabled", False))
 
-    def load_wav_and_play(self, wav_path: Path, cues_path: Path | None = None, track_id: str = "") -> float:
+    def playback_generation(self) -> int:
+        with self.lock:
+            return int(getattr(self, "_play_gen", 0))
+
+    def load_wav_and_play(self, wav_path: Path, cues_path: Path | None = None, track_id: str = "",
+                          expect_gen: int | None = None) -> float:
         with wave.open(str(wav_path), "rb") as wf:
             ch = wf.getnchannels()
             sw = wf.getsampwidth()
@@ -877,6 +882,10 @@ class LiveLipSyncEngine:
 
         dur = len(pcm) / float(sr)
         with self.lock:
+            cur_gen = int(getattr(self, "_play_gen", 0))
+            if expect_gen is not None and cur_gen != expect_gen:
+                return 0.0                       # interrupted while decoding in worker thread: do not resurrect!
+            self._play_gen = cur_gen + 1
             self._pcm = pcm
             self._sr = sr
             self._cues = cues
@@ -894,6 +903,7 @@ class LiveLipSyncEngine:
 
     def stop_playback(self) -> None:
         with self.lock:
+            self._play_gen = int(getattr(self, "_play_gen", 0)) + 1
             self._playing = False
             self._pcm = None
             self._cues = None

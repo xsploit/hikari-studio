@@ -142,6 +142,17 @@ class BargeInCutoffTests(unittest.TestCase):
             _run(ai._finish("Right! There was a tiny star..."))
             self.assertIsNone(ai._interrupted_ctx)
 
+    def test_interrupt_before_finish_streaming_preserves_cutoff(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            ai = AICompanion(Path(td))
+            _run(ai._begin_turn("explain quantum physics"))
+            # Interrupted mid-stream BEFORE _finish() runs
+            ai.record_interruption("Quantum physics starts with", "superposition and entanglement.")
+            _run(ai._finish("Quantum physics starts with superposition and entanglement."))
+            self.assertEqual(ai.history[-1]["content"], "Quantum physics starts with [interrupted]")
+            self.assertIsNotNone(ai._interrupted_ctx)
+            self.assertIn("entanglement", ai._interrupted_ctx["unspoken"])
+
 
 class CharacterContinuityAndAmbientTests(unittest.TestCase):
     def test_companion_notes_and_emotional_carryover(self) -> None:
@@ -214,16 +225,22 @@ class CharacterContinuityAndAmbientTests(unittest.TestCase):
                     r = await cl.get("/api/ambient/status")
                     self.assertEqual(r.status, 200)
                     self.assertFalse((await r.json())["ambient"]["enabled"])
+                    same_origin = f"http://127.0.0.1:{cl.port}"
                     r = await cl.post("/api/memory/self", json={"text": "Loves midnight ramen", "kind": "opinion"},
-                                      headers={"Origin": "http://127.0.0.1:8800"})
+                                      headers={"Origin": same_origin})
                     self.assertEqual(r.status, 200)
                     note_id = (await r.json())["note"]["id"]
                     r = await cl.get("/api/memory/self")
                     self.assertEqual(len((await r.json())["notes"]), 1)
-                    # Foreign origin blocked
+                    # Foreign origin, cross-port localhost origin, and cross-site Sec-Fetch-Site all blocked!
                     bad = await cl.post("/api/memory/self", json={"text": "hack"}, headers={"Origin": "https://evil.example"})
                     self.assertEqual(bad.status, 403)
-                    r = await cl.delete(f"/api/memory/self/{note_id}", headers={"Origin": "http://127.0.0.1:8800"})
+                    cross_port = await cl.post("/api/memory/self", json={"text": "hack"},
+                                               headers={"Origin": f"http://127.0.0.1:{cl.port + 1}"})
+                    self.assertEqual(cross_port.status, 403)
+                    cross_site = await cl.get("/api/ambient/status", headers={"Sec-Fetch-Site": "cross-site"})
+                    self.assertEqual(cross_site.status, 403)
+                    r = await cl.delete(f"/api/memory/self/{note_id}", headers={"Origin": same_origin})
                     self.assertEqual(r.status, 200)
                 finally:
                     await rt.memory.close()

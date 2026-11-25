@@ -698,17 +698,29 @@ async function boot() {
   }
 
   /* ───────── WebSocket bridge with auto-reconnect ───────── */
+  let wsEverConnected = false;
   function connectWs() {
     const ws = new WebSocket(`ws://${location.host}/ws`);
     ws.binaryType = 'arraybuffer';
     store.ws = ws;
-    ws.onopen = () => { wsOnline = true; updateStatus(); };
+    ws.onopen = () => {
+      const reconnected = wsEverConnected;
+      wsEverConnected = true;
+      wsOnline = true;
+      updateStatus();
+      if (reconnected) {
+        fetch('/api/state', { cache: 'no-store' }).then((r) => r.json()).then((d) => {
+          if (d?.config) { store.applyState(d); store.rerenderPanel(); }
+        }).catch(() => {});
+      }
+    };
     ws.onmessage = async (ev) => {
       if (typeof ev.data !== 'string') {
         await avatarRenderer.drawPacket(ev.data, store.config.stage, ptrX, ptrY);
         return;
       }
-      const msg = JSON.parse(ev.data);
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
       if (msg.type === 'telemetry') {
         document.getElementById('hud-fps').textContent = `${msg.fps} FPS`;
         document.getElementById('hud-viseme').textContent = `Viseme: ${msg.viseme}`;
@@ -751,6 +763,7 @@ async function boot() {
   let pttRecorder = null;
   let pttChunks = [];
   let pttStream = null;
+  let pttStarting = false;
 
   async function sendChatText(message, { includeScreen = false } = {}) {
     if (!message) return;
@@ -868,6 +881,8 @@ async function boot() {
       showSubtitle('fish asr', 'Transcribing…', 6.0);
       return;
     }
+    if (pttStarting) return;
+    pttStarting = true;
     try {
       pttStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       pttChunks = [];
@@ -876,22 +891,30 @@ async function boot() {
       pttRecorder.onstop = async () => {
         pttStream?.getTracks().forEach((t) => t.stop());
         pttStream = null;
-        const blob = new Blob(pttChunks, { type: pttRecorder.mimeType || 'audio/webm' });
-        const fd = new FormData();
-        fd.append('audio', blob, 'mic.webm');
-        const r = await (await fetch('/api/stt', { method: 'POST', body: fd })).json();
-        if (r.ok && r.text) {
-          showSubtitle('you', r.text, 3.5);
-          await sendChatText(r.text);
-        } else {
-          showSubtitle('stt', r.error || 'No speech detected.', 3.5);
+        try {
+          const blob = new Blob(pttChunks, { type: pttRecorder.mimeType || 'audio/webm' });
+          const fd = new FormData();
+          fd.append('audio', blob, 'mic.webm');
+          const r = await (await fetch('/api/stt', { method: 'POST', body: fd })).json();
+          if (r.ok && r.text) {
+            showSubtitle('you', r.text, 3.5);
+            await sendChatText(r.text);
+          } else {
+            showSubtitle('stt', r.error || 'No speech detected.', 3.5);
+          }
+        } catch (err) {
+          showSubtitle('stt', err?.message || 'Transcription failed.', 3.5);
         }
       };
       pttRecorder.start();
       btnMic.classList.add('active');
       showSubtitle('listening', 'Speak now — click the mic again to send via Fish ASR…', 15.0);
     } catch (err) {
+      pttStream?.getTracks().forEach((t) => t.stop());
+      pttStream = null;
       showSubtitle('mic error', err.message || 'Microphone access denied.', 4.0);
+    } finally {
+      pttStarting = false;
     }
   });
 

@@ -15,6 +15,7 @@ import copy
 import ctypes
 import json
 import math
+import os
 from pathlib import Path
 import re
 import struct
@@ -88,7 +89,7 @@ IMAGE_EXT = {"PNG": ".png", "WEBP": ".webp", "JPEG": ".jpg"}
 MOTION_ID_RE = re.compile(r"^[A-Za-z0-9_\-][A-Za-z0-9_.\-]{0,127}$")
 # Browser origins allowed to drive the control surface (WebSocket + state-changing requests).
 ALLOWED_ORIGIN_RE = re.compile(
-    r"^(?:http://(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?|tauri://localhost|https?://tauri\.localhost)$")
+    r"^(?:http://(?:127\.0\.0\.1|localhost|\[::1\])(?::(\d{1,5}))?|tauri://localhost|https?://tauri\.localhost)$")
 # DNS-rebinding guard: the Host header must name loopback (optionally with the port we are listening on).
 HOST_RE = re.compile(r"^(127\.0\.0\.1|localhost|\[::1\])(?::(\d{1,5}))?$")
 DEFAULT_PORT = 8800
@@ -102,8 +103,14 @@ SLOW_RECOVER_STREAK = 3
 FRAME_TEMPLATES = {sec: copy.deepcopy(default_config().get(sec) or {}) for sec in FRAME_SECTIONS if sec != "visemes"}
 
 ENGINE_EXE = HERE / "engine" / "hikari-live-engine.exe"
-SDL_DLL = Path("D:/Hikari-Rig-Tools/Inochi-Creator-0.8.6/SDL2.dll")
-SRC_MODEL = ROOT / "v28-inochi" / "Hikari-v28.inp"
+_SDL_CANDIDATES = (
+    Path(os.environ["HIKARI_SDL_DLL"]) if os.environ.get("HIKARI_SDL_DLL") else None,
+    HERE / "engine" / "SDL2.dll",
+    Path("D:/Hikari-Rig-Tools/Inochi-Creator-0.8.6/SDL2.dll"),
+)
+SDL_DLL = next((p for p in _SDL_CANDIDATES if p is not None and p.exists()), HERE / "engine" / "SDL2.dll")
+_SRC_DEFAULT = ROOT / "v28-inochi" / "Hikari-v28.inp"
+SRC_MODEL = _SRC_DEFAULT if _SRC_DEFAULT.exists() else (MODELS_DIR / "Hikari-v28-BaseHD-v5.inp")
 HD_MODEL = MODELS_DIR / "Hikari-v28-HD.inp"
 SAMPLE_WAV = ROOT / "v23" / "watch" / "dialogue.wav"
 SAMPLE_CUES = ROOT / "v23" / "watch" / "dialogue.cues.json"
@@ -186,17 +193,17 @@ def _validate_image(path: Path) -> str:
     try:
         with Image.open(path) as im:
             fmt = (im.format or "").upper()
+            if fmt not in IMAGE_EXT:
+                raise BadUpload("Only PNG, WebP or JPEG images are accepted")
+            if im.width * im.height > 64_000_000:
+                raise BadUpload("Image is too large")
             im.verify()
         with Image.open(path) as im:            # verify() invalidates; reopen to force a full decode
             im.load()
-            if im.width * im.height > 64_000_000:
-                raise BadUpload("Image is too large")
     except BadUpload:
         raise
     except Exception:
         raise BadUpload("Not a valid PNG, WebP or JPEG image") from None
-    if fmt not in IMAGE_EXT:
-        raise BadUpload("Only PNG, WebP or JPEG images are accepted")
     return IMAGE_EXT[fmt]
 
 
@@ -224,9 +231,19 @@ def _motion_path(cid: str, suffix: str) -> Path | None:
     return path if path.is_relative_to(root) and path.parent == root else None
 
 
-def _origin_allowed(origin: str | None) -> bool:
-    """Missing Origin = non-browser / local tool; otherwise only loopback + the Tauri shell."""
-    return origin is None or origin == "" or bool(ALLOWED_ORIGIN_RE.fullmatch(origin))
+def _origin_allowed(origin: str | None, port: int | None = None) -> bool:
+    """Missing Origin = non-browser / local tool; otherwise only exact-port loopback + Tauri shell."""
+    if origin is None or origin == "":
+        return True
+    m = ALLOWED_ORIGIN_RE.fullmatch(origin)
+    if m is None:
+        return False
+    if origin.startswith(("tauri://", "https://tauri.localhost", "http://tauri.localhost")):
+        return True
+    if m.group(1) is None:
+        return True
+    want = port if port is not None else DEFAULT_PORT
+    return int(m.group(1)) == want
 
 
 def _local_port(request: web.Request) -> int | None:
@@ -254,12 +271,15 @@ def _host_allowed(host: str | None, port: int | None) -> bool:
 
 @web.middleware
 async def security_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
-    """Require a local peer, loopback Host and permitted browser Origin for reads and writes."""
-    if not _host_allowed(request.headers.get("Host"), _local_port(request)):
+    """Require a local peer, loopback Host, exact-port browser Origin, and non-cross-site fetch."""
+    port = _local_port(request)
+    if not _host_allowed(request.headers.get("Host"), port):
         return web.json_response({"ok": False, "error": "Host not allowed"}, status=403)
     if request.remote not in ("127.0.0.1", "::1"):
         return web.json_response({"ok": False, "error": "Local connections only"}, status=403)
-    if not _origin_allowed(request.headers.get("Origin")):
+    if (request.headers.get("Sec-Fetch-Site") or "").strip().lower() == "cross-site":
+        return web.json_response({"ok": False, "error": "Cross-site requests not allowed"}, status=403)
+    if not _origin_allowed(request.headers.get("Origin"), port):
         return web.json_response({"ok": False, "error": "Origin not allowed"}, status=403)
     try:
         return await handler(request)
@@ -347,27 +367,32 @@ class SegmentPlayer:
         self.action: dict[str, Any] | None = None
         self.tag = "hikari"
         self._closed = False
+        self._cancelled = False
         self._all_texts: list[str] = []
         self._done_texts: list[str] = []
         self._cur_text: str = ""
         self._cur_start: float = 0.0
         self._cur_dur: float = 0.0
+        self._wavs: set[str] = set()
         self.task = runtime.spawn(self._run())
 
     async def push_pcm(self, pcm: bytes, rate: int, text: str, _idx: int) -> None:
         """`on_segment` callback for AICompanion.generate_reply_with_voice (called in order)."""
-        if self._closed:
+        if self._closed or self._cancelled:
             return
         wav = await self.rt.ai.fish_tts.save_wav(pcm, rate)
         if wav is not None:
             clean = clean_for_speech(text)
             self._all_texts.append(clean)
+            self._wavs.add(wav.name)
             self.q.put_nowait((wav, clean))
 
     def push_wav(self, wav: Path | None, text: str) -> None:
-        if not self._closed:
+        if not self._closed and not self._cancelled:
             clean = clean_for_speech(text)
             self._all_texts.append(clean)
+            if wav is not None:
+                self._wavs.add(wav.name)
             self.q.put_nowait((wav, clean))
 
     def snapshot_progress(self) -> tuple[str, str]:
@@ -393,6 +418,7 @@ class SegmentPlayer:
 
     def cancel(self) -> None:
         self._closed = True
+        self._cancelled = True
         if not self.task.done():
             self.task.cancel()
 
@@ -400,36 +426,48 @@ class SegmentPlayer:
         return max(0.0, self.end_at - time.monotonic())
 
     async def _run(self) -> None:
-        while True:
-            item = await self.q.get()
-            if item is None:
+        try:
+            while True:
+                item = await self.q.get()
+                if item is None:
+                    # Wait for the final audible segment to finish before retiring it (keeps interrupt cutoff accurate)
+                    tail = self.end_at - time.monotonic()
+                    if tail > 0:
+                        await asyncio.sleep(tail)
+                    if self._cur_text:
+                        self._done_texts.append(self._cur_text)
+                        self._cur_text = ""
+                    return
+                wav, text = item
+                wait = self.end_at - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(wait)
                 if self._cur_text:
                     self._done_texts.append(self._cur_text)
-                    self._cur_text = ""
-                return
-            wav, text = item
-            wait = self.end_at - time.monotonic()
-            if wait > 0:
-                await asyncio.sleep(wait)
-            if self._cur_text:
-                self._done_texts.append(self._cur_text)
-            dur, audio_url = max(1.2, len(text) / 14.0), ""
-            if wav is not None and await asyncio.to_thread(wav.exists):
-                dur = await asyncio.to_thread(self.rt.lipsync.load_wav_and_play, wav, None, wav.name)
-                audio_url = f"/uploads/audio/{wav.name}"
-            now = time.monotonic()
-            self._cur_text, self._cur_start, self._cur_dur = text, now, dur
-            self.end_at = now + dur + self.GAP_SEC
-            self.rt._subtitle = text
-            if self.action is not None:
-                self.rt.rig.trigger_temp_action(self.action, duration=max(2.6, dur + 0.6))
-            await self.rt.broadcast_json({"type": "speech", "text": text, "tag": self.tag, "audioUrl": audio_url,
-                                          "duration": round(dur, 2), "segment": self.segments})
-            self.segments += 1
-            self.started.set()
-            if self.segments == 1:
-                self.rt.set_interaction("idle")
-        # (no audio-cache pruning mid-reply: the stage may still be fetching a queued segment)
+                dur, audio_url = max(1.2, len(text) / 14.0), ""
+                if wav is not None and await asyncio.to_thread(wav.exists):
+                    gen = self.rt.lipsync.playback_generation()
+                    dur = await asyncio.to_thread(self.rt.lipsync.load_wav_and_play, wav, None, wav.name, gen)
+                    if dur <= 0.0 or self._cancelled:
+                        return                   # interrupted while decoding in worker thread
+                    audio_url = f"/uploads/audio/{wav.name}"
+                now = time.monotonic()
+                self._cur_text, self._cur_start, self._cur_dur = text, now, dur
+                self.end_at = now + dur + self.GAP_SEC
+                self.rt._subtitle = text
+                if self.action is not None:
+                    self.rt.rig.trigger_temp_action(self.action, duration=max(2.6, dur + 0.6))
+                await self.rt.broadcast_json({"type": "speech", "text": text, "tag": self.tag, "audioUrl": audio_url,
+                                              "duration": round(dur, 2), "segment": self.segments})
+                self.segments += 1
+                self.started.set()
+                if self.segments == 1:
+                    self.rt.set_interaction("idle")
+        finally:
+            self._wavs.clear()
+            if self.rt._segment_player is self:
+                self.rt._segment_player = None
+            self.rt.spawn(asyncio.to_thread(_prune_audio_cache, 20))
 
 
 class StudioRuntime:
@@ -1218,7 +1256,7 @@ class StudioRuntime:
 
     async def speak_text(self, text: str, action: dict[str, Any] | None = None,
                          decision: Decision | None = None, tag: str | None = None,
-                         wav_path: Path | None = None, synth: bool = True) -> dict[str, Any]:
+                         wav_path: Path | None = None, synth: bool = True, *, is_chat: bool = False) -> dict[str, Any]:
         clean, parsed_tag, parsed_act = parse_emotion_and_clean(text)
         explicit = bool(explicit_cue_tag(text))
         if action is None and not explicit and parsed_tag == "wave" and (decision is None or not decision.wave):
@@ -1233,10 +1271,13 @@ class StudioRuntime:
         audio_url = ""
         dur = 3.8
         if wav_path and await asyncio.to_thread(wav_path.exists):
-            dur = await asyncio.to_thread(self.lipsync.load_wav_and_play, wav_path, None, wav_path.name)
+            gen = self.lipsync.playback_generation()
+            dur = await asyncio.to_thread(self.lipsync.load_wav_and_play, wav_path, None, wav_path.name, gen)
+            if dur <= 0.0:
+                return {"type": "speech", "text": clean, "tag": tag, "audioUrl": "", "duration": 0.0, "cancelled": True}
             audio_url = f"/uploads/audio/{wav_path.name}"
             self.spawn(asyncio.to_thread(_prune_audio_cache, 20))
-        self._active_speech = {"text": clean, "start": time.monotonic(), "dur": dur}
+        self._active_speech = {"text": clean, "start": time.monotonic(), "dur": dur, "is_chat": is_chat}
         self.rig.trigger_temp_action(act, duration=max(2.6, dur + 0.6))
         if decision is not None:
             # The reply's autonomous emote starts together with her voice, not before TTS is ready.
@@ -1295,6 +1336,9 @@ class StudioRuntime:
                 act = TAG_TO_STATE["happy"]
         await self.hooks.emit_async("on_ai_reply", self, {"reply": clean, "tag": tag, "action": act})
         if player is not None:
+            if getattr(player, "_cancelled", False):
+                return {"type": "speech", "text": clean, "tag": tag, "audioUrl": "", "segmented": True,
+                        "duration": 0.0, "cancelled": True}, decision
             player.action, player.tag = act, tag
             unvoiced = str((turn if turn is not None else self.ai.last_turn).get("unvoiced") or "").strip()
             if unvoiced:                       # Fish stream broke (or never started): voice the rest classically
@@ -1312,7 +1356,7 @@ class StudioRuntime:
                    "duration": round(est, 2)}
             speech_end = time.monotonic() + est
         else:
-            evt = await self.speak_text(reply, action=act, decision=decision, tag=tag, wav_path=wav_path, synth=False)
+            evt = await self.speak_text(reply, action=act, decision=decision, tag=tag, wav_path=wav_path, synth=False, is_chat=True)
             speech_end = time.monotonic() + float(evt.get("duration") or 3.8)
         fired = self._fire_pending_reply_emote(decision)     # the viewer turn's "on_reply" wave, as she says hi back
         if fired:
@@ -1323,11 +1367,13 @@ class StudioRuntime:
 
     def handle_interrupt(self) -> dict[str, Any]:
         """Graceful barge-in: stop speech cleanly, trigger physical yield reaction, and record exact
-        cutoff point so Hikari knows what she actually finished vs. left unsaid."""
+        cutoff point (for chat replies only) so Hikari knows what she actually finished vs. left unsaid."""
         spoken, unspoken = "", ""
+        from_chat = False
         if self._segment_player is not None:
             if self._segment_player.remaining() > 0.05 or not self._segment_player.task.done():
                 spoken, unspoken = self._segment_player.snapshot_progress()
+                from_chat = True
             self._segment_player.cancel()
             self._segment_player = None
         elif self._active_speech is not None:
@@ -1336,6 +1382,7 @@ class StudioRuntime:
             dur = max(0.25, float(sp_info.get("dur") or 0.0))
             if elapsed < dur * 0.94:
                 spoken, unspoken = _split_spoken_text(str(sp_info.get("text") or ""), elapsed / dur)
+                from_chat = bool(sp_info.get("is_chat"))
         self._active_speech = None
         self.lipsync.stop_playback()
         fn = getattr(self.rig, "trigger_barge_in", None)
@@ -1343,7 +1390,7 @@ class StudioRuntime:
             fn()
         self._interaction_state = "listening"
         interrupted = bool(unspoken)
-        if interrupted and hasattr(self.ai, "record_interruption"):
+        if interrupted and from_chat and hasattr(self.ai, "record_interruption"):
             self.ai.record_interruption(spoken, unspoken)
         return {"interrupted": interrupted, "spoken": spoken, "unspoken": unspoken}
 
@@ -1609,7 +1656,14 @@ def build_app(runtime: StudioRuntime) -> web.Application:
     async def apply_section(sec: str, raw: dict[str, Any]) -> None:
         """Shared by POST /api/config and the WebSocket `patch` message (same allowlist + validation)."""
         if sec == "ai":
+            prev_ai = runtime.config.data.get("ai") or {}
             vals = sanitize_ai_brain_patch(_sanitize_ai_patch(raw))
+            # Never carry a previously saved classic apiKey across a provider/baseUrl change unless replaced explicitly.
+            prov_changed = ("provider" in vals and vals["provider"] != prev_ai.get("provider"))
+            url_changed = ("baseUrl" in vals and str(vals["baseUrl"] or "").strip().rstrip("/")
+                           != str(prev_ai.get("baseUrl") or "").strip().rstrip("/"))
+            if (prov_changed or url_changed) and "apiKey" not in vals and prev_ai.get("apiKey"):
+                vals["apiKey"] = ""
         elif sec == "lipsync":
             vals = sanitize_lipsync_patch(raw)
         elif sec == "memory":
@@ -1936,9 +1990,9 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         await runtime.broadcast_json({"type": "config_sync", "config": public_config(runtime.config.data)})
         return web.json_response({"ok": True, "visemes": runtime.lipsync.visemes})
 
-    async def _json_body(req) -> Any:
+    async def _json_body(req, max_bytes: int = 262_144) -> Any:
         try:
-            return await req.json()
+            return await req.clone(client_max_size=max_bytes).json()
         except web.HTTPRequestEntityTooLarge:
             raise
         except Exception:
@@ -2057,6 +2111,15 @@ def build_app(runtime: StudioRuntime) -> web.Application:
                                       "usedVision": bool(vision), **vision},
                                      status=502)
         runtime.commit_context(ctx, reply, delivered=True)       # both turns were persisted inside AICompanion
+        # Persist live mood + relationship session count (works in browser/CLI mode, not only Tauri shutdown)
+        if hasattr(runtime.memory, "record_session_mood"):
+            st_mood = runtime.decisions.get_mood_state() or {}
+            runtime.spawn(runtime.memory.record_session_mood(
+                str(st_mood.get("label") or "neutral"),
+                float(st_mood.get("valence") or 0.0),
+                float(st_mood.get("arousal") or 0.0),
+                bump_session=bool(ctx is not None and ctx.session_start),
+            ))
         # Emotion decision runs alongside TTS / playback; it never delays her voice.
         decision_task = asyncio.create_task(runtime.decisions.decide(reply, "reply"))
         evt, reply_decision = await runtime.deliver_reply(reply, decision_task, wav_path=pre_voiced, player=player, turn=turn)
@@ -2433,8 +2496,9 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         return web.json_response({"ok": True, "overriddenCount": len(ovr), "overrides": ovr})
 
     def _origin_guard(req) -> web.Response | None:
-        """Local-only control surface: loopback / Tauri origins (reads included) + the loopback Host check."""
-        if not _origin_allowed(req.headers.get("Origin")) or not _host_allowed(req.headers.get("Host"), _local_port(req)):
+        """Local-only control surface: exact-port loopback / Tauri origins + loopback Host check."""
+        port = _local_port(req)
+        if not _origin_allowed(req.headers.get("Origin"), port) or not _host_allowed(req.headers.get("Host"), port):
             return web.json_response({"ok": False, "error": "Origin not allowed"}, status=403)
         return None
 

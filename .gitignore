@@ -14,6 +14,7 @@ settings.json
 # Runtime memory DBs, private uploads & backups
 data/
 uploads/
+scratch/
 web.bak-*/
 *.bak
 *.tmp

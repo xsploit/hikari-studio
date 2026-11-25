@@ -66,9 +66,9 @@ class NativeEngineBridge:
 
     # ------------------------------------------------------------------ robustness
     def _watchdog_loop(self) -> None:
-        """Kill a wedged engine so a blocked pipe read returns (EOF) and the lock is released."""
-        while True:
-            time.sleep(0.5)
+        """Kill a wedged engine so a blocked pipe read returns (EOF) and the lock is released.
+        Exits cleanly when stop() sets _closing so replaced bridges don't retain frame buffers."""
+        while not self._closing.wait(0.5):
             started = self._frame_started
             proc = self._proc
             if started is not None and proc is not None and (time.perf_counter() - started) > FRAME_DEADLINE_SEC:

@@ -37,20 +37,51 @@ export class AvatarGLRenderer {
     if (!gl) throw new Error('WebGL2 required');
     this.gl = gl;
     this._busy = false;
+    this._lost = false;
     this._aspect = 1440 / 1080;
     this._texW = 0;
     this._texH = 0;
 
+    this._initGL();
+    this.resize();
+    window.addEventListener('resize', () => this.resize());
+    canvas.addEventListener('webglcontextlost', (e) => {
+      e.preventDefault();
+      this._lost = true;
+    });
+    canvas.addEventListener('webglcontextrestored', () => {
+      this._lost = false;
+      this._initGL();
+      this.resize();
+    });
+  }
+
+  _initGL() {
+    const gl = this.gl;
+    this._texW = 0;
+    this._texH = 0;
     const compile = (type, src) => {
       const sh = gl.createShader(type);
       gl.shaderSource(sh, src);
       gl.compileShader(sh);
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+        const info = gl.getShaderInfoLog(sh) || 'shader compile failed';
+        gl.deleteShader(sh);
+        throw new Error(info);
+      }
       return sh;
     };
+    const vs = compile(gl.VERTEX_SHADER, VS_SRC);
+    const fs = compile(gl.FRAGMENT_SHADER, FS_SRC);
     const prog = gl.createProgram();
-    gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS_SRC));
-    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS_SRC));
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
     gl.linkProgram(prog);
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(prog) || 'program link failed');
+    }
     this.prog = prog;
 
     const buf = gl.createBuffer();
@@ -63,7 +94,7 @@ export class AvatarGLRenderer {
     const makeTex = () => {
       const t = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, t);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
@@ -75,19 +106,17 @@ export class AvatarGLRenderer {
     this.uScale = gl.getUniformLocation(prog, 'uScale');
     this.uRgb = gl.getUniformLocation(prog, 'uRgb');
     this.uAlpha = gl.getUniformLocation(prog, 'uAlpha');
-    this.resize();
-    window.addEventListener('resize', () => this.resize());
   }
 
   resize() {
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     this.canvas.width = Math.max(1, Math.floor(window.innerWidth * dpr));
     this.canvas.height = Math.max(1, Math.floor(window.innerHeight * dpr));
-    this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    if (!this._lost) this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
   }
 
   async drawPacket(arrayBuf, stageCfg, px = 0, py = 0) {
-    if (this._busy) return;
+    if (this._busy || this._lost || document.hidden) return;
     this._busy = true;
     let bmRgb = null, bmA = null;
     try {
@@ -102,7 +131,7 @@ export class AvatarGLRenderer {
       const [rRgb, rA] = await Promise.allSettled([createImageBitmap(rgbBlob), createImageBitmap(alphaBlob)]);
       if (rRgb.status === 'fulfilled') bmRgb = rRgb.value;
       if (rA.status === 'fulfilled') bmA = rA.value;
-      if (!bmRgb || !bmA) return; // corrupt/partial frame — skip it (finally releases whatever decoded)
+      if (!bmRgb || !bmA || this._lost) return; // corrupt/partial frame or context lost mid-decode
       const bw = bmRgb.width, bh = bmRgb.height;
       this._aspect = bw / bh;
 
@@ -111,20 +140,18 @@ export class AvatarGLRenderer {
       gl.clear(gl.COLOR_BUFFER_BIT);
       gl.useProgram(this.prog);
 
-      // Allocate GPU VRAM storage ONCE per resolution, then stream via texSubImage2D (zero VRAM churn!)
+      // Allocate GPU VRAM storage ONCE per resolution, then stream via texSubImage2D (no per-frame mipmap churn!)
       const realloc = (bw !== this._texW || bh !== this._texH);
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, this.texRgb);
       if (realloc) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bmRgb);
       else gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, bmRgb);
-      gl.generateMipmap(gl.TEXTURE_2D);
       gl.uniform1i(this.uRgb, 0);
 
       gl.activeTexture(gl.TEXTURE1);
       gl.bindTexture(gl.TEXTURE_2D, this.texAlpha);
       if (realloc) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bmA);
       else gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, bmA);
-      gl.generateMipmap(gl.TEXTURE_2D);
       gl.uniform1i(this.uAlpha, 1);
       if (realloc) { this._texW = bw; this._texH = bh; }
 
@@ -187,6 +214,7 @@ export class ProceduralRoomRenderer {
       this.customImg.style.filter = `blur(${Number(stageCfg.roomBlur || 0)}px) brightness(${1 - Number(stageCfg.roomDim || 0)})`;
       this.customImg.style.transform = `scale(1.06) translate(${(-ox * 0.6).toFixed(1)}px, ${(-oy * 0.6).toFixed(1)}px)`;
       ctx.clearRect(0, 0, W, H);
+      this._lastRoom = 'custom';
       this._drawParticles(ctx, W, H, t, stageCfg.particles === 'auto' ? 'dust' : stageCfg.particles);
       return;
     }
