@@ -623,8 +623,8 @@ class WebUiTests(unittest.TestCase):
         self.assertIn("temporalLabel", self.read("js/panels/memory_panel.js"))
         html, app = self.read("index.html"), self.read("js/app.js")
         self.assertIn('id="btn-vision"', html)
-        self.assertIn('title="Look at my screen"', html)
-        for s in ("includeScreen: true", "/api/rig/user-audio", "setVisionArmed"):
+        self.assertIn('id="vision-popover"', html)
+        for s in ("/api/vision/observe", "/api/vision/sources", "/api/rig/user-audio", "startVisionWatch"):
             self.assertIn(s, app)
         ui = self.read("js/ui.js")
         for kw in ("'motion graph'", "prosody:", "backchannel:", "'vocal tags'", "'drama 3'", "'screen vision'",

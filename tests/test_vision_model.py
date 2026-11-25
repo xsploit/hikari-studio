@@ -442,13 +442,51 @@ class ChatVisionRoutingTests(unittest.TestCase):
             st = run(tsw.with_client(rt, go))
             v = dict(rt.config.data["vision"])
         self.assertEqual(st, 200)
-        self.assertEqual(v, {"enabled": True, "model": VISION_MODEL, "providerOrder": "vertex", "mode": "describe"})
+        self.assertEqual(v, {
+            "enabled": True, "model": VISION_MODEL, "providerOrder": "vertex", "mode": "describe",
+            "intervalSec": 10, "source": "desktop", "sourceLabel": "Primary Monitor",
+        })
+
+    def test_vision_sources_and_periodic_observe_dedup_and_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            rt = self._runtime(Path(td))
+            calls = []
+
+            async def fake_desc(url, prompt, **kw):
+                calls.append((url, prompt))
+                return EYE_TEXT, VISION_MODEL
+
+            async def go(cl):
+                r_src = await cl.get("/api/vision/sources")
+                src_d = await r_src.json()
+                r1 = await cl.post("/api/vision/observe", json={"source": "desktop", "force": True})
+                d1 = await r1.json()
+                # Second tick with identical frameHash should skip calling the vision model
+                r2 = await cl.post("/api/vision/observe", json={"source": "desktop"})
+                d2 = await r2.json()
+                # Stop watch clears active state
+                r3 = await cl.post("/api/vision/observe", json={"active": False})
+                d3 = await r3.json()
+                return src_d, d1, d2, d3
+
+            with mock.patch.object(server, "capture_screen_jpeg",
+                                   return_value={"ok": True, "dataUrl": FAKE_JPEG, "frameHash": "0123456789abcdef"}), \
+                 mock.patch.object(server, "describe_screen", side_effect=fake_desc):
+                src_d, d1, d2, d3 = run(tsw.with_client(rt, go))
+        self.assertTrue(src_d["ok"] and len(src_d["sources"]) >= 2)
+        self.assertTrue(d1["ok"] and d1["changed"] and d1["description"] == EYE_TEXT)
+        self.assertTrue(d2["ok"] and d2["skipped"] and not d2["changed"])
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(d3["ok"] and d3["active"] is False)
 
 
 # ------------------------------------------------------------------------------------------ 5. config
 class VisionConfigTests(unittest.TestCase):
     def test_defaults(self) -> None:
-        self.assertEqual(default_config()["vision"], {"enabled": True, "model": "", "providerOrder": "", "mode": "describe"})
+        self.assertEqual(default_config()["vision"], {
+            "enabled": True, "model": "", "providerOrder": "", "mode": "describe",
+            "intervalSec": 10, "source": "desktop", "sourceLabel": "Primary Monitor",
+        })
         self.assertEqual(DEFAULT_VISION_CFG["mode"], "describe")
 
     def test_sanitize_patch(self) -> None:
@@ -464,6 +502,9 @@ class VisionConfigTests(unittest.TestCase):
         self.assertEqual(sanitize_vision_patch({"providerOrder": None}), {"providerOrder": ""})
         self.assertEqual(sanitize_vision_patch({"enabled": "yes"}), {})
         self.assertEqual(sanitize_vision_patch({"enabled": False, "junk": {"x": 1}}), {"enabled": False})
+        self.assertEqual(sanitize_vision_patch({"intervalSec": 1, "source": "window:12345", "sourceLabel": "Chrome"}),
+                         {"intervalSec": 3, "source": "window:12345", "sourceLabel": "Chrome"})
+        self.assertEqual(sanitize_vision_patch({"intervalSec": 999, "source": "bad;source"}), {"intervalSec": 120})
         self.assertEqual(sanitize_vision_patch("nope"), {})
 
     def test_disk_round_trip_sanitizes_mode_and_keeps_model(self) -> None:
@@ -472,12 +513,17 @@ class VisionConfigTests(unittest.TestCase):
             path.write_text(json.dumps({"vision": {"enabled": False, "model": VISION_MODEL, "providerOrder": "vertex,google",
                                                    "mode": "<script>", "junk": "x"}}), encoding="utf-8")
             v = ConfigStore(path).data["vision"]
-            self.assertEqual(v, {"enabled": False, "model": VISION_MODEL, "providerOrder": "vertex,google", "mode": "describe"})
+            self.assertEqual(v, {
+                "enabled": False, "model": VISION_MODEL, "providerOrder": "vertex,google", "mode": "describe",
+                "intervalSec": 10, "source": "desktop", "sourceLabel": "Primary Monitor",
+            })
             store = ConfigStore(path)
             store.patch("vision", sanitize_vision_patch({"mode": "direct"}))
             store.save()
-            self.assertEqual(ConfigStore(path).data["vision"],
-                             {"enabled": False, "model": VISION_MODEL, "providerOrder": "vertex,google", "mode": "direct"})
+            self.assertEqual(ConfigStore(path).data["vision"], {
+                "enabled": False, "model": VISION_MODEL, "providerOrder": "vertex,google", "mode": "direct",
+                "intervalSec": 10, "source": "desktop", "sourceLabel": "Primary Monitor",
+            })
 
     def test_old_settings_without_new_keys_get_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as td:

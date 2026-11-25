@@ -57,7 +57,10 @@ from modules.ambient_presence import AmbientPresenceMonitor
 from modules.lipsync import LiveLipSyncEngine
 from modules.memory_store import CATEGORIES, COMPANION_KINDS, MemoryStore, PinLimitError, temporal_label
 from modules.profiles import ProfileStore
-from modules.screen_vision import capture_screen_jpeg, describe_screen, wants_screen_vision
+from modules.screen_vision import (
+    capture_screen_jpeg, describe_screen, dhash_distance, dhash_from_data_url,
+    list_capture_sources, wants_screen_vision,
+)
 from modules import fish_voices
 from modules.vercel_gateway import (
     pick_vision_model, catalog_entries, evaluation_catalog, list_chat_models_and_providers, pick_gateway_model,
@@ -555,6 +558,8 @@ class StudioRuntime:
         self._subtitle: str = ""
         self._ai_busy: bool = False
         self._chat_inflight = 0
+        self._vision_watch_active: bool = False
+        self._live_screen_obs: dict[str, Any] = {}
         self._frame_in_flight = False
         self._telem_future: Any = None
         self._client_sends: dict[Any, Any] = {}
@@ -1618,14 +1623,23 @@ def build_app(runtime: StudioRuntime) -> web.Application:
     capture_lock = asyncio.Lock()
     idle_lock = asyncio.Lock()
 
-    async def capture_screen():
-        if (runtime.config.data.get("vision") or {}).get("enabled", True) is not True:
+    async def capture_screen(source: str | None = None):
+        vcfg = runtime.config.data.get("vision") or {}
+        if vcfg.get("enabled", True) is not True:
             return {"ok": False, "error": "Screen Vision is disabled"}, 403
         if capture_lock.locked():
             return {"ok": False, "error": "Screen capture already in progress"}, 429
+        src = str(source or vcfg.get("source") or "desktop").strip()
+        def _do_grab():
+            if src and src not in ("desktop", "browser"):
+                try:
+                    return capture_screen_jpeg(source=src)
+                except TypeError:
+                    return capture_screen_jpeg()
+            return capture_screen_jpeg()
         async with capture_lock:
             try:
-                cap = await asyncio.to_thread(capture_screen_jpeg)
+                cap = await asyncio.to_thread(_do_grab)
             except Exception as exc:
                 cap = {"ok": False, "error": f"capture failed ({exc.__class__.__name__})"}
             if (runtime.config.data.get("vision") or {}).get("enabled", True) is not True:
@@ -2065,6 +2079,14 @@ def build_app(runtime: StudioRuntime) -> web.Application:
                         # let the selected vision model answer this screen-look turn directly instead of silent no-op.
                         image_data_url, vision, gen_kw, eye = _plan_vision(
                             cap["dataUrl"], msg, force_direct=(not has_live_chat and runtime.ai.gateway.configured))
+                elif getattr(runtime, "_vision_watch_active", False):
+                    obs = getattr(runtime, "_live_screen_obs", None) or {}
+                    vcfg_w = runtime.config.data.get("vision") or {}
+                    max_age = max(45.0, float(vcfg_w.get("intervalSec", 10)) * 3.5)
+                    if (vcfg_w.get("enabled", True) is True and obs.get("text")
+                            and (time.monotonic() - float(obs.get("at", 0.0))) <= max_age):
+                        gen_kw["screen_observation"] = str(obs["text"])
+                        vision = {"visionMode": "watch", "visionModel": str(obs.get("model") or "")}
                 try:
                     ctx = await runtime.prompt_context(msg, greeting=greeting)   # (the Vision Eye runs meanwhile)
                 except BaseException:
@@ -2543,6 +2565,96 @@ def build_app(runtime: StudioRuntime) -> web.Application:
         cap, status = await capture_screen()
         return web.json_response(cap, status=status)
 
+    async def api_vision_sources(req):
+        """GET /api/vision/sources: list selectable capture targets (monitors, open browser/app windows, OS picker)."""
+        bad = _origin_guard(req)
+        if bad is not None:
+            return bad
+        vcfg = runtime.config.data.get("vision") or {}
+        sources = await asyncio.to_thread(list_capture_sources)
+        obs = getattr(runtime, "_live_screen_obs", None) or {}
+        return web.json_response({
+            "ok": True,
+            "sources": sources,
+            "current": {
+                "source": str(vcfg.get("source") or "desktop"),
+                "sourceLabel": str(vcfg.get("sourceLabel") or "Primary Monitor"),
+                "intervalSec": int(vcfg.get("intervalSec", 10)),
+                "active": bool(getattr(runtime, "_vision_watch_active", False)),
+                "lastObservation": str(obs.get("text") or ""),
+                "lastModel": str(obs.get("model") or ""),
+            },
+        })
+
+    vision_obs_lock = asyncio.Lock()
+
+    async def api_vision_observe(req):
+        """POST /api/vision/observe: periodic Eye Watch tick — capture source, run vision model silently if changed,
+        and cache the observation for chat & live Drama 3 context (NEVER generates unsolicited TTS audio)."""
+        bad = _origin_guard(req)
+        if bad is not None:
+            return bad
+        body = await _json_body(req.clone(client_max_size=6 * 1024 * 1024))
+        if not isinstance(body, dict):
+            body = {}
+        if body.get("active") is False:
+            runtime._vision_watch_active = False
+            runtime._live_screen_obs = {}
+            return web.json_response({"ok": True, "active": False})
+        vcfg = runtime.config.data.get("vision") or {}
+        if vcfg.get("enabled", True) is not True:
+            return web.json_response({"ok": False, "error": "Screen Vision is disabled"}, status=403)
+        if vision_obs_lock.locked():
+            return web.json_response({"ok": True, "skipped": True, "busy": True})
+        src = str(body.get("source") or vcfg.get("source") or "desktop").strip()
+        src_label = str(body.get("sourceLabel") or vcfg.get("sourceLabel") or "Primary Monitor").strip()[:80]
+        force = body.get("force") is True
+        img_url = str(body.get("imageDataUrl") or "").strip()
+        async with vision_obs_lock:
+            runtime._vision_watch_active = True
+            source_fallback = False
+            if img_url.startswith("data:image/"):
+                data_url = img_url
+                fhash = await asyncio.to_thread(dhash_from_data_url, data_url)
+            else:
+                cap, status = await capture_screen(source=src)
+                if status != 200 or not cap.get("dataUrl"):
+                    return web.json_response(cap, status=status)
+                data_url = str(cap["dataUrl"])
+                fhash = str(cap.get("frameHash") or "")
+                source_fallback = bool(cap.get("sourceFallback"))
+            prev = getattr(runtime, "_live_screen_obs", None) or {}
+            if (not force and prev.get("text") and prev.get("source") == src and fhash
+                    and dhash_distance(fhash, str(prev.get("hash") or "")) <= 4):
+                prev["at"] = time.monotonic()
+                return web.json_response({
+                    "ok": True, "active": True, "changed": False, "skipped": True,
+                    "description": str(prev["text"]), "model": str(prev.get("model") or ""),
+                    "source": src, "sourceLabel": src_label, "sourceFallback": source_fallback,
+                })
+            model = pick_vision_model(vcfg.get("model"))
+            order = vcfg.get("providerOrder") or ""
+            prompt = str(body.get("prompt") or "Briefly describe what is currently visible on the user's screen so the companion stays aware.").strip()[:300]
+            desc, used_vmodel = await describe_screen(
+                data_url, prompt, gateway=runtime.ai.gateway, model=model, provider_order=order,
+            )
+            if not desc:
+                return web.json_response({
+                    "ok": False, "active": True,
+                    "error": "Vision model returned no description (check AI Gateway key / vision model)",
+                    "model": used_vmodel,
+                }, status=502)
+            changed = desc != str(prev.get("text") or "")
+            runtime._live_screen_obs = {
+                "text": desc, "model": used_vmodel, "at": time.monotonic(),
+                "source": src, "sourceLabel": src_label, "hash": fhash,
+            }
+            return web.json_response({
+                "ok": True, "active": True, "changed": changed, "skipped": False,
+                "description": desc, "model": used_vmodel,
+                "source": src, "sourceLabel": src_label, "sourceFallback": source_fallback,
+            })
+
     async def api_fish_status(req):
         bad = _origin_guard(req)
         if bad is not None:
@@ -2847,8 +2959,13 @@ def build_app(runtime: StudioRuntime) -> web.Application:
                 recap = await runtime.memory.continuity_recap(8)
             except Exception:
                 recap = ""
-            prompt = compose_session_prompt(runtime.ai.persona, ctx.pinned if ctx else "", ctx.dynamic if ctx else "",
-                                            recap)
+            dyn = ctx.dynamic if ctx else ""
+            if getattr(runtime, "_vision_watch_active", False):
+                obs = getattr(runtime, "_live_screen_obs", None) or {}
+                if obs.get("text") and (time.monotonic() - float(obs.get("at", 0.0))) <= 120.0:
+                    scr_line = f"[Current screen view ({obs.get('sourceLabel') or 'screen'}): {obs['text']}]"
+                    dyn = (dyn + "\n" + scr_line).strip() if dyn else scr_line
+            prompt = compose_session_prompt(runtime.ai.persona, ctx.pinned if ctx else "", dyn, recap)
             try:
                 session = await runtime.fish_duplex.start_session(
                     mode=mode, persona=prompt,
@@ -3057,6 +3174,8 @@ def build_app(runtime: StudioRuntime) -> web.Application:
     app.router.add_get("/api/fish/status", api_fish_status)
     app.router.add_post("/api/rig/user-audio", api_rig_user_audio)
     app.router.add_post("/api/vision/capture", api_vision_capture)
+    app.router.add_get("/api/vision/sources", api_vision_sources)
+    app.router.add_post("/api/vision/observe", api_vision_observe)
     app.router.add_get("/api/profiles", api_profiles_list)
     app.router.add_post("/api/profiles", api_profiles_save)
     app.router.add_post("/api/profiles/{profile_id}/activate", api_profiles_activate)

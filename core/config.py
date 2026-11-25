@@ -276,13 +276,22 @@ FRAME_SECTIONS = ("stage", "camera", "shader", "rig", "visemes")
 # for the vision model; mode "describe" = Vision Eye summarizes the screen into the turn context so the main chat
 # model (even a text-only one such as DeepSeek) replies in character; "direct" = the vision model answers the turn.
 VISION_MODES = ("describe", "direct")
-DEFAULT_VISION_CFG: dict[str, Any] = {"enabled": True, "model": "", "providerOrder": "", "mode": "describe"}
+DEFAULT_VISION_CFG: dict[str, Any] = {
+    "enabled": True,
+    "model": "",
+    "providerOrder": "",
+    "mode": "describe",
+    "intervalSec": 10,
+    "source": "desktop",
+    "sourceLabel": "Primary Monitor",
+}
 _VISION_PROVIDER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_VISION_SOURCE_RE = re.compile(r"^(?:desktop|browser|monitor:[1-8]|window:[0-9]{1,18})$")
 
 
 def sanitize_vision_patch(values: Any) -> dict[str, Any]:
     """`vision` section: bool enabled, bounded routed model id ("" = Auto), comma-separated provider ids,
-    mode in VISION_MODES (anything else -> "describe"). Unknown keys are dropped."""
+    mode in VISION_MODES (anything else -> "describe"), intervalSec (3..120), source, sourceLabel."""
     if not isinstance(values, dict):
         return {}
     out: dict[str, Any] = {}
@@ -310,6 +319,20 @@ def sanitize_vision_patch(values: Any) -> dict[str, Any]:
         mode = values.get("mode")
         mode = mode.strip().lower() if isinstance(mode, str) else ""
         out["mode"] = mode if mode in VISION_MODES else "describe"
+    if "intervalSec" in values and not isinstance(values.get("intervalSec"), bool):
+        try:
+            iv = int(round(float(values["intervalSec"])))
+            out["intervalSec"] = max(3, min(120, iv))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    if "source" in values and isinstance(values.get("source"), str):
+        src = values["source"].strip()
+        if _VISION_SOURCE_RE.fullmatch(src):
+            out["source"] = src
+    if "sourceLabel" in values and isinstance(values.get("sourceLabel"), str):
+        lbl = " ".join(values["sourceLabel"].split())[:80]
+        if lbl:
+            out["sourceLabel"] = lbl
     return out
 
 

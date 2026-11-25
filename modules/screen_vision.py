@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ctypes
+from ctypes import wintypes
 import io
 import re
+import sys
 import unicodedata
 from typing import Any
 
@@ -64,29 +67,210 @@ def _grab_pil() -> Any:
     return ImageGrab.grab()     # primary monitor
 
 
-def _grab_mss() -> Any:
+def _grab_mss(monitor_idx: int = 1) -> Any:
     import mss                  # optional fallback
     from PIL import Image
     with mss.mss() as sct:
-        mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-        shot = sct.grab(mon)
+        idx = monitor_idx if 1 <= monitor_idx < len(sct.monitors) else (1 if len(sct.monitors) > 1 else 0)
+        shot = sct.grab(sct.monitors[idx])
         return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
 
 
-def capture_screen_jpeg(*, max_dim: int = 1024, quality: int = 76) -> dict[str, Any]:
-    """Capture the primary monitor -> proportional downscale to <= max_dim -> JPEG data URL.
-    {"ok": True, "width", "height", "mime": "image/jpeg", "dataUrl", "bytes"} or {"ok": False, "error"};
-    never raises (headless session, locked desktop, missing Pillow...)."""
+_BROWSER_HINTS = ("chrome", "edge", "firefox", "brave", "opera", "vivaldi", "arc", "browser", "youtube", "twitch")
+_SKIP_TITLES = frozenset({"program manager", "hikari studio", "windows input experience", "settings", "msctfime ui"})
+
+
+def list_capture_sources() -> list[dict[str, str]]:
+    """Return selectable screen capture targets: primary desktop, individual monitors, open browser/app windows,
+    plus the OS/browser display picker option."""
+    sources: list[dict[str, str]] = [{"id": "desktop", "kind": "desktop", "label": "Primary Monitor"}]
+    try:
+        import mss
+        with mss.mss() as sct:
+            if len(sct.monitors) > 2:
+                for idx, mon in enumerate(sct.monitors[1:], start=1):
+                    sources.append({
+                        "id": f"monitor:{idx}",
+                        "kind": "monitor",
+                        "label": f"Monitor {idx} ({mon['width']}×{mon['height']})",
+                    })
+    except Exception:
+        pass
+    sources.append({"id": "browser", "kind": "browser", "label": "Browser Tab / Window Picker"})
+    if sys.platform == "win32":
+        try:
+            user32 = ctypes.windll.user32
+            wins: list[tuple[int, int, str]] = []
+            rect = wintypes.RECT()
+
+            @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            def _enum_cb(hwnd: int, _lp: int) -> bool:
+                if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+                    return True
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length <= 0 or length > 256:
+                    return True
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = " ".join(buf.value.split()).strip()
+                if not title or title.lower() in _SKIP_TITLES:
+                    return True
+                if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    return True
+                w = rect.right - rect.left
+                h = rect.bottom - rect.top
+                if w < 180 or h < 120:
+                    return True
+                tl = title.lower()
+                is_browser = 0 if any(k in tl for k in _BROWSER_HINTS) else 1
+                wins.append((is_browser, int(hwnd), title[:72]))
+                return True
+
+            user32.EnumWindows(_enum_cb, 0)
+            wins.sort(key=lambda item: (item[0], item[2].lower()))
+            for is_br, hwnd, title in wins[:24]:
+                sources.append({
+                    "id": f"window:{hwnd}",
+                    "kind": "window",
+                    "label": ("🌐 " if is_br == 0 else "🪟 ") + title,
+                })
+        except Exception:
+            pass
+    return sources
+
+
+def _grab_window(hwnd: int) -> Any:
+    """Capture a specific Windows HWND via PrintWindow(PW_RENDERFULLCONTENT=2), falling back to screen-rect crop."""
+    if sys.platform != "win32" or hwnd <= 0:
+        return None
+    from PIL import Image
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    if not user32.IsWindow(hwnd) or not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+        return None
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    w = rect.right - rect.left
+    h = rect.bottom - rect.top
+    if w < 32 or h < 32 or w > 8192 or h > 8192:
+        return None
+    hdc_win = user32.GetWindowDC(hwnd)
+    if hdc_win:
+        hdc_mem = gdi32.CreateCompatibleDC(hdc_win)
+        hbmp = gdi32.CreateCompatibleBitmap(hdc_win, w, h)
+        old = gdi32.SelectObject(hdc_mem, hbmp) if hbmp else None
+        try:
+            # PW_RENDERFULLCONTENT = 2 captures GPU-accelerated Chrome/Edge/Electron windows cleanly
+            ok = user32.PrintWindow(hwnd, hdc_mem, 2) or user32.PrintWindow(hwnd, hdc_mem, 0)
+            if ok and hbmp:
+                class BITMAPINFOHEADER(ctypes.Structure):
+                    _fields_ = [
+                        ("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG), ("biHeight", wintypes.LONG),
+                        ("biPlanes", wintypes.WORD), ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                        ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                        ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD), ("biClrImportant", wintypes.DWORD),
+                    ]
+                bmi = BITMAPINFOHEADER()
+                bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+                bmi.biWidth = w
+                bmi.biHeight = -h  # top-down DIB
+                bmi.biPlanes = 1
+                bmi.biBitCount = 32
+                bmi.biCompression = 0  # BI_RGB
+                raw = ctypes.create_string_buffer(w * h * 4)
+                if gdi32.GetDIBits(hdc_mem, hbmp, 0, h, raw, ctypes.byref(bmi), 0):
+                    im = Image.frombuffer("RGB", (w, h), raw.raw, "raw", "BGRX", 0, 1).copy()
+                    # Check that PrintWindow didn't return an all-black frame
+                    ext = im.convert("L").getextrema()
+                    if ext and ext[1] > 4:
+                        return im
+        finally:
+            if old:
+                gdi32.SelectObject(hdc_mem, old)
+            if hbmp:
+                gdi32.DeleteObject(hbmp)
+            if hdc_mem:
+                gdi32.DeleteDC(hdc_mem)
+            user32.ReleaseDC(hwnd, hdc_win)
+    # Fallback: capture exact window bounding rectangle from screen
+    try:
+        import mss
+        with mss.mss() as sct:
+            shot = sct.grab({"left": int(rect.left), "top": int(rect.top), "width": int(w), "height": int(h)})
+            return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+    except Exception:
+        return None
+
+
+def compute_dhash(img: Any) -> str:
+    """Fast 64-bit difference hash (16 hex chars) for detecting whether a watched screen actually changed."""
+    try:
+        from PIL import Image
+        small = img.convert("L").resize((9, 8), Image.BILINEAR)
+        px = list(small.getdata())
+        bits = 0
+        for row in range(8):
+            off = row * 9
+            for col in range(8):
+                bits = (bits << 1) | (1 if px[off + col] > px[off + col + 1] else 0)
+        return f"{bits:016x}"
+    except Exception:
+        return ""
+
+
+def dhash_from_data_url(data_url: str) -> str:
+    try:
+        from PIL import Image
+        _, b64 = data_url.split(",", 1)
+        im = Image.open(io.BytesIO(base64.b64decode(b64)))
+        return compute_dhash(im)
+    except Exception:
+        return ""
+
+
+def dhash_distance(h1: str, h2: str) -> int:
+    if not h1 or not h2 or len(h1) != len(h2):
+        return 64
+    try:
+        return (int(h1, 16) ^ int(h2, 16)).bit_count()
+    except ValueError:
+        return 64
+
+
+def capture_screen_jpeg(*, max_dim: int = 1024, quality: int = 76, source: str = "desktop") -> dict[str, Any]:
+    """Capture the selected source ("desktop", "monitor:<idx>", or "window:<hwnd>") -> downscale -> JPEG data URL.
+    {"ok": True, "width", "height", "mime": "image/jpeg", "dataUrl", "bytes", "frameHash", "source", "sourceFallback"}
+    or {"ok": False, "error"}; never raises."""
     try:
         max_dim = max(64, min(4096, int(max_dim)))
         quality = max(30, min(95, int(quality)))
     except (TypeError, ValueError, OverflowError):
         max_dim, quality = 1024, 76
+    src = str(source or "desktop").strip()
     img, errors = None, []
-    for label, grab in (("PIL.ImageGrab", _grab_pil), ("mss", _grab_mss)):
+    fallback = False
+
+    grabbers: list[tuple[str, Any]] = []
+    if src.startswith("window:"):
+        try:
+            hwnd = int(src.split(":", 1)[1])
+            grabbers.append((f"window:{hwnd}", lambda h=hwnd: _grab_window(h)))
+        except ValueError:
+            pass
+    elif src.startswith("monitor:"):
+        try:
+            midx = int(src.split(":", 1)[1])
+            grabbers.append((f"mss:monitor:{midx}", lambda m=midx: _grab_mss(m)))
+        except ValueError:
+            pass
+    grabbers.extend([("PIL.ImageGrab", _grab_pil), ("mss", lambda: _grab_mss(1))])
+
+    for idx_g, (label, grab) in enumerate(grabbers):
         try:
             img = grab()
             if img is not None and img.size[0] > 0 and img.size[1] > 0:
+                fallback = idx_g > 0 and (src.startswith("window:") or src.startswith("monitor:"))
                 break
             img = None
         except Exception as exc:          # ImportError, OSError (no display), ...
@@ -102,6 +286,7 @@ def capture_screen_jpeg(*, max_dim: int = 1024, quality: int = 76) -> dict[str, 
             img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
         if img.mode != "RGB":
             img = img.convert("RGB")
+        fhash = compute_dhash(img)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=quality, optimize=True)
         while buf.tell() > 4 * 1024 * 1024:
@@ -113,7 +298,8 @@ def capture_screen_jpeg(*, max_dim: int = 1024, quality: int = 76) -> dict[str, 
     except Exception as exc:
         return {"ok": False, "error": f"screen encode failed ({exc.__class__.__name__})"}
     return {"ok": True, "width": img.size[0], "height": img.size[1], "mime": "image/jpeg",
-            "dataUrl": "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii"), "bytes": len(raw)}
+            "dataUrl": "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii"), "bytes": len(raw),
+            "frameHash": fhash, "source": src, "sourceFallback": fallback}
 
 
 def clean_description(text: Any, limit: int = VISION_DESC_MAX_CHARS) -> str:

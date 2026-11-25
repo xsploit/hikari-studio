@@ -240,6 +240,7 @@ async function boot() {
         btnMic.classList.remove('active');
       }
       updateStatus();
+      if (st.connected && st.agentMode !== 'speaking') flushPendingFishVision();
       try { syncUserAudioMeter(st); } catch { stopUserAudioMeter(); }
       const sessionId = st.connected ? store.fishCall.sessionId : '';
       if (sessionId && sessionId !== lastFishSession) {
@@ -256,7 +257,14 @@ async function boot() {
     },
     onMessage: async ({ role, text }) => {
       if (!text) return;
+      if (role !== 'agent' && text.startsWith('[Silent screen context')) {
+        suppressSilentFishUntil = Date.now() + 3500;
+        return;
+      }
       if (role === 'agent') {
+        if (Date.now() < suppressSilentFishUntil && store.fishCall?.agentMode !== 'speaking') {
+          return;
+        }
         // Let the viewer's line land first so the backend pairs both sides into one saved turn (bounded wait).
         await Promise.race([fishUserPost, new Promise((r) => setTimeout(r, 1500))]);
         const r = await fetch('/api/fish/emote', {
@@ -767,13 +775,13 @@ async function boot() {
 
   async function sendChatText(message, { includeScreen = false } = {}) {
     if (!message) return;
-    const look = includeScreen || visionArmed;
-    if (look) setVisionArmed(false);           // one look per arm
-    if (store.fishCall.connected && !look) {
+    if (store.fishCall.connected) {
+      // Never bypass an active Drama 3 / Live 3 call to /api/chat (prevents overlapping TTS voice streams!).
       store.fishCall.sendMessage(message);
       showSubtitle('you', message, 3.5);
       return;
     }
+    const look = Boolean(includeScreen);
     showSubtitle(look ? 'looking' : 'thinking', look ? 'Looking at your screen…' : '…', 10.0);
     btnVision.classList.toggle('busy', look);
     try {
@@ -792,25 +800,272 @@ async function boot() {
     }
   }
 
-  /* ───────── Screen Vision (eye button): empty input → look now; otherwise arm it for the next message ───────── */
+  /* ───────── Continuous Screen Vision Watch (Eye button): click = ON/OFF every X sec · right-click = source & interval ───────── */
   const btnVision = document.getElementById('btn-vision');
-  let visionArmed = false;
-  function setVisionArmed(on) {
-    visionArmed = Boolean(on);
-    btnVision.classList.toggle('armed', visionArmed);
-    btnVision.setAttribute('aria-pressed', String(visionArmed));
-    btnVision.title = visionArmed ? 'Screen look armed — your next message includes your screen (click to cancel)' : 'Look at my screen';
+  const visionPop = document.getElementById('vision-popover');
+  const visionPopBadge = document.getElementById('vision-pop-badge');
+  const visionSourceSel = document.getElementById('vision-source-select');
+  const visionIntervalSel = document.getElementById('vision-interval-select');
+  const visionLastObsEl = document.getElementById('vision-last-obs');
+  const btnVisionRefresh = document.getElementById('btn-vision-refresh');
+  const btnVisionPopToggle = document.getElementById('btn-vision-pop-toggle');
+  const btnVisionPopSettings = document.getElementById('btn-vision-pop-settings');
+
+  let visionWatching = false;
+  let visionTimer = null;
+  let visionTickInFlight = false;
+  let visionLastSentText = '';
+  let pendingFishVisionObs = '';
+  let suppressSilentFishUntil = 0;
+  let browserStream = null;
+  let browserVideo = null;
+  let browserCanvas = null;
+
+  function flushPendingFishVision() {
+    if (!pendingFishVisionObs || !store.fishCall?.connected) return;
+    if (store.fishCall.sendSilentContext(pendingFishVisionObs)) {
+      suppressSilentFishUntil = Date.now() + 3500;
+      visionLastSentText = pendingFishVisionObs;
+      pendingFishVisionObs = '';
+    }
   }
-  btnVision.addEventListener('click', () => {
-    if (store.config?.vision && store.config.vision.enabled === false) {
+
+  function stopBrowserCaptureStream() {
+    if (browserStream) {
+      try { browserStream.getTracks().forEach((t) => t.stop()); } catch {}
+      browserStream = null;
+    }
+    if (browserVideo) {
+      try { browserVideo.srcObject = null; } catch {}
+      browserVideo = null;
+    }
+  }
+
+  async function ensureBrowserCaptureStream() {
+    if (browserStream && browserStream.active) return true;
+    stopBrowserCaptureStream();
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      showSubtitle('vision', 'Browser screen picker unavailable here — pick a window or monitor instead', 4.5);
+      return false;
+    }
+    try {
+      browserStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 2, max: 5 } }, audio: false });
+      const track = browserStream.getVideoTracks()[0];
+      if (track) track.addEventListener('ended', () => { if (visionWatching && (store.config?.vision?.source === 'browser')) stopVisionWatch(true); });
+      browserVideo = document.createElement('video');
+      browserVideo.muted = true;
+      browserVideo.playsInline = true;
+      browserVideo.srcObject = browserStream;
+      await browserVideo.play();
+      return true;
+    } catch {
+      stopBrowserCaptureStream();
+      return false;
+    }
+  }
+
+  function grabBrowserFrameDataUrl() {
+    if (!browserVideo || !browserVideo.videoWidth || !browserVideo.videoHeight) return '';
+    const maxDim = 1024;
+    const scale = Math.min(1, maxDim / Math.max(browserVideo.videoWidth, browserVideo.videoHeight));
+    const w = Math.max(1, Math.round(browserVideo.videoWidth * scale));
+    const h = Math.max(1, Math.round(browserVideo.videoHeight * scale));
+    if (!browserCanvas) browserCanvas = document.createElement('canvas');
+    browserCanvas.width = w;
+    browserCanvas.height = h;
+    const ctx2d = browserCanvas.getContext('2d');
+    ctx2d.drawImage(browserVideo, 0, 0, w, h);
+    return browserCanvas.toDataURL('image/jpeg', 0.76);
+  }
+
+  function syncVisionUi() {
+    const vcfg = store.config?.vision || {};
+    const iv = Math.max(3, Math.min(120, Number(vcfg.intervalSec || 10)));
+    const lbl = vcfg.sourceLabel || 'Primary Monitor';
+    btnVision.classList.toggle('armed', visionWatching);
+    btnVision.setAttribute('aria-pressed', String(visionWatching));
+    btnVision.title = visionWatching
+      ? `Watching ${lbl} every ${iv}s · Click to stop · Right-click to change source`
+      : `Watch my screen (${lbl}, every ${iv}s) · Click: ON/OFF · Right-click: source & interval`;
+    if (visionPopBadge) {
+      visionPopBadge.textContent = visionWatching ? `ON · ${iv}s` : 'OFF';
+      visionPopBadge.classList.toggle('on', visionWatching);
+    }
+    if (btnVisionPopToggle) btnVisionPopToggle.textContent = visionWatching ? 'Stop watching' : 'Start watching';
+    if (visionIntervalSel && visionIntervalSel.value !== String(iv)) visionIntervalSel.value = String(iv);
+  }
+
+  async function refreshVisionSources() {
+    if (!visionSourceSel) return;
+    try {
+      const resp = await fetch('/api/vision/sources', { cache: 'no-store' });
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) return;
+      const vcfg = store.config?.vision || {};
+      const curSrc = vcfg.source || data.current?.source || 'desktop';
+      const curLbl = vcfg.sourceLabel || data.current?.sourceLabel || 'Primary Monitor';
+      visionSourceSel.innerHTML = '';
+      let found = false;
+      for (const s of data.sources || []) {
+        const opt = document.createElement('option');
+        opt.value = s.id;
+        opt.textContent = s.label;
+        if (s.id === curSrc) { opt.selected = true; found = true; }
+        visionSourceSel.appendChild(opt);
+      }
+      if (!found && curSrc) {
+        const opt = document.createElement('option');
+        opt.value = curSrc;
+        opt.textContent = curLbl;
+        opt.selected = true;
+        visionSourceSel.prepend(opt);
+      }
+      if (data.current?.lastObservation && visionLastObsEl) {
+        visionLastObsEl.textContent = data.current.lastObservation;
+      }
+    } catch {}
+  }
+
+  async function runVisionTick(force = false) {
+    if (!visionWatching || visionTickInFlight) return;
+    const vcfg = store.config?.vision || {};
+    if (vcfg.enabled === false) { stopVisionWatch(false); return; }
+    visionTickInFlight = true;
+    btnVision.classList.add('busy');
+    try {
+      const src = vcfg.source || 'desktop';
+      const srcLabel = vcfg.sourceLabel || 'Primary Monitor';
+      const payload = { source: src, sourceLabel: srcLabel, force: Boolean(force) };
+      if (src === 'browser') {
+        const dataUrl = grabBrowserFrameDataUrl();
+        if (!dataUrl) return;
+        payload.imageDataUrl = dataUrl;
+      }
+      const resp = await fetch('/api/vision/observe', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const res = await resp.json().catch(() => ({}));
+      if (!resp.ok || !res.ok) {
+        if (force && res.error) showSubtitle('vision', res.error, 4.5);
+        return;
+      }
+      if (res.description && visionLastObsEl) {
+        visionLastObsEl.textContent = res.description;
+      }
+      if (res.description && (res.changed || force) && res.description !== visionLastSentText) {
+        if (store.fishCall?.connected) {
+          if (store.fishCall.sendSilentContext(res.description)) {
+            suppressSilentFishUntil = Date.now() + 3500;
+            visionLastSentText = res.description;
+            pendingFishVisionObs = '';
+          } else {
+            // She is mid-sentence — queue and deliver silently once she stops speaking.
+            pendingFishVisionObs = res.description;
+          }
+        } else {
+          visionLastSentText = res.description;
+        }
+      }
+    } catch {} finally {
+      visionTickInFlight = false;
+      btnVision.classList.remove('busy');
+    }
+  }
+
+  function scheduleVisionLoop() {
+    if (visionTimer) { clearInterval(visionTimer); visionTimer = null; }
+    if (!visionWatching) return;
+    const iv = Math.max(3, Math.min(120, Number(store.config?.vision?.intervalSec || 10)));
+    visionTimer = setInterval(() => { runVisionTick(false); }, iv * 1000);
+  }
+
+  async function startVisionWatch() {
+    const vcfg = store.config?.vision || {};
+    if (vcfg.enabled === false) {
       showSubtitle('vision off', 'Screen Vision is off — enable it in Voice & Brain → Chat & Speech', 4.0);
       return;
     }
-    const text = document.getElementById('chat-input').value.trim();
-    if (visionArmed) { setVisionArmed(false); return; }
-    if (!text) { sendChatText('Look at my screen', { includeScreen: true }); return; }
-    setVisionArmed(true);
+    if ((vcfg.source || 'desktop') === 'browser') {
+      const ok = await ensureBrowserCaptureStream();
+      if (!ok) return;
+    }
+    visionWatching = true;
+    visionLastSentText = '';
+    pendingFishVisionObs = '';
+    syncVisionUi();
+    const iv = Math.max(3, Math.min(120, Number(vcfg.intervalSec || 10)));
+    const lbl = vcfg.sourceLabel || 'Primary Monitor';
+    showSubtitle('vision on', `Watching ${lbl} every ${iv}s (right-click eye to change)`, 3.2);
+    scheduleVisionLoop();
+    runVisionTick(true);
+  }
+
+  function stopVisionWatch(notify = true) {
+    visionWatching = false;
+    pendingFishVisionObs = '';
+    if (visionTimer) { clearInterval(visionTimer); visionTimer = null; }
+    stopBrowserCaptureStream();
+    btnVision.classList.remove('busy');
+    syncVisionUi();
+    fetch('/api/vision/observe', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ active: false }),
+    }).catch(() => {});
+    if (notify) showSubtitle('vision off', 'Screen Vision stopped', 2.2);
+  }
+
+  function closeVisionPop() { if (visionPop) visionPop.hidden = true; }
+  async function toggleVisionPop() {
+    if (!visionPop) return;
+    const open = visionPop.hidden;
+    closeEmotes();
+    visionPop.hidden = !open;
+    if (open) {
+      syncVisionUi();
+      await refreshVisionSources();
+    }
+  }
+
+  btnVision.addEventListener('click', () => {
+    if (visionWatching) stopVisionWatch(true);
+    else startVisionWatch();
   });
+  btnVision.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    toggleVisionPop();
+  });
+  btnVisionRefresh?.addEventListener('click', () => refreshVisionSources());
+  btnVisionPopToggle?.addEventListener('click', () => {
+    if (visionWatching) stopVisionWatch(true);
+    else startVisionWatch();
+  });
+  btnVisionPopSettings?.addEventListener('click', () => { closeVisionPop(); openSettings('voice'); });
+  visionSourceSel?.addEventListener('change', async () => {
+    const src = visionSourceSel.value || 'desktop';
+    const lbl = visionSourceSel.options[visionSourceSel.selectedIndex]?.textContent || src;
+    store.patch('vision', { source: src, sourceLabel: lbl });
+    if (src !== 'browser') stopBrowserCaptureStream();
+    syncVisionUi();
+    if (visionWatching) {
+      if (src === 'browser' && !(await ensureBrowserCaptureStream())) { stopVisionWatch(false); return; }
+      visionLastSentText = '';
+      runVisionTick(true);
+    }
+  });
+  visionIntervalSel?.addEventListener('change', () => {
+    const iv = Math.max(3, Math.min(120, Number(visionIntervalSel.value) || 10));
+    store.patch('vision', { intervalSec: iv });
+    syncVisionUi();
+    if (visionWatching) scheduleVisionLoop();
+  });
+  document.addEventListener('pointerdown', (e) => {
+    if (visionPop && !visionPop.hidden && !visionPop.contains(e.target) && !btnVision.contains(e.target)) {
+      closeVisionPop();
+    }
+  });
+  // Keep watch loop synced if the user edits intervalSec / source from Settings panel
+  store.onPatchVision = () => { syncVisionUi(); if (visionWatching) scheduleVisionLoop(); };
 
   /* ───────── Live Call → visual backchanneling: throttled (~4 Hz) mic RMS to /api/rig/user-audio ───────── */
   let meter = null;

@@ -245,6 +245,17 @@ export class FishCallManager {
     return true;
   }
 
+  sendSilentContext(text) {
+    if (!this.session || !this.connected || !text || !text.trim()) return false;
+    // Never interrupt or talk over Hikari while she is speaking.
+    if (this.agentMode === 'speaking' || this.session.isSpeaking) return false;
+    this.session.sendUserMessage(
+      `[Silent screen context — do NOT reply out loud or acknowledge this; just keep it in mind when I talk]: ${text.trim()}`,
+      { audio: false },
+    );
+    return true;
+  }
+
   async setOutputDevice(id) {
     this.outputDeviceId = id || '';
     if (this.session) await this.session.setOutputDevice(this.outputDeviceId);

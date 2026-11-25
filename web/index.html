@@ -42,6 +42,39 @@
       </div>
     </div>
 
+    <!-- Screen Vision source & interval popover (right-click the eye icon) -->
+    <div id="vision-popover" role="dialog" aria-label="Screen Vision source and interval" hidden>
+      <div class="pop-head">
+        <span>Screen Vision Watch</span>
+        <span class="vis-badge" id="vision-pop-badge">OFF</span>
+      </div>
+      <div class="vis-pop-body">
+        <label class="vis-field">
+          <span>Capture source</span>
+          <div class="vis-row">
+            <select id="vision-source-select" class="pill-select"></select>
+            <button type="button" class="pop-link" id="btn-vision-refresh" title="Refresh open windows">↻</button>
+          </div>
+        </label>
+        <label class="vis-field">
+          <span>Screenshot every</span>
+          <select id="vision-interval-select" class="pill-select">
+            <option value="3">3 seconds</option>
+            <option value="5">5 seconds</option>
+            <option value="10" selected>10 seconds</option>
+            <option value="15">15 seconds</option>
+            <option value="30">30 seconds</option>
+            <option value="60">60 seconds</option>
+          </select>
+        </label>
+        <div class="vis-preview" id="vision-last-obs">Eye is off. Click the eye icon to start watching.</div>
+      </div>
+      <div class="pop-foot">
+        <button type="button" class="pop-link" id="btn-vision-pop-toggle">Start watching</button>
+        <button type="button" class="pop-link" id="btn-vision-pop-settings">Vision settings →</button>
+      </div>
+    </div>
+
     <!-- Subtitles + compact bottom pill bar -->
     <section id="chat-dock">
       <div id="subtitle-bar" hidden>
@@ -53,7 +86,7 @@
           <svg viewBox="0 0 24 24"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 19v3"/></svg>
         </button>
         <input id="chat-input" type="text" placeholder="Talk to Hikari…" aria-label="Message Hikari">
-        <button type="button" class="bar-btn vision" id="btn-vision" title="Look at my screen" aria-label="Look at my screen" aria-pressed="false">
+        <button type="button" class="bar-btn vision" id="btn-vision" title="Watch my screen (click: ON/OFF · right-click: pick source &amp; interval)" aria-label="Watch my screen" aria-pressed="false">
           <svg viewBox="0 0 24 24"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z"/><circle cx="12" cy="12" r="3"/></svg>
         </button>
         <button type="button" class="bar-btn danger" id="btn-interrupt" title="Interrupt / stop audio" aria-label="Interrupt" hidden>

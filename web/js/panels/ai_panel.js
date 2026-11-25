@@ -596,6 +596,49 @@ export function renderAiPanel(store) {
     onChange: (v) => { setVision({ mode: v }); softRerender(store); },
   }), 'vision mode screen vision multimodal describe direct vision eye');
 
+  const VISION_INTERVALS = [
+    ['3', 'Every 3 seconds'], ['5', 'Every 5 seconds'], ['10', 'Every 10 seconds'],
+    ['15', 'Every 15 seconds'], ['30', 'Every 30 seconds'], ['60', 'Every 60 seconds'],
+  ];
+  const vs = store._visionSourcesState || (store._visionSourcesState = { list: null, loading: false });
+  const loadVisionSources = () => {
+    if (vs.loading) return;
+    vs.loading = true;
+    fetch('/api/vision/sources').then((r) => r.json()).then((d) => {
+      if (d?.ok && Array.isArray(d.sources)) vs.list = d.sources;
+    }).catch(() => {}).finally(() => { vs.loading = false; softRerender(store); });
+  };
+  if (!vs.list && !vs.loading) loadVisionSources();
+  const visionSourceRow = () => {
+    const curSrc = vcfg.source || 'desktop';
+    const curLbl = vcfg.sourceLabel || 'Primary Monitor';
+    const items = (vs.list && vs.list.length)
+      ? vs.list.map((s) => [s.id, s.label])
+      : [['desktop', 'Primary Monitor'], ['browser', 'Browser Tab / Window Picker']];
+    if (curSrc && !items.some(([id]) => id === curSrc)) items.unshift([curSrc, curLbl]);
+    return tagged(row({
+      title: 'Vision capture source',
+      desc: 'Pick full desktop, a monitor, an open browser/app window, or OS picker (right-click the eye icon anytime)',
+      cls: 'wide-ctrl',
+      control: [
+        selectEl(items, curSrc, (v) => {
+          const hit = items.find(([id]) => id === v);
+          setVision({ source: v, sourceLabel: hit ? hit[1] : v });
+          store.onPatchVision?.();
+          softRerender(store);
+        }, { 'aria-label': 'Vision capture source', class: 'pill-select wide' }),
+        btn(vs.loading ? '…' : 'Refresh', () => { vs.list = null; loadVisionSources(); }),
+      ],
+    }), 'vision source desktop browser window monitor capture screen');
+  };
+  const visionIntervalRow = () => tagged(selectRow({
+    label: 'Vision watch interval',
+    desc: 'How often the eye button screenshots your screen and silently updates Hikari while watching',
+    items: withCurrent(VISION_INTERVALS, String(vcfg.intervalSec || 10)),
+    value: String(vcfg.intervalSec || 10),
+    onChange: (v) => { setVision({ intervalSec: Number(v) || 10 }); store.onPatchVision?.(); softRerender(store); },
+  }), 'vision interval seconds watch loop screenshot frequency');
+
   /* Brain & voice mode */
   // A retired mode left in an old settings.json falls back to Fish duplex in the picker.
   const brainMode = BRAIN_MODES.some(([id]) => id === ai.brainMode) ? ai.brainMode : 'fish_duplex';
@@ -656,10 +699,12 @@ export function renderAiPanel(store) {
       ...fishRows,
       tagged(toggle({
         label: 'Screen Vision',
-        desc: 'Allow on-demand screen look via the stage eye button or saying "look at my screen"',
+        desc: 'Continuous screen watching via the eye button (click: ON/OFF · right-click: pick desktop / browser / interval)',
         checked: store.config.vision?.enabled ?? true,
         onChange: (v) => store.patch('vision', { enabled: v }),
       }), 'screen vision look at my screen screenshot'),
+      visionSourceRow(),
+      visionIntervalRow(),
       visionModelRow(),
       visionProviderRow(),
       visionModeRow(),
