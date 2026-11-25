@@ -35,7 +35,7 @@ from core.paths import studio_root
 ROOT = studio_root()
 MIDORI_TOOL = ROOT / "tools" / "build_midori_deform_arms.py"
 MIDORI_CACHE_DIR = ROOT / "assets" / "hd_parts" / "wave" / "_midori_cache"
-MIDORI_VERSION = "midori-v1"
+MIDORI_VERSION = "midori-v7-outer-hermite"
 VFX_CACHE_DIR = ROOT / "assets" / "hd_parts" / "_vfx_cache"
 WAVE_TEXTURES = (53, 54, 55, 56, 57, 58)
 TEX_NONE = 4294967295

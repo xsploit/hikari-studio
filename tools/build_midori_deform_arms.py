@@ -190,13 +190,14 @@ def bake_arm(parts: list[tuple[dict, np.ndarray]], texs: list[tuple[int, bytes]]
 
 LINE_RGB = np.array((150.0, 99.0, 82.0), np.float32) / 255.0   # the wave art's warm-brown outline (customizer.py)
 LINE_W = 0.7                                                    # outline width, model units
-ELBOW_REPAIR_R = 40.0                                           # repair radius around the elbow pivot
+ELBOW_REPAIR_R = 46.0                                           # repair radius around the elbow pivot
 
 
 def repair_elbow_seam(canvas: np.ndarray, q0: np.ndarray, ppu: float, E: np.ndarray) -> tuple[np.ndarray, int]:
-    """The rigid rig left a notch in the outer-elbow outline (forearm ball-cap meets the upper arm) plus faint
-    internal stroke remnants of the cut edges. On the baked canvas: erase thin dark strokes well inside the skin,
-    close the silhouette notch, and re-draw one continuous outline - only inside a feathered disc around the elbow."""
+    """The rigid rig left a small step/notch in the outer-elbow outline (forearm ball-cap meets the upper arm) plus
+    faint internal stroke remnants of the cut edges. On the baked canvas: erase internal strokes, smooth both concave
+    notches AND convex steps via Gaussian-filtered signed distance field (SDF) inside a feathered disc around the
+    elbow, inpaint newly exposed interior skin cleanly, and re-draw one continuous uniform outline."""
     H, W = canvas.shape[:2]
     a = canvas[..., 3].copy()
     straight = np.where(a[..., None] > 1e-4, canvas[..., :3] / np.maximum(a[..., None], 1e-4), 0.0)
@@ -204,31 +205,82 @@ def repair_elbow_seam(canvas: np.ndarray, q0: np.ndarray, ppu: float, E: np.ndar
     ex, ey = (E - q0) * ppu - 0.5
     r_units = np.hypot(xx - ex, yy - ey) / ppu
     region = r_units < ELBOW_REPAIR_R
-    blend = 1.0 - smoothstep(ELBOW_REPAIR_R - 6.0, ELBOW_REPAIR_R, r_units)
-    # 1) internal dark strokes: darker than the grey-closed (stroke-free) skin, and > 1.3 units inside the outline
+    blend = 1.0 - smoothstep(ELBOW_REPAIR_R - 8.0, ELBOW_REPAIR_R, r_units)
+
+    # 1) internal dark strokes: darker than the grey-closed (stroke-free) skin, and > 1.2 units inside the outline
     lum = straight.mean(-1).astype(np.float32)
-    kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(2.2 * ppu) | 1,) * 2)
+    kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(2.4 * ppu) | 1,) * 2)
     lum_bg = cv2.morphologyEx(lum, cv2.MORPH_CLOSE, kc)
-    d_in = cv2.distanceTransform((a > 0.5).astype(np.uint8), cv2.DIST_L2, 5) / ppu
-    stroke = region & (a > 0.98) & (d_in > 1.3) & ((lum_bg - lum) > 0.03)
+    mask_bin = (a > 0.5).astype(np.uint8)
+    d_in = cv2.distanceTransform(mask_bin, cv2.DIST_L2, 5) / ppu
+    d_out = cv2.distanceTransform(1 - mask_bin, cv2.DIST_L2, 5) / ppu
+    stroke = region & (a > 0.96) & (d_in > 1.2) & ((lum_bg - lum) > 0.025)
     stroke = cv2.dilate(stroke.astype(np.uint8), np.ones((3, 3), np.uint8))
     n_stroke = int(stroke.sum())
     if n_stroke:
         s8 = np.round(straight.clip(0, 1) * 255).astype(np.uint8)
-        fixed = cv2.inpaint(s8, stroke, 6, cv2.INPAINT_TELEA).astype(np.float32) / 255.0
+        fixed = cv2.inpaint(s8, stroke, 7, cv2.INPAINT_TELEA).astype(np.float32) / 255.0
         straight = np.where(stroke[..., None] > 0, fixed, straight)
-    # 2) close the silhouette notch (grey closing keeps the anti-aliased edge)
-    kn = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(3.0 * ppu) | 1,) * 2)
-    a_closed = cv2.morphologyEx(a, cv2.MORPH_CLOSE, kn)
-    new_a = a + (np.maximum(a, a_closed) - a) * blend * region
-    grown = (new_a - a) > 0.02
-    # 3) one continuous outline: pixels within LINE_W of the (closed) edge take the line colour
+
+    # 2) Deterministic outer-elbow C1 cubic Hermite spline bridge across [ey - 6u .. ey + 23u]:
+    #    The hand sits to the left of E on the R arm (outer elbow = left edge, side_idx=0) and to the right on the L
+    #    arm (outer elbow = right edge, side_idx=-1). Anchoring cleanly above the forearm/upper-arm seam (ey - 6u)
+    #    and below it (ey + 23u, well above the elbow tip) eliminates the outer-elbow bump on both R and L arms!
+    top_nz = np.flatnonzero(mask_bin[: max(1, H // 3)].any(axis=0))
+    x_hand = float(top_nz.mean()) if len(top_nz) else float(W * 0.5)
+    side_idx = 0 if x_hand < ex else -1
+
+    y_a = max(6.0 * ppu, ey - 6.0 * ppu)
+    y_b = min(float(H - 1) - 6.0 * ppu, ey + 23.0 * ppu)
+    y_scan0 = max(0, int(np.floor(y_a - 7.0 * ppu)))
+    y_scan1 = min(H - 1, int(np.ceil(y_b + 7.0 * ppu)))
+    ys = np.arange(y_scan0, y_scan1 + 1, dtype=np.float64)
+    xs = np.full(len(ys), np.nan, dtype=np.float64)
+    for k, y in enumerate(ys.astype(int)):
+        nz = np.flatnonzero(mask_bin[y])
+        if len(nz):
+            xs[k] = float(nz[side_idx])
+
+    new_a = a.copy()
+    repaired_band = np.zeros((H, W), dtype=bool)
+    m_a = np.isfinite(xs) & (ys >= y_a - 6.0 * ppu) & (ys <= y_a)
+    m_b = np.isfinite(xs) & (ys >= y_b) & (ys <= y_b + 6.0 * ppu)
+    if m_a.sum() >= 5 and m_b.sum() >= 5:
+        pa = np.polyfit(ys[m_a], xs[m_a], 1)
+        pb = np.polyfit(ys[m_b], xs[m_b], 1)
+        xa, dxa = float(np.polyval(pa, y_a)), float(pa[0])
+        xb, dxb = float(np.polyval(pb, y_b)), float(pb[0])
+        span = max(1.0, y_b - y_a)
+        m0, m1 = dxa * span, dxb * span
+        yi0 = max(0, int(np.floor(y_a)))
+        yi1 = min(H - 1, int(np.ceil(y_b)))
+        for y in range(yi0, yi1 + 1):
+            t = max(0.0, min(1.0, (float(y) - y_a) / span))
+            t2, t3 = t * t, t * t * t
+            xt = (2.0 * t3 - 3.0 * t2 + 1.0) * xa + (t3 - 2.0 * t2 + t) * m0 + (-2.0 * t3 + 3.0 * t2) * xb + (t3 - t2) * m1
+            x_band = np.abs(xx[y] - xt) < 6.5 * ppu
+            a_edge = np.clip(0.5 + (xx[y] - xt if side_idx == 0 else xt - xx[y]), 0.0, 1.0)
+            wt = float(smoothstep(y_a, y_a + 2.5 * ppu, float(y)) * (1.0 - smoothstep(y_b - 2.5 * ppu, y_b, float(y))))
+            new_a[y, x_band] = a[y, x_band] + (a_edge[x_band] - a[y, x_band]) * wt
+            repaired_band[y, x_band] = True
+
+    # 3) Cleanly inpaint skin colour inside the repaired band (removes old dark double-outline + fills grown pixels)
     d_new = cv2.distanceTransform((new_a > 0.5).astype(np.uint8), cv2.DIST_L2, 5) / ppu
-    lw = np.clip((LINE_W - d_new) / 0.25, 0.0, 1.0) * (new_a > 0.02) * blend * region
-    lw = np.maximum(lw, grown.astype(np.float32) * blend)
+    grown = (new_a > 0.02) & (a < 0.90) & repaired_band
+    old_dark = (new_a > 0.02) & (d_new < 4.0) & ((lum_bg - lum) > 0.02) & repaired_band
+    strip = (grown | old_dark | ((new_a > 0.02) & (d_new < 2.0) & repaired_band)).astype(np.uint8)
+    if int(strip.sum()) > 0:
+        s8 = np.round(straight.clip(0, 1) * 255).astype(np.uint8)
+        skin_fill = cv2.inpaint(s8, strip, max(7, int(round(5.0 * ppu))), cv2.INPAINT_TELEA).astype(np.float32) / 255.0
+        fix_w = np.where(strip > 0, 1.0, 0.0).astype(np.float32)
+        straight = straight + (skin_fill - straight) * fix_w[..., None]
+
+    # 4) Stroke one crisp, continuous warm-brown anime outline along the exact smooth outer-elbow spline
+    lw = np.clip((LINE_W - d_new) / 0.28, 0.0, 1.0) * (new_a > 0.02) * repaired_band
     lum_line = float(LINE_RGB.mean())
     lw = lw * (straight.mean(-1) > lum_line - 0.02)          # never lighten pixels already darker than the line
     straight = straight + (LINE_RGB[None, None, :] - straight) * lw[..., None]
+
     out = np.empty_like(canvas)
     out[..., 3] = new_a
     out[..., :3] = straight.clip(0, 1) * new_a[..., None]
